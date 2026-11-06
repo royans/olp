@@ -1,7 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use olp::config::{ensure_server_initialized, expand_path, olp_home_dir};
-use olp::keys::{format_pubkey, load_or_generate_keypair, parse_pubkey, write_private_file};
+use olp::config::{ensure_server_initialized, olp_home_dir};
 use olp::server::run_server_with_shutdown;
 use std::path::PathBuf;
 use tokio::sync::watch;
@@ -18,15 +17,7 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Print olp-server's public key and exit
-    #[arg(long)]
-    show_pubkey: bool,
-
-    /// Set or update the pinned olp-proxy public key (~/.olp/keys/known_proxy.pub)
-    #[arg(long)]
-    set_proxy_key: Option<String>,
-
-    /// Initialize ~/.olp/server.toml and keys, then exit without connecting
+    /// Initialize ~/.olp/server.toml, then exit without connecting
     #[arg(long)]
     init_only: bool,
 
@@ -65,46 +56,32 @@ async fn main() -> Result<()> {
     };
 
     let cfg = ensure_server_initialized(&config_path, args.non_interactive)?;
-    let priv_path = expand_path(&cfg.keys.private_key)?;
-    let signing_key = load_or_generate_keypair(&priv_path, "olp-server-ed25519")?;
-    let pubkey_str = format_pubkey("olp-server-ed25519", &signing_key.verifying_key());
-
-    if args.show_pubkey {
-        println!("{}", pubkey_str);
-        return Ok(());
-    }
-
-    if let Some(ref proxy_key) = args.set_proxy_key {
-        let parsed = parse_pubkey(proxy_key).context("Invalid olp-proxy public key")?;
-        let known_path = expand_path(&cfg.keys.known_proxy_key)?;
-        let formatted = format_pubkey("olp-proxy-ed25519", &parsed);
-        write_private_file(&known_path, &format!("{}\n", formatted))?;
-        println!(
-            "[olp-server] Saved pinned olp-proxy public key to {}",
-            known_path.display()
-        );
-        return Ok(());
-    }
 
     if args.init_only {
+        println!("[olp-server] Initialization complete.");
         return Ok(());
     }
 
-    println!("================================================================================");
+    println!("\n================================================================================");
     println!("  olp-server starting");
     println!("  Config       : {}", config_path.display());
     println!("  Proxy Target : {}", cfg.server.proxy_addr);
     println!("  Local Ollama : {}", cfg.server.ollama_addr);
     println!("  Remote Port  : {}", cfg.server.remote_port);
-    println!("  Public Key   : {}", pubkey_str);
-    println!("================================================================================");
+    println!("================================================================================\n");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        println!("\n[olp-server] Shutting down cleanly...");
-        let _ = shutdown_tx.send(true);
+
+    let server_task = tokio::spawn(async move {
+        if let Err(e) = run_server_with_shutdown(cfg, shutdown_rx).await {
+            eprintln!("olp-server error: {}", e);
+        }
     });
 
-    run_server_with_shutdown(cfg, shutdown_rx).await
+    wait_for_shutdown_signal().await;
+    println!("\n[olp-server] Shutting down...");
+    let _ = shutdown_tx.send(true);
+    let _ = server_task.await;
+
+    Ok(())
 }

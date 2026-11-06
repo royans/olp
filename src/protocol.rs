@@ -1,6 +1,4 @@
-use crate::keys::{sign_message, verify_signature, PasskeyVerifier};
-use anyhow::{anyhow, Context, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use anyhow::{anyhow, Result};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -10,161 +8,73 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use socket2::{SockRef, TcpKeepalive};
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-olp-tunnel-v1";
 pub const MAX_HANDSHAKE_FRAME_LEN: usize = 16 * 1024;
 
 /// Step 1 of Handshake: Sent from `olp-proxy` to `olp-server` immediately after TLS 1.3 handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyHelloChallenge {
     pub proxy_nonce: [u8; 32],
-    pub proxy_pubkey: [u8; 32],
-    pub proxy_signature_b64: String,
 }
 
-/// Step 2 of Handshake: Sent from `olp-server` to `olp-proxy` after verifying `ProxyHelloChallenge`.
+impl ProxyHelloChallenge {
+    pub fn new() -> Self {
+        let mut proxy_nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut proxy_nonce);
+        Self { proxy_nonce }
+    }
+}
+
+impl Default for ProxyHelloChallenge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Step 2 of Handshake: Sent from `olp-server` to `olp-proxy` to register a tunnel with `passkey_proxy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerAuthRegister {
-    pub server_pubkey: [u8; 32],
-    pub server_nonce: [u8; 32],
     pub remote_port: u16,
-    pub passkey_verifier: PasskeyVerifier,
-    pub server_signature_b64: String,
+    pub auth_token: [u8; 32],
 }
 
-/// Step 3 of Handshake: Sent from `olp-proxy` to `olp-server` to confirm port binding.
+impl ServerAuthRegister {
+    pub fn new(remote_port: u16, passkey_proxy: &str, proxy_nonce: &[u8; 32]) -> Self {
+        let auth_token = compute_proxy_auth_token(passkey_proxy, proxy_nonce);
+        Self {
+            remote_port,
+            auth_token,
+        }
+    }
+}
+
+/// Step 3 of Handshake: Sent from `olp-proxy` to `olp-server` to confirm or reject registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelEstablished {
     pub accepted: bool,
     pub message: String,
 }
 
-/// Builds the byte payload signed by `olp-proxy` in `ProxyHelloChallenge`.
-pub fn build_proxy_challenge_transcript(
-    tls_exporter: &[u8; 32],
+/// Computes a cryptographically secure token binding `passkey_proxy` to `proxy_nonce` using BLAKE3.
+pub fn compute_proxy_auth_token(passkey_proxy: &str, proxy_nonce: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"olp-tunnel-auth-v2:");
+    hasher.update(proxy_nonce);
+    hasher.update(passkey_proxy.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Constant-time verification of `passkey_proxy` authentication token.
+pub fn verify_proxy_auth_token(
+    candidate_token: &[u8; 32],
+    passkey_proxy: &str,
     proxy_nonce: &[u8; 32],
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(96);
-    buf.extend_from_slice(b"olp-proxy-challenge-v1:");
-    buf.extend_from_slice(tls_exporter);
-    buf.extend_from_slice(proxy_nonce);
-    buf
-}
-
-/// Builds the byte payload signed by `olp-server` in `ServerAuthRegister`.
-pub fn build_server_register_transcript(
-    tls_exporter: &[u8; 32],
-    proxy_nonce: &[u8; 32],
-    server_nonce: &[u8; 32],
-    remote_port: u16,
-    verifier: &PasskeyVerifier,
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(200);
-    buf.extend_from_slice(b"olp-server-register-v1:");
-    buf.extend_from_slice(tls_exporter);
-    buf.extend_from_slice(proxy_nonce);
-    buf.extend_from_slice(server_nonce);
-    buf.extend_from_slice(&remote_port.to_be_bytes());
-    buf.extend_from_slice(&verifier.salt);
-    buf.extend_from_slice(&verifier.hash);
-    buf
-}
-
-impl ProxyHelloChallenge {
-    pub fn create(signing_key: &SigningKey, tls_exporter: &[u8; 32]) -> Self {
-        let mut proxy_nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut proxy_nonce);
-        let transcript = build_proxy_challenge_transcript(tls_exporter, &proxy_nonce);
-        let sig = sign_message(signing_key, &transcript);
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-        Self {
-            proxy_nonce,
-            proxy_pubkey: signing_key.verifying_key().to_bytes(),
-            proxy_signature_b64: BASE64.encode(sig),
-        }
-    }
-
-    pub fn verify(
-        &self,
-        expected_proxy_key: &VerifyingKey,
-        tls_exporter: &[u8; 32],
-    ) -> Result<()> {
-        if &self.proxy_pubkey != expected_proxy_key.as_bytes() {
-            return Err(anyhow!(
-                "MITM / Key mismatch: olp-proxy presented a public key that does not match known_proxy.pub"
-            ));
-        }
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-        let sig_raw = BASE64
-            .decode(&self.proxy_signature_b64)
-            .context("Invalid base64 signature in ProxyHelloChallenge")?;
-        let sig_bytes: [u8; 64] = sig_raw
-            .try_into()
-            .map_err(|_| anyhow!("Invalid Ed25519 signature length in ProxyHelloChallenge"))?;
-        let transcript = build_proxy_challenge_transcript(tls_exporter, &self.proxy_nonce);
-        if !verify_signature(expected_proxy_key, &transcript, &sig_bytes) {
-            return Err(anyhow!(
-                "Invalid Ed25519 signature in ProxyHelloChallenge (TLS channel binding failed)"
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl ServerAuthRegister {
-    pub fn create(
-        signing_key: &SigningKey,
-        tls_exporter: &[u8; 32],
-        proxy_nonce: &[u8; 32],
-        remote_port: u16,
-        passkey_verifier: PasskeyVerifier,
-    ) -> Self {
-        let mut server_nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut server_nonce);
-        let transcript = build_server_register_transcript(
-            tls_exporter,
-            proxy_nonce,
-            &server_nonce,
-            remote_port,
-            &passkey_verifier,
-        );
-        let sig = sign_message(signing_key, &transcript);
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-        Self {
-            server_pubkey: signing_key.verifying_key().to_bytes(),
-            server_nonce,
-            remote_port,
-            passkey_verifier,
-            server_signature_b64: BASE64.encode(sig),
-        }
-    }
-
-    pub fn verify(&self, tls_exporter: &[u8; 32], proxy_nonce: &[u8; 32]) -> Result<VerifyingKey> {
-        let server_key = VerifyingKey::from_bytes(&self.server_pubkey)
-            .context("Invalid Ed25519 public key in ServerAuthRegister")?;
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-        let sig_raw = BASE64
-            .decode(&self.server_signature_b64)
-            .context("Invalid base64 signature in ServerAuthRegister")?;
-        let sig_bytes: [u8; 64] = sig_raw
-            .try_into()
-            .map_err(|_| anyhow!("Invalid Ed25519 signature length in ServerAuthRegister"))?;
-        let transcript = build_server_register_transcript(
-            tls_exporter,
-            proxy_nonce,
-            &self.server_nonce,
-            self.remote_port,
-            &self.passkey_verifier,
-        );
-        if !verify_signature(&server_key, &transcript, &sig_bytes) {
-            return Err(anyhow!(
-                "Invalid Ed25519 signature in ServerAuthRegister (TLS channel binding failed)"
-            ));
-        }
-        Ok(server_key)
-    }
+) -> bool {
+    let expected = compute_proxy_auth_token(passkey_proxy, proxy_nonce);
+    candidate_token.ct_eq(&expected).into()
 }
 
 /// Sends a length-prefixed JSON frame over an async stream.
@@ -238,25 +148,25 @@ pub fn create_tunnel_tls_server_config() -> Result<Arc<rustls::ServerConfig>> {
 }
 
 /// Builds a `rustls::ClientConfig` for `olp-server` restricted strictly to TLS 1.3.
-/// Identity verification is enforced via mutual Ed25519 signature over RFC 8446 TLS Exporter.
+/// End-to-end encryption is established; authentication is performed via `passkey_proxy`.
 pub fn create_tunnel_tls_client_config() -> Result<Arc<rustls::ClientConfig>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let client_cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(ChannelBoundCertVerifier { provider }))
+        .with_custom_certificate_verifier(Arc::new(TunnelCertVerifier { provider }))
         .with_no_client_auth();
 
     Ok(Arc::new(client_cfg))
 }
 
 #[derive(Debug)]
-struct ChannelBoundCertVerifier {
+struct TunnelCertVerifier {
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
-impl ServerCertVerifier for ChannelBoundCertVerifier {
+impl ServerCertVerifier for TunnelCertVerifier {
     fn verify_server_cert(
         &self,
         _end_entity: &CertificateDer<'_>,
@@ -264,24 +174,19 @@ impl ServerCertVerifier for ChannelBoundCertVerifier {
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, RustlsError> {
-        // Server identity is cryptographically verified immediately after the TLS 1.3 handshake
-        // via Ed25519 signature over the RFC 8446 TLS Exporter value (`EXPORTER-olp-tunnel-v1`).
+    ) -> Result<ServerCertVerified, RustlsError> {
         Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(RustlsError::PeerIncompatible(
+            rustls::PeerIncompatible::ServerDoesNotSupportTls12Or13,
+        ))
     }
 
     fn verify_tls13_signature(
@@ -289,7 +194,7 @@ impl ServerCertVerifier for ChannelBoundCertVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -305,3 +210,18 @@ impl ServerCertVerifier for ChannelBoundCertVerifier {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_proxy_auth_token_constant_time() {
+        let nonce = [42u8; 32];
+        let token = compute_proxy_auth_token("secret-passkey", &nonce);
+        assert!(verify_proxy_auth_token(&token, "secret-passkey", &nonce));
+        assert!(!verify_proxy_auth_token(&token, "wrong-passkey", &nonce));
+
+        let diff_nonce = [43u8; 32];
+        assert!(!verify_proxy_auth_token(&token, "secret-passkey", &diff_nonce));
+    }
+}

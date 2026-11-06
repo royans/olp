@@ -1,38 +1,48 @@
 # ==============================================================================
-# Sample Configuration for `olp-proxy`
-# Copy or let `olp-proxy` generate this file at: ~/.olp/proxy.toml
+# Configuration for `olp-proxy`
+# Location: ~/.olp/proxy.toml (permissions 0600)
 # ==============================================================================
 
 [proxy]
-# Address and port where `olp-proxy` listens for incoming tunnel connections from `olp-server`
+# Address and port where `olp-proxy` listens for incoming reverse tunnels from `olp-server`
 listen_addr = "0.0.0.0:4443"
 
-# Allowed inclusive port range that authenticated `olp-server` instances may bind publicly
+# Allowed inclusive port range that `olp-server` instances may expose publicly
 allowed_ports = "10000-20000"
 
-# How long (in seconds) to hold the public port open (returning 503 Retry-After)
+# How long (in seconds) to hold the public port open (returning 503 Service Unavailable)
 # if an active tunnel drops unexpectedly while waiting for `olp-server` to reconnect
-listener_grace_period_sec = 300
+listener_grace_period_sec = 60
 
-[keys]
-# Path to `olp-proxy`'s Ed25519 private key (auto-generated on first run)
-private_key = "~/.olp/keys/proxy_id_ed25519"
+[auth]
+# 1. passkey_proxy: Shared between olp-proxy and olp-server for tunnel registration.
+# The connecting olp-server must provide this exact passkey.
+passkey_proxy = "change-me-to-a-secure-proxy-passkey"
 
-# Path to `authorized_keys` containing allowed `olp-server` public keys (one per line)
-# Format: olp-server-ed25519 <base64-pubkey> [optional-comment] [ports=11434,11435]
-authorized_keys = "~/.olp/keys/authorized_keys"
+# 2. passkey_user: Required by end users to query Ollama through olp-proxy.
+# Supports HTTP Basic Auth (any-username:passkey_user) or Bearer Token (Authorization: Bearer <passkey_user>).
+passkey_user = "change-me-to-a-secure-user-passkey"
 
 [security]
-# Maximum failed HTTP Basic/Bearer authentication attempts per IP per minute before returning 429
-max_auth_failures_per_min = 5
+# Allowed CIDR blocks for tunnel connections from olp-server (defaults to all: ["0.0.0.0/0", "::/0"])
+# Example to restrict to a specific IP or subnet:
+# allowed_server_cidrs = ["67.180.155.189/32", "192.168.1.0/24"]
+allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
 
-# Maximum concurrent multiplexed HTTP streams per tunnel
+# Allowed CIDR blocks for user HTTP connections to exposed Ollama endpoints
+# Example to restrict users to your office or VPN:
+# allowed_user_cidrs = ["203.0.113.0/24", "198.51.100.5/32"]
+allowed_user_cidrs = ["0.0.0.0/0", "::/0"]
+
+# Maximum failed HTTP authentication attempts per IP per minute before temporary lockout
+max_auth_failures_per_min = 60
+
+# Maximum concurrent multiplexed HTTP streams per reverse tunnel
 max_concurrent_streams = 128
 
 [tls]
-# Public endpoint TLS mode: "off" (plain HTTP), "manual" (custom PEM files), or "self-signed"
+# Public Ollama endpoint TLS mode: "off" (plain HTTP), "manual" (custom PEM files), or "self-signed"
 mode = "off"
 # If mode = "manual":
-# cert_path = "~/.olp/keys/tls_cert.pem"
-# key_path = "~/.olp/keys/tls_key.pem"
-
+# cert_path = "~/.olp/tls_cert.pem"
+# key_path = "~/.olp/tls_key.pem"

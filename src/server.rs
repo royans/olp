@@ -1,14 +1,12 @@
 use crate::backoff::FibonacciBackoff;
-use crate::config::{expand_path, ServerConfig};
-use crate::keys::{format_pubkey, load_or_generate_keypair, parse_pubkey, PasskeyVerifier};
+use crate::config::ServerConfig;
 use crate::mux::{spawn_mux_session, CompatYamuxStream};
 use crate::protocol::{
     configure_tunnel_socket, create_tunnel_tls_client_config, read_frame, write_frame,
-    ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished, EXPORTER_LABEL,
+    ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished,
 };
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, HOST};
@@ -17,8 +15,6 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
-use std::fs;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::TcpStream;
@@ -29,29 +25,18 @@ use yamux::Mode;
 
 type BoxHttpBody = BoxBody<Bytes, hyper::Error>;
 
-fn full_body(s: impl Into<Bytes>) -> BoxHttpBody {
-    Full::new(s.into())
-        .map_err(|never| match never {})
+fn full_body<T: Into<Bytes>>(chunk: T) -> BoxHttpBody {
+    Full::new(chunk.into())
+        .map_err(|e| match e {})
         .boxed()
 }
 
-/// Runs the `olp-server` daemon with automatic Fibonacci backoff reconnection.
+/// Main entry point for `olp-server`. Maintains a persistent Yamux reverse tunnel
+/// over TLS 1.3 to `olp-proxy` with Fibonacci reconnection backoff.
 pub async fn run_server_with_shutdown(
     config: ServerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let priv_path = expand_path(&config.keys.private_key)?;
-    let signing_key = Arc::new(load_or_generate_keypair(&priv_path, "olp-server-ed25519")?);
-
-    let known_proxy_path = expand_path(&config.keys.known_proxy_key)?;
-    let known_proxy_raw = fs::read_to_string(&known_proxy_path).with_context(|| {
-        format!(
-            "Failed to read known_proxy_key at {} (make sure you pasted olp-proxy's public key)",
-            known_proxy_path.display()
-        )
-    })?;
-    let expected_proxy_key = parse_pubkey(&known_proxy_raw)?;
-
     let tls_client_cfg = create_tunnel_tls_client_config()?;
     let connector = TlsConnector::from(tls_client_cfg);
 
@@ -62,26 +47,19 @@ pub async fn run_server_with_shutdown(
 
     loop {
         if *shutdown_rx.borrow() {
-            info!("olp-server shutting down cleanly");
+            info!("olp-server shutdown signal received");
             return Ok(());
         }
 
         let session_start = Instant::now();
-        let res = run_single_tunnel_session(
-            &config,
-            &signing_key,
-            &expected_proxy_key,
-            &connector,
-            &mut shutdown_rx,
-        )
-        .await;
+        let res = run_single_tunnel_session(&config, &connector, &mut shutdown_rx).await;
 
         if *shutdown_rx.borrow() {
             info!("olp-server shutting down cleanly");
             return Ok(());
         }
 
-        // If the tunnel stayed alive for at least one healthy cycle (>= 30s), reset Fibonacci sequence
+        // If the tunnel stayed alive for at least 30s, reset Fibonacci sequence
         if session_start.elapsed() >= Duration::from_secs(30) {
             backoff.reset();
         }
@@ -97,20 +75,14 @@ pub async fn run_server_with_shutdown(
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("ERR_UNAUTHORIZED_KEY") {
-                    let pubkey_str =
-                        format_pubkey("olp-server-ed25519", &signing_key.verifying_key());
+                if err_str.contains("ERR_INVALID_PASSKEY_PROXY") {
                     if backoff.attempt() == 1 || backoff.attempt() % 5 == 0 {
                         error!(
                             "\n================================================================================\n\
-                             [AUTH ERROR] Proxy rejected this server's public key!\n\
-                             Your Server Public Key is:\n\
-                               {}\n\n\
-                             To authorize this server on the proxy, run this command ON THE PROXY HOST:\n\
-                               ./start-proxy.sh --add-key \"{}\"\n\
-                             (or append that line to ~/.olp/keys/authorized_keys on the proxy)\n\
-                             ================================================================================",
-                            pubkey_str, pubkey_str
+                             [AUTH ERROR] Proxy rejected your passkey_proxy!\n\
+                             Please check that [server].passkey_proxy in ~/.olp/server.toml matches\n\
+                             [auth].passkey_proxy in ~/.olp/proxy.toml on the proxy host.\n\
+                             ================================================================================"
                         );
                     }
                 }
@@ -137,8 +109,6 @@ pub async fn run_server_with_shutdown(
 /// Runs a single outbound tunnel session to `olp-proxy`.
 pub async fn run_single_tunnel_session(
     config: &ServerConfig,
-    signing_key: &Arc<SigningKey>,
-    expected_proxy_key: &VerifyingKey,
     connector: &TlsConnector,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
@@ -163,15 +133,7 @@ pub async fn run_single_tunnel_session(
     .context("TLS 1.3 handshake timed out")?
     .context("TLS 1.3 handshake failed")?;
 
-    // Derive RFC 8446 TLS Exporter value to bind authentication to this exact TLS session
-    let mut exporter = [0u8; 32];
-    tls_stream
-        .get_ref()
-        .1
-        .export_keying_material(&mut exporter, EXPORTER_LABEL, None)
-        .context("Failed to derive RFC 8446 TLS exporter")?;
-
-    // Step 1: Read and verify ProxyHelloChallenge BEFORE sending passkey verifier
+    // Step 1: Read ProxyHelloChallenge
     let challenge: ProxyHelloChallenge = tokio::time::timeout(
         Duration::from_secs(10),
         read_frame(&mut tls_stream),
@@ -179,16 +141,11 @@ pub async fn run_single_tunnel_session(
     .await
     .context("Timed out waiting for ProxyHelloChallenge")??;
 
-    challenge.verify(expected_proxy_key, &exporter)?;
-
-    // Step 2: Send ServerAuthRegister with salted BLAKE3 passkey verifier
-    let verifier = PasskeyVerifier::from_passkey(&config.server.passkey);
-    let register = ServerAuthRegister::create(
-        signing_key,
-        &exporter,
-        &challenge.proxy_nonce,
+    // Step 2: Send ServerAuthRegister with auth token computed from passkey_proxy
+    let register = ServerAuthRegister::new(
         config.server.remote_port,
-        verifier,
+        &config.server.passkey_proxy,
+        &challenge.proxy_nonce,
     );
 
     tokio::time::timeout(
@@ -226,7 +183,6 @@ pub async fn run_single_tunnel_session(
     let ollama_addr = config.server.ollama_addr.clone();
 
     let mut ticker = tokio::time::interval(hb_interval);
-    // Consume immediate first tick
     ticker.tick().await;
 
     loop {
@@ -251,7 +207,6 @@ pub async fn run_single_tunnel_session(
                 }
             }
             _ = ticker.tick() => {
-                // Active application-level Ping/Pong over Yamux
                 let ping_res = tokio::time::timeout(hb_timeout, async {
                     let mut stream = mux_handle.open_stream().await?;
                     stream.write_all(b"PING\n").await?;
@@ -280,8 +235,6 @@ pub async fn run_single_tunnel_session(
     }
 }
 
-/// Receives an HTTP request over a `yamux` stream from `olp-proxy`, sanitizes it,
-/// and forwards it with zero buffering to the local Ollama instance.
 async fn serve_proxied_ollama_stream(yamux_stream: CompatYamuxStream, ollama_addr: String) {
     let service = service_fn(move |req: Request<Incoming>| {
         let target_addr = ollama_addr.clone();
@@ -299,14 +252,12 @@ async fn forward_to_local_ollama(
     mut req: Request<Incoming>,
     ollama_addr: &str,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
-    // 1. SSRF & Method Sanitization: Reject CONNECT or non-Ollama tunnel methods
     if req.method() == Method::CONNECT {
         let mut resp = Response::new(full_body(r#"{"error":"CONNECT method is forbidden"}"#));
         *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
         return Ok(resp);
     }
 
-    // 2. Normalize URI to path_and_query only (preventing absolute-URI proxy abuse)
     let path_and_query = req
         .uri()
         .path_and_query()
@@ -316,14 +267,11 @@ async fn forward_to_local_ollama(
         *req.uri_mut() = clean_uri;
     }
 
-    // 3. Strip external Authorization header (never leak passkey to local logs)
-    // and rewrite Host header so Ollama's internal DNS-rebinding check succeeds
     req.headers_mut().remove(AUTHORIZATION);
     if let Ok(host_val) = hyper::header::HeaderValue::from_str(ollama_addr) {
         req.headers_mut().insert(HOST, host_val);
     }
 
-    // 4. Connect to local Ollama with fast 5-second connect timeout
     let upstream_tcp = match tokio::time::timeout(
         Duration::from_secs(5),
         TcpStream::connect(ollama_addr),
@@ -341,9 +289,8 @@ async fn forward_to_local_ollama(
             return Ok(resp);
         }
     };
-    let _ = upstream_tcp.set_nodelay(true);
 
-    let (mut sender, conn) =
+    let (mut client_sender, conn) =
         match hyper::client::conn::http1::handshake(TokioIo::new(upstream_tcp)).await {
             Ok(pair) => pair,
             Err(_) => {
@@ -359,17 +306,18 @@ async fn forward_to_local_ollama(
         let _ = conn.await;
     });
 
-    // 5. Stream response chunks back to `olp-proxy` immediately without buffering
-    match sender.send_request(req).await {
-        Ok(resp) => Ok(resp.map(|b| b.boxed())),
-        Err(e) => {
-            error!("Error forwarding request to local Ollama: {}", e);
+    match client_sender.send_request(req).await {
+        Ok(upstream_resp) => {
+            let (u_parts, u_body) = upstream_resp.into_parts();
+            let boxed_body = u_body.map_err(|e| e).boxed();
+            Ok(Response::from_parts(u_parts, boxed_body))
+        }
+        Err(_) => {
             let mut resp = Response::new(full_body(
-                r#"{"error":"upstream local ollama connection closed unexpectedly"}"#,
+                r#"{"error":"local ollama stream terminated prematurely"}"#,
             ));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             Ok(resp)
         }
     }
 }
-

@@ -1,14 +1,14 @@
+use crate::cidr::IpFilter;
 use crate::config::{expand_path, ProxyConfig};
-use crate::keys::{format_pubkey, load_or_generate_keypair, verify_authorized_key, PasskeyVerifier};
+use crate::keys::{enforce_private_file_permissions, IpRateLimiter, PasskeyVerifier};
 use crate::mux::{spawn_mux_session, MuxHandle};
 use crate::protocol::{
-    configure_tunnel_socket, create_tunnel_tls_server_config, read_frame, write_frame,
-    ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished, EXPORTER_LABEL,
+    configure_tunnel_socket, create_tunnel_tls_server_config, read_frame, verify_proxy_auth_token,
+    write_frame, ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
-use ed25519_dalek::SigningKey;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, RETRY_AFTER, WWW_AUTHENTICATE};
@@ -22,10 +22,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -33,60 +32,68 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 use yamux::Mode;
 
-type BoxHttpBody = BoxBody<Bytes, hyper::Error>;
+pub type BoxHttpBody = BoxBody<Bytes, hyper::Error>;
 
-fn full_body(s: impl Into<Bytes>) -> BoxHttpBody {
-    Full::new(s.into())
-        .map_err(|never| match never {})
+fn full_body<T: Into<Bytes>>(chunk: T) -> BoxHttpBody {
+    Full::new(chunk.into())
+        .map_err(|e| match e {})
         .boxed()
 }
 
-/// Sliding-window per-IP authentication failure rate limiter.
-pub struct IpRateLimiter {
-    max_failures_per_min: u32,
-    records: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+pub fn build_public_tls_acceptor(config: &ProxyConfig) -> Result<Option<TlsAcceptor>> {
+    match config.tls.mode.as_str() {
+        "off" => Ok(None),
+        "self-signed" => {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+            let cert_der = CertificateDer::from(cert.cert);
+            let key_der =
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)?;
+            Ok(Some(TlsAcceptor::from(Arc::new(server_cfg))))
+        }
+        "manual" => {
+            let cert_path_str = config.tls.cert_path.as_ref().ok_or_else(|| {
+                anyhow!("tls.cert_path is required when tls.mode is set to 'manual'")
+            })?;
+            let key_path_str = config.tls.key_path.as_ref().ok_or_else(|| {
+                anyhow!("tls.key_path is required when tls.mode is set to 'manual'")
+            })?;
+            let cert_path = expand_path(cert_path_str)?;
+            let key_path = expand_path(key_path_str)?;
+            enforce_private_file_permissions(&key_path)?;
+
+            let cert_file = File::open(&cert_path)
+                .with_context(|| format!("Failed to open TLS cert {}", cert_path.display()))?;
+            let mut cert_reader = BufReader::new(cert_file);
+            let certs: Vec<CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+            let key_file = File::open(&key_path)
+                .with_context(|| format!("Failed to open TLS key {}", key_path.display()))?;
+            let mut key_reader = BufReader::new(key_file);
+            let key = rustls_pemfile::private_key(&mut key_reader)?
+                .ok_or_else(|| anyhow!("No private key found in {}", key_path.display()))?;
+
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?;
+            Ok(Some(TlsAcceptor::from(Arc::new(server_cfg))))
+        }
+        other => Err(anyhow!(
+            "Invalid tls.mode '{}' (expected 'off', 'self-signed', or 'manual')",
+            other
+        )),
+    }
 }
 
-impl IpRateLimiter {
-    pub fn new(max_failures_per_min: u32) -> Self {
-        Self {
-            max_failures_per_min: max_failures_per_min.max(1),
-            records: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn is_rate_limited(&self, ip: IpAddr) -> bool {
-        let mut guard = self.records.lock().unwrap();
-        let now = Instant::now();
-        let cutoff = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
-        if let Some(times) = guard.get_mut(&ip) {
-            times.retain(|&t| t > cutoff);
-            times.len() as u32 >= self.max_failures_per_min
-        } else {
-            false
-        }
-    }
-
-    pub fn record_failure(&self, ip: IpAddr) {
-        let mut guard = self.records.lock().unwrap();
-        let now = Instant::now();
-        let cutoff = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
-        let entry = guard.entry(ip).or_default();
-        entry.retain(|&t| t > cutoff);
-        entry.push(now);
-    }
-
-    pub fn clear_ip(&self, ip: IpAddr) {
-        let mut guard = self.records.lock().unwrap();
-        guard.remove(&ip);
-    }
-}
-
-/// Manages a persistent public port listener and its hot-swappable tunnel session.
 pub struct PortWorker {
     pub port: u16,
-    pub owner_pubkey: RwLock<[u8; 32]>,
-    pub verifier: RwLock<PasskeyVerifier>,
     pub active_mux: RwLock<Option<MuxHandle>>,
     pub session_gen: AtomicU64,
     pub shutdown_notify: Notify,
@@ -102,19 +109,18 @@ impl PortWorker {
     }
 }
 
-/// Shared state across the `olp-proxy` instance.
 pub struct ProxyState {
     pub config: ProxyConfig,
-    pub signing_key: SigningKey,
-    pub auth_keys_path: PathBuf,
+    pub user_verifier: PasskeyVerifier,
     pub allowed_port_range: (u16, u16),
     pub control_port: u16,
+    pub server_ip_filter: Arc<IpFilter>,
+    pub user_ip_filter: Arc<IpFilter>,
     pub workers: Mutex<HashMap<u16, Arc<PortWorker>>>,
     pub rate_limiter: Arc<IpRateLimiter>,
     pub public_tls_acceptor: Option<TlsAcceptor>,
 }
 
-/// Extracts and validates the user passkey from Basic Auth or Bearer Token headers.
 pub fn verify_http_headers_auth(
     headers: &hyper::HeaderMap,
     verifier: &PasskeyVerifier,
@@ -152,7 +158,6 @@ pub fn verify_http_headers_auth(
     false
 }
 
-/// Extracts and validates the user passkey from an incoming HTTP request.
 pub fn verify_http_request_auth(
     req: &Request<Incoming>,
     verifier: &PasskeyVerifier,
@@ -160,73 +165,10 @@ pub fn verify_http_request_auth(
     verify_http_headers_auth(req.headers(), verifier)
 }
 
-/// Builds the optional TLS acceptor for public user ports (`off`, `self-signed`, or `manual`).
-fn build_public_tls_acceptor(cfg: &ProxyConfig) -> Result<Option<TlsAcceptor>> {
-    let mode = cfg.tls.mode.trim().to_lowercase();
-    if mode == "off" || mode == "http" || mode.is_empty() {
-        return Ok(None);
-    }
-
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-
-    if mode == "self-signed" {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
-        let cert_der = CertificateDer::from(cert.cert);
-        let key_der =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
-        let tls_cfg = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)?;
-        return Ok(Some(TlsAcceptor::from(Arc::new(tls_cfg))));
-    }
-
-    if mode == "manual" {
-        let cert_path = expand_path(
-            cfg.tls
-                .cert_path
-                .as_deref()
-                .ok_or_else(|| anyhow!("tls.cert_path required when tls.mode = 'manual'"))?,
-        )?;
-        let key_path = expand_path(
-            cfg.tls
-                .key_path
-                .as_deref()
-                .ok_or_else(|| anyhow!("tls.key_path required when tls.mode = 'manual'"))?,
-        )?;
-
-        let cert_file = File::open(&cert_path)
-            .with_context(|| format!("Failed to open TLS cert {}", cert_path.display()))?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_reader).collect::<std::result::Result<Vec<_>, _>>()?;
-
-        let key_file = File::open(&key_path)
-            .with_context(|| format!("Failed to open TLS key {}", key_path.display()))?;
-        let mut key_reader = BufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut key_reader)?
-            .ok_or_else(|| anyhow!("No private key found in {}", key_path.display()))?;
-
-        let tls_cfg = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
-        return Ok(Some(TlsAcceptor::from(Arc::new(tls_cfg))));
-    }
-
-    Err(anyhow!(
-        "Unsupported tls.mode '{}' (supported: 'off', 'self-signed', 'manual')",
-        mode
-    ))
-}
-
-/// Binds a TCP listener with `SO_REUSEADDR` enabled.
 pub fn bind_reusable_listener(addr: SocketAddr) -> Result<TcpListener> {
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
@@ -237,16 +179,17 @@ pub fn bind_reusable_listener(addr: SocketAddr) -> Result<TcpListener> {
     Ok(TcpListener::from_std(std_listener)?)
 }
 
-/// Starts the `olp-proxy` server using the provided configuration and returns the bound control address
-/// and a join handle for the background server loop.
 pub async fn start_proxy_server(
     config: ProxyConfig,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    let priv_path = expand_path(&config.keys.private_key)?;
-    let signing_key = load_or_generate_keypair(&priv_path, "olp-proxy-ed25519")?;
-    let auth_keys_path = expand_path(&config.keys.authorized_keys)?;
     let allowed_port_range = config.parse_allowed_port_range()?;
     let public_tls_acceptor = build_public_tls_acceptor(&config)?;
+    let user_verifier = PasskeyVerifier::from_passkey(&config.auth.passkey_user);
+
+    let server_ip_filter =
+        Arc::new(IpFilter::new(&config.security.allowed_server_cidrs).context("Invalid allowed_server_cidrs")?);
+    let user_ip_filter =
+        Arc::new(IpFilter::new(&config.security.allowed_user_cidrs).context("Invalid allowed_user_cidrs")?);
 
     let listen_sock_addr: SocketAddr = config
         .proxy
@@ -265,10 +208,11 @@ pub async fn start_proxy_server(
             config.security.max_auth_failures_per_min,
         )),
         config,
-        signing_key,
-        auth_keys_path,
+        user_verifier,
         allowed_port_range,
         control_port: local_addr.port(),
+        server_ip_filter,
+        user_ip_filter,
         workers: Mutex::new(HashMap::new()),
         public_tls_acceptor,
     });
@@ -285,6 +229,14 @@ pub async fn start_proxy_server(
                     let state_clone = state.clone();
                     let acceptor = tunnel_tls_acceptor.clone();
                     tokio::spawn(async move {
+                        if !state_clone.server_ip_filter.is_allowed(&peer_addr.ip()) {
+                            warn!(
+                                "[IP FILTER] Dropped tunnel connection from {} (not in allowed_server_cidrs)",
+                                peer_addr
+                            );
+                            return;
+                        }
+
                         if let Err(e) =
                             handle_incoming_tunnel(tcp_stream, peer_addr, acceptor, state_clone)
                                 .await
@@ -312,7 +264,6 @@ async fn handle_incoming_tunnel(
 ) -> Result<()> {
     configure_tunnel_socket(&tcp_stream)?;
 
-    // Enforce 10-second handshake timeout against port scanners
     let mut tls_stream = tokio::time::timeout(
         Duration::from_secs(10),
         acceptor.accept(tcp_stream),
@@ -321,16 +272,8 @@ async fn handle_incoming_tunnel(
     .context("TLS handshake timed out")?
     .context("TLS handshake failed")?;
 
-    // Extract RFC 8446 TLS 1.3 Exporter channel binding value
-    let mut exporter = [0u8; 32];
-    tls_stream
-        .get_ref()
-        .1
-        .export_keying_material(&mut exporter, EXPORTER_LABEL, None)
-        .context("Failed to derive RFC 8446 TLS exporter")?;
-
-    // Step 1: Send ProxyHelloChallenge
-    let challenge = ProxyHelloChallenge::create(&state.signing_key, &exporter);
+    // Step 1: Send ProxyHelloChallenge with fresh CSPRNG nonce
+    let challenge = ProxyHelloChallenge::new();
     tokio::time::timeout(
         Duration::from_secs(10),
         write_frame(&mut tls_stream, &challenge),
@@ -346,33 +289,15 @@ async fn handle_incoming_tunnel(
     .await
     .context("Timed out waiting for ServerAuthRegister")??;
 
-    // Verify server signature over TLS exporter & challenge nonce
-    let server_key = match register.verify(&exporter, &challenge.proxy_nonce) {
-        Ok(k) => k,
-        Err(e) => {
-            let _ = write_frame(
-                &mut tls_stream,
-                &TunnelEstablished {
-                    accepted: false,
-                    message: format!("ERR_SIGNATURE_INVALID: {}", e),
-                },
-            )
-            .await;
-            return Err(e);
-        }
-    };
+    // Step 3: Verify passkey_proxy in constant time
+    let is_valid = verify_proxy_auth_token(
+        &register.auth_token,
+        &state.config.auth.passkey_proxy,
+        &challenge.proxy_nonce,
+    );
 
-    let req_port = register.remote_port;
-
-    // Check authorized_keys dynamically (supports hot-reload without restarting olp-proxy!)
-    let is_authorized = verify_authorized_key(&state.auth_keys_path, &server_key, req_port)
-        .unwrap_or(false);
-    if !is_authorized {
-        let key_str = format_pubkey("olp-server-ed25519", &server_key);
-        let msg = format!(
-            "ERR_UNAUTHORIZED_KEY: server public key '{}' is not in proxy authorized_keys (or port {} not permitted)",
-            key_str, req_port
-        );
+    if !is_valid {
+        let msg = "ERR_INVALID_PASSKEY_PROXY: The proxy rejected your passkey_proxy. Ensure [server].passkey_proxy in server.toml matches [auth].passkey_proxy in proxy.toml.".to_string();
         let _ = write_frame(
             &mut tls_stream,
             &TunnelEstablished {
@@ -384,22 +309,18 @@ async fn handle_incoming_tunnel(
 
         error!(
             "\n================================================================================\n\
-             [UNAUTHORIZED TUNNEL ATTEMPT] from {}\n\
-             Server Public Key : {}\n\
-             Requested Port    : {}\n\n\
-             To authorize this server on this proxy, run:\n\
-               ./start-proxy.sh --add-key \"{}\"\n\
-             (or append that line to {})\n\
+             [AUTH ERROR] Tunnel connection from {} rejected: invalid passkey_proxy!\n\
+             Please verify that [server].passkey_proxy in server.toml on the client matches\n\
+             [auth].passkey_proxy in {} on this proxy.\n\
              ================================================================================",
             peer_addr,
-            key_str,
-            req_port,
-            key_str,
-            state.auth_keys_path.display()
+            state.config.auth.passkey_proxy
         );
 
         return Err(anyhow!(msg));
     }
+
+    let req_port = register.remote_port;
 
     // Check port range guardrails
     let (min_port, max_port) = state.allowed_port_range;
@@ -420,12 +341,7 @@ async fn handle_incoming_tunnel(
     }
 
     // Acquire or hot-swap PortWorker for `req_port`
-    let worker = match get_or_create_port_worker(
-        &state,
-        req_port,
-        register.server_pubkey,
-        register.passkey_verifier.clone(),
-    ) {
+    let worker = match get_or_create_port_worker(&state, req_port) {
         Ok(w) => w,
         Err(e) => {
             let _ = write_frame(
@@ -458,8 +374,6 @@ async fn handle_incoming_tunnel(
 
     let my_gen = worker.session_gen.fetch_add(1, Ordering::SeqCst) + 1;
     {
-        *worker.owner_pubkey.write().unwrap() = register.server_pubkey;
-        *worker.verifier.write().unwrap() = register.passkey_verifier;
         *worker.active_mux.write().unwrap() = Some(mux_handle);
     }
 
@@ -495,18 +409,9 @@ async fn handle_incoming_tunnel(
 fn get_or_create_port_worker(
     state: &Arc<ProxyState>,
     port: u16,
-    server_pubkey: [u8; 32],
-    verifier: PasskeyVerifier,
 ) -> Result<Arc<PortWorker>> {
     let mut guard = state.workers.lock().unwrap();
     if let Some(existing) = guard.get(&port) {
-        let current_owner = *existing.owner_pubkey.read().unwrap();
-        if current_owner != server_pubkey && existing.has_active_session() {
-            return Err(anyhow!(
-                "Port {} is currently in use by another authenticated olp-server",
-                port
-            ));
-        }
         return Ok(existing.clone());
     }
 
@@ -516,8 +421,6 @@ fn get_or_create_port_worker(
 
     let worker = Arc::new(PortWorker {
         port,
-        owner_pubkey: RwLock::new(server_pubkey),
-        verifier: RwLock::new(verifier),
         active_mux: RwLock::new(None),
         session_gen: AtomicU64::new(0),
         shutdown_notify: Notify::new(),
@@ -614,8 +517,21 @@ async fn handle_public_http_request(
     worker: Arc<PortWorker>,
     state: Arc<ProxyState>,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
-    // 1. Check pre-tunnel IP brute-force rate limiter
-    if state.rate_limiter.is_rate_limited(client_ip) {
+    // 1. Check CIDR IP filter for user HTTP connections
+    if !state.user_ip_filter.is_allowed(&client_ip) {
+        warn!(
+            "[IP FILTER] Rejected user HTTP connection from {} (not in allowed_user_cidrs)",
+            client_ip
+        );
+        let mut resp = Response::new(full_body(
+            r#"{"error":"forbidden: IP address not allowed by proxy filter"}"#,
+        ));
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        return Ok(resp);
+    }
+
+    // 2. Check pre-tunnel IP brute-force rate limiter
+    if state.rate_limiter.is_locked_out(&client_ip).is_some() {
         let mut resp = Response::new(full_body(
             r#"{"error":"too many failed authentication attempts, try again later"}"#,
         ));
@@ -625,12 +541,11 @@ async fn handle_public_http_request(
         return Ok(resp);
     }
 
-    // 2. Verify Basic Auth or Bearer Token in constant time
-    let verifier = worker.verifier.read().unwrap().clone();
-    if !verify_http_request_auth(&req, &verifier) {
+    // 3. Verify passkey_user using Basic Auth or Bearer Token in constant time
+    if !verify_http_request_auth(&req, &state.user_verifier) {
         state.rate_limiter.record_failure(client_ip);
         let mut resp = Response::new(full_body(
-            r#"{"error":"unauthorized: valid Basic Auth or Bearer passkey required"}"#,
+            r#"{"error":"unauthorized: valid Basic Auth (username:passkey_user) or Bearer passkey_user required"}"#,
         ));
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
         resp.headers_mut().insert(
@@ -640,42 +555,44 @@ async fn handle_public_http_request(
         return Ok(resp);
     }
 
-    // 3. Obtain current hot-swappable MuxHandle
-    let mux_opt = worker.active_mux.read().unwrap().clone();
-    let mux = match mux_opt {
+    state.rate_limiter.record_success(&client_ip);
+
+    // 4. Retrieve active Yamux session
+    let mux = {
+        let guard = worker.active_mux.read().unwrap();
+        guard.clone()
+    };
+
+    let mux = match mux {
         Some(m) if !m.is_closed() => m,
         _ => {
             let mut resp = Response::new(full_body(
-                r#"{"error":"olp-server tunnel is currently disconnected or reconnecting"}"#,
+                r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#,
             ));
             *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            resp.headers_mut()
-                .insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("2"));
             return Ok(resp);
         }
     };
 
-    // 4. Open multiplexed stream to `olp-server`
-    let yamux_stream = match mux.open_stream().await {
+    // 5. Open new Yamux substream to `olp-server`
+    let mux_stream = match mux.open_stream().await {
         Ok(s) => s,
         Err(_) => {
             let mut resp = Response::new(full_body(
-                r#"{"error":"failed to open multiplexed stream to olp-server"}"#,
+                r#"{"error":"failed to open substream to olp-server"}"#,
             ));
-            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            resp.headers_mut()
-                .insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("2"));
+            *resp.status_mut() = StatusCode::BAD_GATEWAY;
             return Ok(resp);
         }
     };
 
-    // 5. Stream HTTP request & response over the yamux stream with zero full-body buffering
-    let (mut sender, conn) =
-        match hyper::client::conn::http1::handshake(TokioIo::new(yamux_stream)).await {
+    // 6. Forward HTTP request with stripped Authorization header
+    let (mut client_sender, conn) =
+        match hyper::client::conn::http1::handshake(TokioIo::new(mux_stream)).await {
             Ok(pair) => pair,
             Err(_) => {
                 let mut resp = Response::new(full_body(
-                    r#"{"error":"tunnel stream HTTP handshake failed"}"#,
+                    r#"{"error":"failed HTTP handshake over tunnel substream"}"#,
                 ));
                 *resp.status_mut() = StatusCode::BAD_GATEWAY;
                 return Ok(resp);
@@ -686,15 +603,21 @@ async fn handle_public_http_request(
         let _ = conn.await;
     });
 
-    match sender.send_request(req).await {
-        Ok(upstream_resp) => Ok(upstream_resp.map(|b| b.boxed())),
+    let (mut parts, body) = req.into_parts();
+    parts.headers.remove(AUTHORIZATION);
+    let forward_req = Request::from_parts(parts, body);
+
+    match client_sender.send_request(forward_req).await {
+        Ok(upstream_resp) => {
+            let (u_parts, u_body) = upstream_resp.into_parts();
+            let boxed_body = u_body.map_err(|e| e).boxed();
+            Ok(Response::from_parts(u_parts, boxed_body))
+        }
         Err(_) => {
             let mut resp = Response::new(full_body(
-                r#"{"error":"olp-server tunnel disconnected or reconnecting"}"#,
+                r#"{"error":"upstream olp-server failed to respond"}"#,
             ));
-            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            resp.headers_mut()
-                .insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("2"));
+            *resp.status_mut() = StatusCode::BAD_GATEWAY;
             Ok(resp)
         }
     }

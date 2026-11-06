@@ -148,7 +148,7 @@ elif [ "$ACTION" = "restart" ]; then
 elif pid=$(is_running); then
     # Running without 'restart' flag: check if user passed query arguments
     case "${1:-}" in
-        --show-pubkey|--set-proxy-key|-h|--help|-V|--version)
+        -h|--help|-V|--version|--init-only|--non-interactive)
             # Allow query commands to proceed without conflicting with the running daemon
             ;;
         *)

@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use olp::config::{ensure_proxy_initialized, expand_path, olp_home_dir};
-use olp::keys::{add_authorized_key, format_pubkey, load_or_generate_keypair};
+use olp::config::{ensure_proxy_initialized, olp_home_dir};
 use olp::proxy::start_proxy_server;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -17,15 +16,7 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Print olp-proxy's public key and exit
-    #[arg(long)]
-    show_pubkey: bool,
-
-    /// Authorize an olp-server public key (appends to ~/.olp/keys/authorized_keys) and exit
-    #[arg(long)]
-    add_key: Option<String>,
-
-    /// Initialize ~/.olp/proxy.toml and keys, then exit without starting the listener
+    /// Initialize ~/.olp/proxy.toml with random passkeys, then exit without starting the listener
     #[arg(long)]
     init_only: bool,
 
@@ -64,44 +55,24 @@ async fn main() -> Result<()> {
     };
 
     let cfg = ensure_proxy_initialized(&config_path, args.non_interactive)?;
-    let priv_path = expand_path(&cfg.keys.private_key)?;
-    let signing_key = load_or_generate_keypair(&priv_path, "olp-proxy-ed25519")?;
-    let pubkey_str = format_pubkey("olp-proxy-ed25519", &signing_key.verifying_key());
-
-    if args.show_pubkey {
-        println!("{}", pubkey_str);
-        return Ok(());
-    }
-
-    if let Some(ref server_key) = args.add_key {
-        let auth_path = expand_path(&cfg.keys.authorized_keys)?;
-        add_authorized_key(&auth_path, server_key)?;
-        println!(
-            "[olp-proxy] Successfully authorized server key in {}",
-            auth_path.display()
-        );
-        return Ok(());
-    }
 
     if args.init_only {
+        println!("[olp-proxy] Initialization complete.");
         return Ok(());
     }
 
-    println!("================================================================================");
+    println!("\n================================================================================");
     println!("  olp-proxy starting");
-    println!("  Config      : {}", config_path.display());
-    println!("  Listen Addr : {}", cfg.proxy.listen_addr);
-    println!("  Public Key  : {}", pubkey_str);
-    println!("================================================================================");
+    println!("  Config               : {}", config_path.display());
+    println!("  Listen Addr          : {}", cfg.proxy.listen_addr);
+    println!("  Allowed Server CIDRs : {:?}", cfg.security.allowed_server_cidrs);
+    println!("  Allowed User CIDRs   : {:?}", cfg.security.allowed_user_cidrs);
+    println!("================================================================================\n");
 
-    let (_bound_addr, handle) = start_proxy_server(cfg).await?;
+    let (_bound_addr, _server_task) = start_proxy_server(cfg).await?;
 
-    tokio::select! {
-        _ = wait_for_shutdown_signal() => {
-            println!("\n[olp-proxy] Shutting down cleanly...");
-        }
-        _ = handle => {}
-    }
+    wait_for_shutdown_signal().await;
+    println!("\n[olp-proxy] Shutting down cleanly...");
 
     Ok(())
 }

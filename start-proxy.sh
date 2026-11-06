@@ -146,7 +146,7 @@ elif [ "$ACTION" = "restart" ]; then
     shift || true
 elif pid=$(is_running); then
     case "${1:-}" in
-        --show-pubkey|--add-key|-h|--help|-V|--version)
+        -h|--help|-V|--version|--init-only|--non-interactive)
             ;;
         *)
             echo "[olp-proxy] Already running (PID: $pid)."
