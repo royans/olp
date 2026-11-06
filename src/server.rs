@@ -113,7 +113,7 @@ pub async fn run_single_tunnel_session(
     connector: &TlsConnector,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    info!("Connecting to olp-proxy at {} ...", config.server.proxy_addr);
+    info!("Connecting to olp-proxy at {} (TLS 1.3)...", config.server.proxy_addr);
 
     let tcp_stream = tokio::time::timeout(
         Duration::from_secs(10),
@@ -172,7 +172,7 @@ pub async fn run_single_tunnel_session(
     }
 
     info!(
-        "Tunnel established! Exposing local Ollama ({}) on remote port :{}",
+        "TLS 1.3 tunnel established! Exposing local Ollama ({}) on remote port :{}",
         config.server.ollama_addr, config.server.remote_port
     );
 

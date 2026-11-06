@@ -227,7 +227,7 @@ pub async fn start_proxy_server(
     });
 
     info!(
-        "olp-proxy listening for olp-server tunnels on {}",
+        "olp-proxy listening for olp-server tunnels on {} (TLS 1.3 encrypted)",
         local_addr
     );
 

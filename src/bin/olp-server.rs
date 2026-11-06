@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     println!("\n================================================================================");
     println!("  olp-server starting");
     println!("  Config       : {}", config_path.display());
-    println!("  Proxy Target : {}", cfg.server.proxy_addr);
+    println!("  Proxy Target : {} (TLS 1.3 encrypted)", cfg.server.proxy_addr);
     println!("  Local Ollama : {}", cfg.server.ollama_addr);
     println!("  Remote Port  : {}", cfg.server.remote_port);
     println!("================================================================================\n");

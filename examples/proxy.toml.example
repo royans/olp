@@ -41,8 +41,10 @@ max_auth_failures_per_min = 60
 max_concurrent_streams = 128
 
 [tls]
-# Public Ollama endpoint TLS mode: "off" (plain HTTP), "manual" (custom PEM files), or "self-signed"
+# Public Ollama endpoint TLS mode: "off" (plain HTTP), "manual" (Let's Encrypt / custom PEM), or "self-signed"
+# NOTE: The reverse tunnel connection between olp-server and olp-proxy (:4443) is ALWAYS encrypted with TLS 1.3.
+# This [tls] section only controls the public user-facing port (e.g. :11434).
 mode = "off"
 # If mode = "manual":
-# cert_path = "~/.olp/tls_cert.pem"
-# key_path = "~/.olp/tls_key.pem"
+# cert_path = "~/.olp/tls/fullchain.pem"
+# key_path = "~/.olp/tls/privkey.pem"

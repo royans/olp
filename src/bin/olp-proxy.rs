@@ -64,7 +64,8 @@ async fn main() -> Result<()> {
     println!("\n================================================================================");
     println!("  olp-proxy starting");
     println!("  Config               : {}", config_path.display());
-    println!("  Listen Addr          : {}", cfg.proxy.listen_addr);
+    println!("  Listen Addr (Tunnel) : {} (TLS 1.3 encrypted)", cfg.proxy.listen_addr);
+    println!("  Public TLS Mode      : {}", cfg.tls.mode);
     println!("  Allowed Server CIDRs : {:?}", cfg.security.allowed_server_cidrs);
     println!("  Allowed User CIDRs   : {:?}", cfg.security.allowed_user_cidrs);
     println!("================================================================================\n");
