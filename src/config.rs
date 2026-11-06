@@ -405,23 +405,46 @@ pub fn ensure_server_initialized(
         println!("  [olp-server] First-Time Configuration Setup");
         println!("================================================================================\n");
 
-        cfg.server.proxy_addr =
-            prompt_line("Remote olp-proxy address (host:port)", &cfg.server.proxy_addr)?;
+        // 1. Proxy Host & Port
+        let proxy_host_input = prompt_line("Proxy server address/host", "ssh3.blogofy.com")?;
+        let (host, default_port) = match proxy_host_input.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() && p.parse::<u16>().is_ok() => {
+                (h.to_string(), p.to_string())
+            }
+            _ => (proxy_host_input, "4443".to_string()),
+        };
+
+        let proxy_port = prompt_line("Proxy tunnel control port", &default_port)?;
+        cfg.server.proxy_addr = format!("{}:{}", host.trim(), proxy_port.trim());
+
+        // 2. Local Ollama address
         cfg.server.ollama_addr =
             prompt_line("Local Ollama address", &cfg.server.ollama_addr)?;
 
+        // 3. Port to serve the service on via the proxy
         let port_str = prompt_line(
-            "External port to expose on olp-proxy",
+            "Port on the proxy to serve Ollama on (public port)",
             &cfg.server.remote_port.to_string(),
         )?;
         cfg.server.remote_port = port_str
+            .trim()
             .parse::<u16>()
-            .context("Remote port must be a valid port number")?;
+            .context("Public port must be a valid port number (1024-65535)")?;
 
-        cfg.server.passkey_proxy = prompt_line(
-            "Passkey for proxy (passkey_proxy from proxy.toml)",
-            "",
-        )?;
+        // 4. Passkey for proxy
+        loop {
+            let key = prompt_line(
+                "Passkey for proxy (passkey_proxy from proxy.toml)",
+                "",
+            )?;
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                cfg.server.passkey_proxy = trimmed.to_string();
+                break;
+            } else {
+                println!("  [!] passkey_proxy is required to connect to the proxy. Please enter it:");
+            }
+        }
     }
 
     if cfg.server.passkey_proxy.is_empty() {
