@@ -2,7 +2,7 @@
 name = "olp"
 version = "0.1.0"
 edition = "2021"
-description = "Lightweight, resilient, mutually-authenticated reverse proxy and tunnel for Ollama (olp-proxy & olp-server)"
+description = "Lightweight, resilient reverse proxy and reverse tunnel for Ollama with two-passkey auth and CIDR IP filtering"
 license = "MIT"
 repository = "https://github.com/royans/olp"
 homepage = "https://github.com/royans/olp"
