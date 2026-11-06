@@ -406,7 +406,7 @@ pub fn ensure_server_initialized(
         println!("================================================================================\n");
 
         // 1. Proxy Host & Port
-        let proxy_host_input = prompt_line("Proxy server address/host", "ssh3.blogofy.com")?;
+        let proxy_host_input = prompt_line("Proxy server address/host", "proxy.example.com")?;
         let (host, default_port) = match proxy_host_input.rsplit_once(':') {
             Some((h, p)) if !h.is_empty() && p.parse::<u16>().is_ok() => {
                 (h.to_string(), p.to_string())

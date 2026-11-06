@@ -27,7 +27,7 @@ for arg in "$@"; do
         echo "Usage: sudo ./renew-tls.sh [DOMAIN] [OPTIONS]"
         echo ""
         echo "Arguments:"
-        echo "  DOMAIN            Public domain pointing to this proxy (e.g. ssh3.blogofy.com)"
+        echo "  DOMAIN            Public domain pointing to this proxy (e.g. proxy.example.com)"
         echo ""
         echo "Options:"
         echo "  --cron, -q        Run quietly for automated cron execution"
@@ -110,7 +110,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: sudo ./renew-tls.sh [DOMAIN] [OPTIONS]"
             echo ""
             echo "Arguments:"
-            echo "  DOMAIN            Public domain pointing to this proxy (e.g. ssh3.blogofy.com)"
+            echo "  DOMAIN            Public domain pointing to this proxy (e.g. proxy.example.com)"
             echo ""
             echo "Options:"
             echo "  --cron, -q        Run quietly for automated cron execution"
@@ -159,7 +159,7 @@ if [ -z "$DOMAIN" ]; then
                 DOMAIN="$DETECTED_HOST"
             fi
         else
-            read -r -p "Enter the public domain name for this server (e.g. ssh3.blogofy.com): " INPUT_DOMAIN
+            read -r -p "Enter the public domain name for this server (e.g. proxy.example.com): " INPUT_DOMAIN
             DOMAIN="$(echo "$INPUT_DOMAIN" | tr -d '[:space:]')"
         fi
     fi

@@ -5,7 +5,7 @@
 
 [server]
 # Address and port of the public olp-proxy control listener
-proxy_addr = "ssh3.blogofy.com:4443"
+proxy_addr = "proxy.example.com:4443"
 
 # Local address of the Ollama service to expose
 # Note: olp-server automatically queries Ollama and maps client requests to whatever

@@ -105,7 +105,7 @@ cd olp
 ```
 
 When prompted:
-1. Enter your proxy host (e.g. `ssh3.blogofy.com:4443`).
+1. Enter your proxy host (e.g. `proxy.example.com:4443`).
 2. Paste `passkey_proxy` from Step 1.
 
 The tunnel connects immediately:
@@ -151,13 +151,13 @@ mode = "off" # Set to "manual" when using Let's Encrypt / custom certs
 
 ## Enabling Valid TLS / HTTPS with Let's Encrypt (`olp-proxy`)
 
-To enable native `https://` (e.g. `https://ssh3.blogofy.com:11434`) without certificate warnings, use the automated provisioning script **`renew-tls.sh`** on the proxy host:
+To enable native `https://` (e.g. `https://proxy.example.com:11434`) without certificate warnings, use the automated provisioning script **`renew-tls.sh`** on the proxy host:
 
 ### 1. Provision Certificate (One-Time Setup)
 
 ```bash
 # On your public proxy host:
-sudo ./renew-tls.sh ssh3.blogofy.com
+sudo ./renew-tls.sh proxy.example.com
 ```
 
 The script:
@@ -186,7 +186,7 @@ When renewal occurs, the script automatically exports the refreshed certs to `~/
 ### `~/.olp/server.toml`
 ```toml
 [server]
-proxy_addr = "ssh3.blogofy.com:4443"
+proxy_addr = "proxy.example.com:4443"
 ollama_addr = "127.0.0.1:11434"
 remote_port = 11434
 passkey_proxy = "your-secret-proxy-passkey"
@@ -207,7 +207,7 @@ Cline connects cleanly through `olp-proxy`:
 
 1. In Cline Settings, select **API Provider**: `Ollama`.
 2. Check **Use custom base URL**:
-   - `http://ssh3.blogofy.com:11434`
+   - `http://proxy.example.com:11434`
 3. Enter **Ollama API Key**: `<passkey_user>` (your `passkey_user` from `proxy.toml`).
 4. In **Model**, enter **any model name** (or `default`, `llama3.1`, etc.).
    - `olp-server` automatically routes to whatever model is loaded in Ollama (e.g. `hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M`).
@@ -220,24 +220,24 @@ Cline connects cleanly through `olp-proxy`:
 ### Using curl with Bearer Token (or custom API Key)
 ```bash
 # Model name can be anything: olp-server automatically rewrites it to whatever is loaded!
-curl -X POST http://ssh3.blogofy.com:11434/api/generate \
+curl -X POST http://proxy.example.com:11434/api/generate \
   -H "Authorization: Bearer <passkey_user>" \
   -d '{"model": "auto", "prompt": "Why is the sky blue?"}'
 
 # Or using x-api-key header:
-curl -X POST http://ssh3.blogofy.com:11434/api/generate \
+curl -X POST http://proxy.example.com:11434/api/generate \
   -H "x-api-key: <passkey_user>" \
   -d '{"model": "default", "prompt": "Hello!"}'
 ```
 
 ### Using curl with HTTP Basic Auth
 ```bash
-curl -u "user:<passkey_user>" http://ssh3.blogofy.com:11434/api/tags
+curl -u "user:<passkey_user>" http://proxy.example.com:11434/api/tags
 ```
 
 ### Using Official Ollama CLI
 ```bash
-export OLLAMA_HOST="http://user:<passkey_user>@ssh3.blogofy.com:11434"
+export OLLAMA_HOST="http://user:<passkey_user>@proxy.example.com:11434"
 ollama list
 ollama run default
 ```
