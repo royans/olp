@@ -24,25 +24,39 @@ if [ -f "$HOME/.cargo/env" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 1. Detect if compiled binary already exists
+# 1. Detect if compiled binary already exists and is up to date
 # ------------------------------------------------------------------------------
+is_binary_outdated() {
+    local bin="$1"
+    if [ ! -f "$bin" ]; then
+        return 0
+    fi
+    if [ -d "$SCRIPT_DIR/src" ]; then
+        local newer
+        newer=$(find "$SCRIPT_DIR/src" "$SCRIPT_DIR/Cargo.toml" -type f -newer "$bin" 2>/dev/null | head -n 1)
+        if [ -n "$newer" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 find_compiled_binary() {
-    if [ -x "$SCRIPT_DIR/olp-server" ]; then
-        echo "$SCRIPT_DIR/olp-server"
-        return 0
-    fi
-    if [ -x "$SCRIPT_DIR/target/release/olp-server" ]; then
-        echo "$SCRIPT_DIR/target/release/olp-server"
-        return 0
-    fi
-    if [ -x "$SCRIPT_DIR/target/debug/olp-server" ]; then
-        echo "$SCRIPT_DIR/target/debug/olp-server"
-        return 0
-    fi
-    if [ -x "$HOME/.cargo/bin/olp-server" ]; then
-        echo "$HOME/.cargo/bin/olp-server"
-        return 0
-    fi
+    for candidate in \
+        "$SCRIPT_DIR/olp-server" \
+        "$SCRIPT_DIR/target/release/olp-server" \
+        "$SCRIPT_DIR/target/debug/olp-server" \
+        "$HOME/.cargo/bin/olp-server"; do
+        if [ -x "$candidate" ]; then
+            if is_binary_outdated "$candidate"; then
+                echo "[olp-server] Existing binary at $candidate is older than source files. Recompilation needed." >&2
+                NEED_RECOMPILE=1
+                return 1
+            fi
+            echo "$candidate"
+            return 0
+        fi
+    done
     if command -v olp-server >/dev/null 2>&1; then
         command -v olp-server
         return 0
@@ -161,6 +175,9 @@ elif pid=$(is_running); then
             ;;
     esac
 fi
+
+# Auto-check git updates on launch
+auto_update_from_git
 
 # ------------------------------------------------------------------------------
 # 4. Resolve Binary: Try User-Space First, Explain Root Needs & Fail Fast

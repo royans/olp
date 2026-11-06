@@ -227,3 +227,4 @@ mod tests {
         assert!(!filter.is_allowed(&"172.16.0.1".parse().unwrap()));
     }
 }
+
