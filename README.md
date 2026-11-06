@@ -195,6 +195,11 @@ ollama_addr = "127.0.0.1:11434"
 remote_port = 11434
 passkey_proxy = "your-secret-proxy-passkey"
 
+# TLS CA Certificate Verification (optional, auto-detected)
+# Defaults to true for public domain names, false for localhost / 127.0.0.1.
+# Enforces Mozilla WebPKI root verification (e.g. Let's Encrypt) to protect against MITM.
+# tls_verify = true
+
 [reconnect]
 strategy = "fibonacci"
 initial_delay_sec = 1

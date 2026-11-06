@@ -2,7 +2,7 @@ use crate::backoff::FibonacciBackoff;
 use crate::config::ServerConfig;
 use crate::mux::{spawn_mux_session, CompatYamuxStream};
 use crate::protocol::{
-    configure_tunnel_socket, create_tunnel_tls_client_config, read_frame, write_frame,
+    configure_tunnel_socket, create_tunnel_tls_client_config, extract_host, read_frame, write_frame,
     ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished,
 };
 use anyhow::{anyhow, Context, Result};
@@ -38,7 +38,13 @@ pub async fn run_server_with_shutdown(
     config: ServerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let tls_client_cfg = create_tunnel_tls_client_config()?;
+    let verify_ca = config.server.should_verify_ca();
+    if verify_ca {
+        info!("TLS certificate verification enabled (Mozilla WebPKI CA roots)");
+    } else {
+        info!("TLS certificate verification skipped (self-signed / internal / local tunnel)");
+    }
+    let tls_client_cfg = create_tunnel_tls_client_config(verify_ca)?;
     let connector = TlsConnector::from(tls_client_cfg);
 
     let mut backoff = FibonacciBackoff::new(
@@ -125,7 +131,9 @@ pub async fn run_single_tunnel_session(
 
     configure_tunnel_socket(&tcp_stream)?;
 
-    let server_name = ServerName::try_from("olp-tunnel.internal").unwrap();
+    let host = extract_host(&config.server.proxy_addr);
+    let server_name = ServerName::try_from(host.to_string())
+        .unwrap_or_else(|_| ServerName::try_from("olp-tunnel.internal".to_string()).unwrap());
     let mut tls_stream = tokio::time::timeout(
         Duration::from_secs(10),
         connector.connect(server_name, tcp_stream),

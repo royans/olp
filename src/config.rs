@@ -167,12 +167,36 @@ pub struct ServerConfig {
     pub reconnect: ReconnectSection,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerSection {
     pub proxy_addr: String,
     pub ollama_addr: String,
     pub remote_port: u16,
     pub passkey_proxy: String,
+    #[serde(default)]
+    pub tls_verify: Option<bool>,
+}
+
+impl ServerSection {
+    /// Determines whether to verify the proxy's TLS certificate using Mozilla WebPKI root certificates.
+    /// If explicitly set in server.toml (`tls_verify = true/false`), uses that value.
+    /// Otherwise auto-detects: returns `true` for public domain names, and `false` for raw IP / 127.0.0.1 / localhost.
+    pub fn should_verify_ca(&self) -> bool {
+        if let Some(explicit) = self.tls_verify {
+            return explicit;
+        }
+
+        let host = crate::protocol::extract_host(&self.proxy_addr);
+        if host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host.parse::<std::net::IpAddr>().is_ok()
+        {
+            false
+        } else {
+            true
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +249,7 @@ impl ServerConfig {
                 ollama_addr: "127.0.0.1:11434".to_string(),
                 remote_port: 11434,
                 passkey_proxy: String::new(),
+                tls_verify: None,
             },
             reconnect: ReconnectSection::default(),
         }

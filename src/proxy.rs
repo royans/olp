@@ -209,8 +209,42 @@ pub async fn start_proxy_server(
     let listener = bind_reusable_listener(listen_sock_addr)?;
     let local_addr = listener.local_addr()?;
 
-    let tls_server_cfg = create_tunnel_tls_server_config()?;
-    let tunnel_tls_acceptor = TlsAcceptor::from(tls_server_cfg);
+    let tunnel_tls_acceptor = if config.tls.mode == "manual" {
+        if let (Some(cert_path_str), Some(key_path_str)) = (&config.tls.cert_path, &config.tls.key_path) {
+            let cert_path = expand_path(cert_path_str)?;
+            let key_path = expand_path(key_path_str)?;
+            if cert_path.exists() && key_path.exists() {
+                let cert_file = File::open(&cert_path)
+                    .with_context(|| format!("Failed to open TLS cert {}", cert_path.display()))?;
+                let mut cert_reader = BufReader::new(cert_file);
+                let certs: Vec<CertificateDer<'static>> =
+                    rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+                let key_file = File::open(&key_path)
+                    .with_context(|| format!("Failed to open TLS key {}", key_path.display()))?;
+                let mut key_reader = BufReader::new(key_file);
+                let key = rustls_pemfile::private_key(&mut key_reader)?
+                    .ok_or_else(|| anyhow!("No private key found in {}", key_path.display()))?;
+
+                let provider = Arc::new(rustls::crypto::ring::default_provider());
+                let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
+                    .with_protocol_versions(&[&rustls::version::TLS13])?
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)?;
+                info!(
+                    "Tunnel control port (:4443) secured with CA TLS certificate ({})",
+                    cert_path.display()
+                );
+                TlsAcceptor::from(Arc::new(server_cfg))
+            } else {
+                TlsAcceptor::from(create_tunnel_tls_server_config()?)
+            }
+        } else {
+            TlsAcceptor::from(create_tunnel_tls_server_config()?)
+        }
+    } else {
+        TlsAcceptor::from(create_tunnel_tls_server_config()?)
+    };
 
     let state = Arc::new(ProxyState {
         rate_limiter: Arc::new(IpRateLimiter::new(

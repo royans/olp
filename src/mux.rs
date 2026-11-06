@@ -47,7 +47,7 @@ where
 {
     let mut cfg = YamuxConfig::default();
     cfg.set_max_num_streams(max_num_streams);
-    let _ = cfg.set_receive_window(256 * 1024);
+    cfg.set_max_connection_receive_window(Some(256 * 1024 * max_num_streams));
 
     let compat_io = io.compat();
     let mut conn = Connection::new(compat_io, cfg, mode);

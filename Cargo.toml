@@ -22,7 +22,6 @@ blake3 = "1.5"
 bytes = "1.6"
 clap = { version = "4.5", features = ["derive"] }
 dirs = "5.0"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 futures = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1.4", features = ["full"] }
@@ -41,5 +40,6 @@ tokio-util = { version = "0.7", features = ["compat"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-yamux = "0.12"
+webpki-roots = "0.26"
+yamux = "0.13"
 

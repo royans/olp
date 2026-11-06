@@ -282,7 +282,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
-    let tls_client_cfg = create_tunnel_tls_client_config().unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
     let connector = TlsConnector::from(tls_client_cfg);
 
     // Case 1: Requesting privileged port 80 -> rejected by proxy
@@ -292,6 +292,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             ollama_addr: "127.0.0.1:11434".to_string(),
             remote_port: 80, // privileged port!
             passkey_proxy: "legit-proxy-pass".to_string(),
+            tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
     };
@@ -311,6 +312,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             ollama_addr: "127.0.0.1:11434".to_string(),
             remote_port: 25000, // outside allowed 15000-16000
             passkey_proxy: "legit-proxy-pass".to_string(),
+            tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
     };
@@ -341,7 +343,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
-    let tls_client_cfg = create_tunnel_tls_client_config().unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
     let connector = TlsConnector::from(tls_client_cfg);
 
     let server_cfg1 = ServerConfig {
@@ -350,6 +352,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             ollama_addr: "127.0.0.1:11434".to_string(),
             remote_port: 17101,
             passkey_proxy: "shared-proxy-pass".to_string(),
+            tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
     };
@@ -360,6 +363,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             ollama_addr: "127.0.0.1:11434".to_string(),
             remote_port: 17102,
             passkey_proxy: "shared-proxy-pass".to_string(),
+            tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
     };
@@ -391,4 +395,70 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
 
     task1.abort();
     task2.abort();
+}
+
+#[tokio::test]
+async fn test_ca_verification_rejects_untrusted_certificates() {
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "18000-18999".to_string(),
+            listener_grace_period_sec: 60,
+        },
+        auth: ProxyAuthSection {
+            passkey_proxy: "ca-test-passkey".to_string(),
+            passkey_user: "ca-test-user".to_string(),
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+
+    // Client with WebPKI CA verification enabled:
+    let tls_client_cfg = create_tunnel_tls_client_config(true).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let tcp_stream = tokio::net::TcpStream::connect(proxy_control_addr).await.unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("olp-tunnel.internal").unwrap();
+
+    // The proxy uses a self-signed certificate, which WebPKI root certificates MUST reject
+    let tls_result = connector.connect(server_name, tcp_stream).await;
+    assert!(tls_result.is_err(), "WebPKI CA verification must reject self-signed proxy cert");
+
+    // But with verify_ca = false, it succeeds:
+    let tls_client_cfg_noverify = create_tunnel_tls_client_config(false).unwrap();
+    let connector_noverify = TlsConnector::from(tls_client_cfg_noverify);
+    let tcp_stream_ok = tokio::net::TcpStream::connect(proxy_control_addr).await.unwrap();
+    let server_name_ok = rustls::pki_types::ServerName::try_from("olp-tunnel.internal").unwrap();
+    let tls_ok = connector_noverify.connect(server_name_ok, tcp_stream_ok).await;
+    assert!(tls_ok.is_ok(), "Self-signed certificate is accepted when verify_ca is false");
+}
+
+#[test]
+fn test_server_should_verify_ca_auto_detection() {
+    let mut s = ServerSection {
+        proxy_addr: "127.0.0.1:4443".to_string(),
+        ollama_addr: "127.0.0.1:11434".to_string(),
+        remote_port: 18434,
+        passkey_proxy: "pass".to_string(),
+        tls_verify: None,
+    };
+    assert!(!s.should_verify_ca());
+
+    s.proxy_addr = "localhost:4443".to_string();
+    assert!(!s.should_verify_ca());
+
+    s.proxy_addr = "192.168.1.100:4443".to_string();
+    assert!(!s.should_verify_ca());
+
+    s.proxy_addr = "proxy.example.com:4443".to_string();
+    assert!(s.should_verify_ca());
+
+    // Explicit override
+    s.tls_verify = Some(false);
+    assert!(!s.should_verify_ca());
+
+    s.tls_verify = Some(true);
+    assert!(s.should_verify_ca());
 }

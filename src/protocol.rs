@@ -147,18 +147,44 @@ pub fn create_tunnel_tls_server_config() -> Result<Arc<rustls::ServerConfig>> {
     Ok(Arc::new(server_cfg))
 }
 
+/// Extracts the host string from a `host:port` or `[ipv6]:port` address string.
+pub fn extract_host(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    addr.split(':').next().unwrap_or(addr)
+}
+
 /// Builds a `rustls::ClientConfig` for `olp-server` restricted strictly to TLS 1.3.
-/// End-to-end encryption is established; authentication is performed via `passkey_proxy`.
-pub fn create_tunnel_tls_client_config() -> Result<Arc<rustls::ClientConfig>> {
+/// When `verify_ca` is true (default when connecting to domain names), validates the proxy's TLS
+/// certificate using Mozilla's WebPKI root store (Let's Encrypt / CA roots), preventing MITM attacks.
+/// When `verify_ca` is false (e.g. 127.0.0.1 testing), establishes an encrypted TLS 1.3 channel
+/// authenticated via `passkey_proxy`.
+pub fn create_tunnel_tls_client_config(verify_ca: bool) -> Result<Arc<rustls::ClientConfig>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let client_cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TunnelCertVerifier { provider }))
-        .with_no_client_auth();
 
-    Ok(Arc::new(client_cfg))
+    if verify_ca {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        Ok(Arc::new(client_cfg))
+    } else {
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TunnelCertVerifier { provider }))
+            .with_no_client_auth();
+
+        Ok(Arc::new(client_cfg))
+    }
 }
 
 #[derive(Debug)]

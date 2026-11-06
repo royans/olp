@@ -18,6 +18,11 @@ remote_port = 11434
 # Passkey matching [auth].passkey_proxy in proxy.toml on olp-proxy
 passkey_proxy = "change-me-to-a-secure-proxy-passkey"
 
+# TLS CA Certificate Verification (optional, defaults to true for domain names, false for raw IP/localhost)
+# Set to true to enforce Mozilla WebPKI root certificate verification (e.g. Let's Encrypt).
+# Set to false only when using self-signed certs over raw IP or internal test environments.
+# tls_verify = true
+
 [reconnect]
 # Strategy: "fibonacci" (Fibonacci sequence: 1, 1, 2, 3, 5, 8... up to max_delay_sec with ±10% jitter)
 strategy = "fibonacci"

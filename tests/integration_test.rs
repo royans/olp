@@ -176,6 +176,7 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             ollama_addr: ollama_addr.to_string(),
             remote_port,
             passkey_proxy: passkey_proxy.to_string(),
+            tls_verify: None,
         },
         reconnect: ReconnectSection {
             strategy: "fibonacci".to_string(),
@@ -306,7 +307,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
-    let tls_client_cfg = create_tunnel_tls_client_config().unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
     let connector = TlsConnector::from(tls_client_cfg);
 
     // Case A: Wrong passkey_proxy -> rejection with ERR_INVALID_PASSKEY_PROXY
@@ -316,6 +317,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             ollama_addr: "127.0.0.1:11434".to_string(),
             remote_port: 18450,
             passkey_proxy: "wrong-passkey".to_string(),
+            tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
     };
@@ -334,6 +336,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             ollama_addr: "127.0.0.1:11434".to_string(),
             remote_port: 18451,
             passkey_proxy: "legit-proxy-passkey".to_string(),
+            tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
     };
@@ -468,6 +471,7 @@ async fn test_model_auto_mapping_and_cors() {
             ollama_addr: mock_addr.to_string(),
             remote_port: 18550,
             passkey_proxy: "test-proxy-passkey".to_string(),
+            tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
     };
