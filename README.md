@@ -142,8 +142,46 @@ max_auth_failures_per_min = 60
 max_concurrent_streams = 128
 
 [tls]
-mode = "off" # "off", "self-signed", or "manual"
+mode = "off" # Set to "manual" when using Let's Encrypt / custom certs
+# cert_path = "~/.olp/tls/fullchain.pem"
+# key_path = "~/.olp/tls/privkey.pem"
 ```
+
+---
+
+## Enabling Valid TLS / HTTPS with Let's Encrypt (`olp-proxy`)
+
+To enable native `https://` (e.g. `https://ssh3.blogofy.com:11434`) without certificate warnings, use the automated provisioning script **`renew-tls.sh`** on the proxy host:
+
+### 1. Provision Certificate (One-Time Setup)
+
+```bash
+# On your public proxy host:
+sudo ./renew-tls.sh ssh3.blogofy.com
+```
+
+The script:
+1. Verifies/installs `certbot`.
+2. Validates domain ownership via ACME HTTP-01 challenge (standalone or webroot).
+3. Safely exports the dereferenced certificate chain and private key to `~/.olp/tls/`.
+4. Enforces strict `0700`/`0600` permissions owned by your unprivileged proxy user (`$USER`).
+5. Updates `~/.olp/proxy.toml` to `mode = "manual"`.
+6. Gracefully restarts `olp-proxy` with active HTTPS.
+
+### 2. Automated Certificate Renewal via Root Cronjob
+
+Let's Encrypt certificates expire every 90 days. To automate renewal without interrupting the non-root proxy daemon, add this to root's crontab:
+
+```bash
+sudo crontab -e
+```
+
+Add the following entry (runs weekly on Monday at 3:00 AM):
+```cron
+0 3 * * 1 /home/royans/olp/renew-tls.sh --cron >> /var/log/olp-tls.log 2>&1
+```
+
+When renewal occurs, the script automatically exports the refreshed certs to `~/.olp/tls/` and reloads `olp-proxy` cleanly.
 
 ### `~/.olp/server.toml`
 ```toml

@@ -50,7 +50,7 @@ pub fn build_public_tls_acceptor(config: &ProxyConfig) -> Result<Option<TlsAccep
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
             let provider = Arc::new(rustls::crypto::ring::default_provider());
             let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
-                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
                 .with_no_client_auth()
                 .with_single_cert(vec![cert_der], key_der)?;
             Ok(Some(TlsAcceptor::from(Arc::new(server_cfg))))
@@ -80,7 +80,7 @@ pub fn build_public_tls_acceptor(config: &ProxyConfig) -> Result<Option<TlsAccep
 
             let provider = Arc::new(rustls::crypto::ring::default_provider());
             let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
-                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
                 .with_no_client_auth()
                 .with_single_cert(certs, key)?;
             Ok(Some(TlsAcceptor::from(Arc::new(server_cfg))))
