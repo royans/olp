@@ -63,7 +63,7 @@ A single `olp-proxy` instance can simultaneously host any number of private `olp
 
 Clone the repository and run the startup script:
 ```bash
-git clone https://github.com/<your-username>/olp.git
+git clone https://github.com/royans/olp.git
 cd olp
 ./start-proxy.sh
 ```
@@ -79,7 +79,7 @@ On first launch:
 
 Clone the repository on the machine running Ollama (`127.0.0.1:11434`):
 ```bash
-git clone https://github.com/<your-username>/olp.git
+git clone https://github.com/royans/olp.git
 cd olp
 ./start-server.sh
 ```
