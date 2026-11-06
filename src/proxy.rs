@@ -1,5 +1,5 @@
 use crate::config::{expand_path, ProxyConfig};
-use crate::keys::{load_or_generate_keypair, verify_authorized_key, PasskeyVerifier};
+use crate::keys::{format_pubkey, load_or_generate_keypair, verify_authorized_key, PasskeyVerifier};
 use crate::mux::{spawn_mux_session, MuxHandle};
 use crate::protocol::{
     configure_tunnel_socket, create_tunnel_tls_server_config, read_frame, write_frame,
@@ -368,7 +368,11 @@ async fn handle_incoming_tunnel(
     let is_authorized = verify_authorized_key(&state.auth_keys_path, &server_key, req_port)
         .unwrap_or(false);
     if !is_authorized {
-        let msg = "ERR_UNAUTHORIZED_KEY: server public key is not in proxy authorized_keys (or not permitted for this port)".to_string();
+        let key_str = format_pubkey("olp-server-ed25519", &server_key);
+        let msg = format!(
+            "ERR_UNAUTHORIZED_KEY: server public key '{}' is not in proxy authorized_keys (or port {} not permitted)",
+            key_str, req_port
+        );
         let _ = write_frame(
             &mut tls_stream,
             &TunnelEstablished {
@@ -377,6 +381,23 @@ async fn handle_incoming_tunnel(
             },
         )
         .await;
+
+        error!(
+            "\n================================================================================\n\
+             [UNAUTHORIZED TUNNEL ATTEMPT] from {}\n\
+             Server Public Key : {}\n\
+             Requested Port    : {}\n\n\
+             To authorize this server on this proxy, run:\n\
+               ./start-proxy.sh --add-key \"{}\"\n\
+             (or append that line to {})\n\
+             ================================================================================",
+            peer_addr,
+            key_str,
+            req_port,
+            key_str,
+            state.auth_keys_path.display()
+        );
+
         return Err(anyhow!(msg));
     }
 

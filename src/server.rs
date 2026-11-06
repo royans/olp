@@ -1,6 +1,6 @@
 use crate::backoff::FibonacciBackoff;
 use crate::config::{expand_path, ServerConfig};
-use crate::keys::{load_or_generate_keypair, parse_pubkey, PasskeyVerifier};
+use crate::keys::{format_pubkey, load_or_generate_keypair, parse_pubkey, PasskeyVerifier};
 use crate::mux::{spawn_mux_session, CompatYamuxStream};
 use crate::protocol::{
     configure_tunnel_socket, create_tunnel_tls_client_config, read_frame, write_frame,
@@ -96,6 +96,24 @@ pub async fn run_server_with_shutdown(
                 );
             }
             Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("ERR_UNAUTHORIZED_KEY") {
+                    let pubkey_str =
+                        format_pubkey("olp-server-ed25519", &signing_key.verifying_key());
+                    if backoff.attempt() == 1 || backoff.attempt() % 5 == 0 {
+                        error!(
+                            "\n================================================================================\n\
+                             [AUTH ERROR] Proxy rejected this server's public key!\n\
+                             Your Server Public Key is:\n\
+                               {}\n\n\
+                             To authorize this server on the proxy, run this command ON THE PROXY HOST:\n\
+                               ./start-proxy.sh --add-key \"{}\"\n\
+                             (or append that line to ~/.olp/keys/authorized_keys on the proxy)\n\
+                             ================================================================================",
+                            pubkey_str, pubkey_str
+                        );
+                    }
+                }
                 warn!(
                     "Tunnel error ({}); retrying in {:.1}s (Fibonacci attempt #{})",
                     e,
