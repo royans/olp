@@ -10,7 +10,22 @@ cd "$SCRIPT_DIR"
 
 OLP_DATA_DIR="${OLP_HOME:-$HOME/.olp}"
 PID_FILE="$OLP_DATA_DIR/olp-server.pid"
+LOG_FILE="$OLP_DATA_DIR/server.log"
 NEED_RECOMPILE=0
+DAEMON_MODE=0
+
+# Parse daemon flag from arguments
+CLEAN_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --daemon|-d)
+            DAEMON_MODE=1
+            ;;
+        *)
+            CLEAN_ARGS+=("$arg")
+            ;;
+    esac
+done
 
 # Auto-enable git pre-commit security protections if in a git repo
 if [ -d ".git" ] && [ -d ".githooks" ]; then
@@ -155,26 +170,23 @@ elif [ "$ACTION" = "update" ]; then
     fi
     echo "[olp-server] Update complete."
     exit 0
-elif [ "$ACTION" = "restart" ]; then
-    stop_process
-    auto_update_from_git
-    shift || true
-elif pid=$(is_running); then
-    # Running without 'restart' flag: check if user passed query arguments
-    case "${1:-}" in
-        -h|--help|-V|--version|--init-only|--non-interactive)
-            # Allow query commands to proceed without conflicting with the running daemon
-            ;;
-        *)
-            echo "[olp-server] Already running (PID: $pid)."
-            echo "  To restart & auto-update:  ./start-server.sh restart"
-            echo "  To update code now:        ./start-server.sh update"
-            echo "  To stop:                   ./start-server.sh stop"
-            echo "  To check:                  ./start-server.sh status"
-            exit 0
-            ;;
-    esac
 fi
+
+# Informational query commands do not terminate a running daemon
+case "${1:-}" in
+    -h|--help|-V|--version)
+        ;;
+    *)
+        # Always terminate previous process for clean restart (cron & repeated run friendly)
+        if pid=$(is_running); then
+            echo "[olp-server] Existing process detected (PID: $pid). Terminating previous instance for clean restart..."
+            stop_process
+        fi
+        if [ "${1:-}" = "restart" ]; then
+            shift || true
+        fi
+        ;;
+esac
 
 # Auto-check git updates on launch
 auto_update_from_git
@@ -273,12 +285,26 @@ fi
 mkdir -p "$OLP_DATA_DIR"
 chmod 0700 "$OLP_DATA_DIR" 2>/dev/null || true
 
-# If config does not exist yet and stdin is a TTY, run first-time setup in foreground
+# If config does not exist yet, run first-time setup
 CONFIG_FILE="${OLP_CONFIG:-$OLP_DATA_DIR/server.toml}"
-if [ ! -f "$CONFIG_FILE" ] && [ -t 0 ]; then
-    "$BIN_PATH" --init-only
+if [ ! -f "$CONFIG_FILE" ]; then
+    if [ "$DAEMON_MODE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
+        "$BIN_PATH" --init-only --non-interactive
+    elif [ -t 0 ]; then
+        "$BIN_PATH" --init-only
+    fi
 fi
 
-# Run binary replacing this shell with full TTY control
-echo $$ > "$PID_FILE"
-exec "$BIN_PATH" "$@"
+if [ "$DAEMON_MODE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
+    # Run in background as daemon (ideal for cron jobs)
+    nohup "$BIN_PATH" "${CLEAN_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
+    CHILD_PID=$!
+    disown "$CHILD_PID" 2>/dev/null || true
+    echo "$CHILD_PID" > "$PID_FILE"
+    echo "[olp-server] Started in background (PID: $CHILD_PID, log: $LOG_FILE)"
+    exit 0
+else
+    # Run in foreground with full TTY control
+    echo $$ > "$PID_FILE"
+    exec "$BIN_PATH" "${CLEAN_ARGS[@]}"
+fi
