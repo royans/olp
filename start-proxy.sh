@@ -294,6 +294,43 @@ if [ ! -f "$CONFIG_FILE" ]; then
     fi
 fi
 
+# ------------------------------------------------------------------------------
+# 6. Propose @reboot Cronjob if Missing
+# ------------------------------------------------------------------------------
+if [ "$DAEMON_MODE" -eq 0 ] && command -v crontab >/dev/null 2>&1; then
+    EXISTING_CRON="$(crontab -l 2>/dev/null || true)"
+    if ! echo "$EXISTING_CRON" | grep -q "start-proxy.sh"; then
+        CRON_ENTRY="@reboot cd $SCRIPT_DIR && ./start-proxy.sh --daemon"
+        echo ""
+        echo "================================================================================"
+        echo "  [olp-proxy] Automated Cronjob Setup"
+        echo "================================================================================"
+        echo "  No @reboot crontab job was found for olp-proxy."
+        echo "  Recommended crontab entry to auto-start after server reboots:"
+        echo ""
+        echo "    $CRON_ENTRY"
+        echo ""
+        if [ -t 0 ]; then
+            read -r -p "  Would you like to install this @reboot cronjob now? [y/N]: " cron_choice
+            case "${cron_choice:-n}" in
+                y|Y|yes|YES)
+                    if [ -n "$EXISTING_CRON" ]; then
+                        printf "%s\n%s\n" "$EXISTING_CRON" "$CRON_ENTRY" | crontab -
+                    else
+                        printf "%s\n" "$CRON_ENTRY" | crontab -
+                    fi
+                    echo "  [✓] Cronjob successfully installed into crontab!"
+                    ;;
+                *)
+                    echo "  Skipped. You can add it later via: crontab -e"
+                    ;;
+            esac
+        fi
+        echo "================================================================================"
+        echo ""
+    fi
+fi
+
 if [ "$DAEMON_MODE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
     # Run in background as daemon (ideal for cron jobs)
     nohup "$BIN_PATH" "${CLEAN_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
