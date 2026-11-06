@@ -1,7 +1,16 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
+
+type BoxHttpBody = BoxBody<Bytes, hyper::Error>;
+
+fn full_body<T: Into<Bytes>>(chunk: T) -> BoxHttpBody {
+    Full::new(chunk.into())
+        .map_err(|e: std::convert::Infallible| -> hyper::Error { match e {} })
+        .boxed()
+}
 use hyper::header::{AUTHORIZATION, HOST, WWW_AUTHENTICATE};
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
@@ -46,7 +55,7 @@ async fn start_mock_ollama() -> SocketAddr {
                             assert_eq!(host_hdr, expected_host);
 
                             let path = req.uri().path().to_string();
-                            if req.method() == Method::GET && path == "/api/tags" {
+                            if req.method() == Method::GET && (path == "/api/tags" || path == "/api/ps") {
                                 let body = Full::new(Bytes::from_static(
                                     br#"{"models":[{"name":"llama3:latest"}]}"#,
                                 ))
@@ -354,6 +363,191 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(body.contains("forbidden"));
+
+    let _ = server_shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_model_auto_mapping_and_cors() {
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+
+    let target_loaded_model = "hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M";
+
+    // Mock Ollama server verifying that incoming requests have their model rewritten
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = mock_listener.accept().await {
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| async move {
+                        let path = req.uri().path().to_string();
+
+                        if req.method() == Method::GET && path == "/api/ps" {
+                            let json = format!(
+                                r#"{{"models":[{{"name":"{}","model":"{}"}}]}}"#,
+                                target_loaded_model, target_loaded_model
+                            );
+                            return Ok::<_, hyper::Error>(Response::new(full_body(json)));
+                        }
+
+                        if req.method() == Method::GET && path == "/api/tags" {
+                            let json = format!(
+                                r#"{{"models":[{{"name":"{}","model":"{}"}}]}}"#,
+                                target_loaded_model, target_loaded_model
+                            );
+                            return Ok::<_, hyper::Error>(Response::new(full_body(json)));
+                        }
+
+                        if req.method() == Method::POST && path == "/api/generate" {
+                            let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
+                            let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+                            // Assert that olp-server rewrote the requested model to target_loaded_model
+                            assert_eq!(
+                                parsed["model"].as_str().unwrap(),
+                                target_loaded_model,
+                                "olp-server must rewrite requested model to active loaded model"
+                            );
+
+                            return Ok(Response::new(full_body(
+                                r#"{"response":"generated text","done":true}"#,
+                            )));
+                        }
+
+                        if req.method() == Method::POST && path == "/api/show" {
+                            let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
+                            let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+                            assert_eq!(
+                                parsed["name"].as_str().unwrap(),
+                                target_loaded_model,
+                                "olp-server must rewrite /api/show name to active loaded model"
+                            );
+
+                            return Ok(Response::new(full_body(
+                                r#"{"license":"MIT","parameters":"9B"}"#,
+                            )));
+                        }
+
+                        let mut not_found = Response::new(full_body(&b"not found"[..]));
+                        *not_found.status_mut() = StatusCode::NOT_FOUND;
+                        Ok(not_found)
+                    });
+
+                    let _ = server_http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        }
+    });
+
+    // Start proxy
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "18500-18600".to_string(),
+            listener_grace_period_sec: 10,
+        },
+        auth: ProxyAuthSection {
+            passkey_proxy: "test-proxy-passkey".to_string(),
+            passkey_user: "test-user-passkey".to_string(),
+        },
+        security: ProxySecuritySection {
+            allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
+            allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
+            max_auth_failures_per_min: 60,
+            max_concurrent_streams: 64,
+        },
+        tls: ProxyTlsSection::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+
+    // Start server exposing mock Ollama on remote port 18550
+    let server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            remote_port: 18550,
+            passkey_proxy: "test-proxy-passkey".to_string(),
+        },
+        reconnect: ReconnectSection::default(),
+    };
+
+    let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_server_with_shutdown(server_cfg, server_shutdown_rx).await;
+    });
+
+    let public_addr: SocketAddr = "127.0.0.1:18550".parse().unwrap();
+    for _ in 0..40 {
+        if TcpStream::connect(public_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 1. Verify CORS preflight OPTIONS returns 204 No Content without auth
+    let tcp = TcpStream::connect(public_addr).await.unwrap();
+    let (mut client_sender, conn) =
+        hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await.unwrap();
+    tokio::spawn(async move { let _ = conn.await; });
+
+    let opt_req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/api/tags")
+        .header(HOST, public_addr.to_string())
+        .header("Origin", "vscode-webview://cline")
+        .header("Access-Control-Request-Method", "POST")
+        .body(full_body(Bytes::new()))
+        .unwrap();
+
+    let opt_resp = client_sender.send_request(opt_req).await.unwrap();
+    assert_eq!(opt_resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        opt_resp.headers().get("access-control-allow-origin").unwrap(),
+        "*"
+    );
+
+    // 2. Client sends request specifying "model": "llama3.1" (Cline default or typed by user)
+    // with "x-api-key" auth header
+    let tcp2 = TcpStream::connect(public_addr).await.unwrap();
+    let (mut client_sender2, conn2) =
+        hyper::client::conn::http1::handshake(TokioIo::new(tcp2)).await.unwrap();
+    tokio::spawn(async move { let _ = conn2.await; });
+
+    let post_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/generate")
+        .header(HOST, public_addr.to_string())
+        .header("x-api-key", "test-user-passkey")
+        .header("content-type", "application/json")
+        .body(full_body(&br#"{"model":"llama3.1","prompt":"hello"}"#[..]))
+        .unwrap();
+
+    let post_resp = client_sender2.send_request(post_req).await.unwrap();
+    assert_eq!(post_resp.status(), StatusCode::OK);
+    let post_body = post_resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(post_body.starts_with(b"{\"response\":\"generated text\""));
+
+    // 3. Client checks /api/show with {"name": "some-random-model"}
+    let tcp3 = TcpStream::connect(public_addr).await.unwrap();
+    let (mut client_sender3, conn3) =
+        hyper::client::conn::http1::handshake(TokioIo::new(tcp3)).await.unwrap();
+    tokio::spawn(async move { let _ = conn3.await; });
+
+    let show_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/show")
+        .header(HOST, public_addr.to_string())
+        .header(AUTHORIZATION, "Bearer test-user-passkey")
+        .header("content-type", "application/json")
+        .body(full_body(&br#"{"name":"random-unknown-model"}"#[..]))
+        .unwrap();
+
+    let show_resp = client_sender3.send_request(show_req).await.unwrap();
+    assert_eq!(show_resp.status(), StatusCode::OK);
+    let show_body = show_resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(show_body.starts_with(b"{\"license\":\"MIT\""));
 
     let _ = server_shutdown_tx.send(true);
 }

@@ -8,6 +8,8 @@
 proxy_addr = "ssh3.blogofy.com:4443"
 
 # Local address of the Ollama service to expose
+# Note: olp-server automatically queries Ollama and maps client requests to whatever
+# model is currently loaded in memory, regardless of what model name the client requests.
 ollama_addr = "127.0.0.1:11434"
 
 # External port to expose on olp-proxy (must fall within proxy's allowed_ports)

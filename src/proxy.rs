@@ -14,7 +14,7 @@ use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, RETRY_AFTER, WWW_AUTHENTICATE};
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -125,32 +125,41 @@ pub fn verify_http_headers_auth(
     headers: &hyper::HeaderMap,
     verifier: &PasskeyVerifier,
 ) -> bool {
-    let auth_header = match headers.get(AUTHORIZATION) {
-        Some(h) => match h.to_str() {
-            Ok(s) => s.trim(),
-            Err(_) => return false,
-        },
-        None => return false,
-    };
+    // 1. Standard Authorization header (Bearer token or Basic auth)
+    if let Some(auth_header) = headers.get(AUTHORIZATION).and_then(|h| h.to_str().ok()) {
+        let auth_header = auth_header.trim();
+        if let Some(token) = auth_header
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_header.strip_prefix("bearer "))
+        {
+            if verifier.verify(token.trim()) {
+                return true;
+            }
+        }
 
-    if let Some(token) = auth_header
-        .strip_prefix("Bearer ")
-        .or_else(|| auth_header.strip_prefix("bearer "))
-    {
-        return verifier.verify(token.trim());
+        if let Some(b64) = auth_header
+            .strip_prefix("Basic ")
+            .or_else(|| auth_header.strip_prefix("basic "))
+        {
+            if let Ok(decoded_bytes) = BASE64.decode(b64.trim()) {
+                if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                    let candidate = match decoded_str.split_once(':') {
+                        Some((_user, pass)) => pass,
+                        None => decoded_str.as_str(),
+                    };
+                    if verifier.verify(candidate) {
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
-    if let Some(b64) = auth_header
-        .strip_prefix("Basic ")
-        .or_else(|| auth_header.strip_prefix("basic "))
-    {
-        if let Ok(decoded_bytes) = BASE64.decode(b64.trim()) {
-            if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
-                let candidate = match decoded_str.split_once(':') {
-                    Some((_user, pass)) => pass,
-                    None => decoded_str.as_str(),
-                };
-                return verifier.verify(candidate);
+    // 2. Custom API key headers commonly sent by LLM clients (Cline, Roo Code, etc.)
+    for header_name in &["x-api-key", "api-key", "ollama-api-key", "x-auth-token"] {
+        if let Some(val) = headers.get(*header_name).and_then(|h| h.to_str().ok()) {
+            if verifier.verify(val.trim()) {
+                return true;
             }
         }
     }
@@ -517,7 +526,30 @@ async fn handle_public_http_request(
     worker: Arc<PortWorker>,
     state: Arc<ProxyState>,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
-    // 1. Check CIDR IP filter for user HTTP connections
+    // 1. Handle CORS preflight without requiring authentication
+    if req.method() == Method::OPTIONS {
+        let mut resp = Response::new(full_body(Bytes::new()));
+        *resp.status_mut() = StatusCode::NO_CONTENT;
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_static("*"),
+        );
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
+            hyper::header::HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD"),
+        );
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            hyper::header::HeaderValue::from_static("*"),
+        );
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_MAX_AGE,
+            hyper::header::HeaderValue::from_static("86400"),
+        );
+        return Ok(resp);
+    }
+
+    // 2. Check CIDR IP filter for user HTTP connections
     if !state.user_ip_filter.is_allowed(&client_ip) {
         warn!(
             "[IP FILTER] Rejected user HTTP connection from {} (not in allowed_user_cidrs)",
@@ -527,10 +559,14 @@ async fn handle_public_http_request(
             r#"{"error":"forbidden: IP address not allowed by proxy filter"}"#,
         ));
         *resp.status_mut() = StatusCode::FORBIDDEN;
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_static("*"),
+        );
         return Ok(resp);
     }
 
-    // 2. Check pre-tunnel IP brute-force rate limiter
+    // 3. Check pre-tunnel IP brute-force rate limiter
     if state.rate_limiter.is_locked_out(&client_ip).is_some() {
         let mut resp = Response::new(full_body(
             r#"{"error":"too many failed authentication attempts, try again later"}"#,
@@ -538,10 +574,14 @@ async fn handle_public_http_request(
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         resp.headers_mut()
             .insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("60"));
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_static("*"),
+        );
         return Ok(resp);
     }
 
-    // 3. Verify passkey_user using Basic Auth or Bearer Token in constant time
+    // 4. Verify passkey_user using Basic Auth or Bearer Token in constant time
     if !verify_http_request_auth(&req, &state.user_verifier) {
         state.rate_limiter.record_failure(client_ip);
         let mut resp = Response::new(full_body(
@@ -552,12 +592,16 @@ async fn handle_public_http_request(
             WWW_AUTHENTICATE,
             hyper::header::HeaderValue::from_static(r#"Basic realm="Ollama Proxy""#),
         );
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_static("*"),
+        );
         return Ok(resp);
     }
 
     state.rate_limiter.record_success(&client_ip);
 
-    // 4. Retrieve active Yamux session
+    // 5. Retrieve active Yamux session
     let mux = {
         let guard = worker.active_mux.read().unwrap();
         guard.clone()
@@ -570,11 +614,15 @@ async fn handle_public_http_request(
                 r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#,
             ));
             *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            resp.headers_mut().insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                hyper::header::HeaderValue::from_static("*"),
+            );
             return Ok(resp);
         }
     };
 
-    // 5. Open new Yamux substream to `olp-server`
+    // 6. Open new Yamux substream to `olp-server`
     let mux_stream = match mux.open_stream().await {
         Ok(s) => s,
         Err(_) => {
@@ -582,11 +630,15 @@ async fn handle_public_http_request(
                 r#"{"error":"failed to open substream to olp-server"}"#,
             ));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
+            resp.headers_mut().insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                hyper::header::HeaderValue::from_static("*"),
+            );
             return Ok(resp);
         }
     };
 
-    // 6. Forward HTTP request with stripped Authorization header
+    // 7. Forward HTTP request with stripped auth headers
     let (mut client_sender, conn) =
         match hyper::client::conn::http1::handshake(TokioIo::new(mux_stream)).await {
             Ok(pair) => pair,
@@ -595,6 +647,10 @@ async fn handle_public_http_request(
                     r#"{"error":"failed HTTP handshake over tunnel substream"}"#,
                 ));
                 *resp.status_mut() = StatusCode::BAD_GATEWAY;
+                resp.headers_mut().insert(
+                    hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                    hyper::header::HeaderValue::from_static("*"),
+                );
                 return Ok(resp);
             }
         };
@@ -605,11 +661,19 @@ async fn handle_public_http_request(
 
     let (mut parts, body) = req.into_parts();
     parts.headers.remove(AUTHORIZATION);
+    parts.headers.remove("x-api-key");
+    parts.headers.remove("api-key");
+    parts.headers.remove("ollama-api-key");
+    parts.headers.remove("x-auth-token");
     let forward_req = Request::from_parts(parts, body);
 
     match client_sender.send_request(forward_req).await {
         Ok(upstream_resp) => {
-            let (u_parts, u_body) = upstream_resp.into_parts();
+            let (mut u_parts, u_body) = upstream_resp.into_parts();
+            u_parts
+                .headers
+                .entry(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .or_insert_with(|| hyper::header::HeaderValue::from_static("*"));
             let boxed_body = u_body.map_err(|e| e).boxed();
             Ok(Response::from_parts(u_parts, boxed_body))
         }
@@ -618,6 +682,10 @@ async fn handle_public_http_request(
                 r#"{"error":"upstream olp-server failed to respond"}"#,
             ));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
+            resp.headers_mut().insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                hyper::header::HeaderValue::from_static("*"),
+            );
             Ok(resp)
         }
     }

@@ -1,6 +1,6 @@
 # Ollama Proxy (`olp-proxy` & `olp-server`)
 
-[![Tests](https://img.shields.io/badge/tests-20%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-21%20passing-brightgreen.svg)]()
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
 [![Memory Footprint](https://img.shields.io/badge/memory-%3C5MB%20RAM-success.svg)]()
@@ -15,10 +15,11 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
  |    (Reverse TLS 1.3 Tunnel)      | (passkey_proxy)   |    Public Port:  :11434          |
  +----------------------------------+                   +------------------+---------------+
                                                                            |
-                                                      (passkey_user)       | Basic / Bearer Auth
+                                                      (passkey_user)       | Basic / Bearer / API Key
                                                                            v
                                                                 +--------------------+
                                                                 | Users & Ollama App |
+                                                                | (Cline, WebUI, CLI)|
                                                                 +--------------------+
 ```
 
@@ -31,11 +32,11 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
 1. **`passkey_proxy`**:
    - Shared between `olp-proxy` and `olp-server`.
    - Authorizes `olp-server` to connect to `olp-proxy:4443` and register a reverse tunnel.
-   - Defined in `proxy.toml` and specified in `server.toml`.
+   - Configured in `proxy.toml` and specified in `server.toml`.
 2. **`passkey_user`**:
-   - Shared between `olp-proxy` and end users querying Ollama.
-   - Used for **HTTP Basic Auth** (`username:passkey_user`) or **Bearer Token** (`Authorization: Bearer <passkey_user>`).
-   - Handled directly by `olp-proxy`.
+   - Shared between `olp-proxy` and end users / coding agents querying Ollama.
+   - Accepted via **Bearer Token** (`Authorization: Bearer <passkey_user>`), **HTTP Basic Auth** (`username:passkey_user`), or **API Key headers** (`x-api-key`, `api-key`, `ollama-api-key`).
+   - Verified directly by `olp-proxy`.
 3. **CIDR IP Filtering**:
    - **`allowed_server_cidrs`**: Restricts which IP addresses / subnets can connect to the tunnel control port (`:4443`).
    - **`allowed_user_cidrs`**: Restricts which IP addresses / subnets can query the public Ollama HTTP port (`:11434`).
@@ -45,13 +46,19 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
 
 ## Key Features
 
+- **Automatic Model Dynamic Mapping ("Serve Whatever is Loaded")**:
+  - `olp-server` automatically detects whichever model is actively running in Ollama's memory (`/api/ps`) or installed on disk (`/api/tags`).
+  - **The model name requested by the client does not matter.** Whether Cline, Open WebUI, or curl requests `llama3.1`, `auto`, `default`, or anything else, `olp-server` transparently rewrites the request to whatever model is loaded (e.g., `hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M`).
+  - Automatically rewrites model parameters in `/api/show` so agent context windows, capabilities, and templates work out of the box without manual configuration.
 - **Zero Inbound Port Forwarding on NAT**: `olp-server` initiates an *outbound* connection to `olp-proxy` over a single TLS 1.3 port (`:4443`).
 - **Encrypted TLS 1.3 Reverse Tunnel**: All multiplexed traffic is end-to-end encrypted with forward secrecy over TLS 1.3 using Yamux.
+- **Built-in CORS & Webview Compatibility**: Full CORS preflight (`OPTIONS`) handling without authentication, enabling seamless integration with VS Code extensions (Cline, Roo Code) and browser web interfaces (Open WebUI).
+- **Flexible Client Authentication**: Supports Bearer tokens, HTTP Basic Auth, and custom `x-api-key` / `ollama-api-key` headers.
 - **Constant-Time Verification**: Plaintext passkeys are never verified with naive string equality; verification uses constant-time comparisons (`subtle::ConstantTimeEq`) and salted BLAKE3 hashing.
 - **CIDR Block IP Filtering**: IPv4 and IPv6 subnet filtering on both tunnel and user HTTP connections.
-- **Dual User Authentication**: Supports both HTTP Basic Auth and Bearer Tokens, compatible with the official Ollama CLI, Open WebUI, LibreChat, and IDE extensions (Continue, Cursor, Cline).
 - **Fibonacci Reconnect Backoff**: Smart reconnect sequence (`1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s...` capped at 300s) with $\pm 10\%$ jitter.
 - **Zero-Buffering Chunked Streaming**: Full support for real-time Server-Sent Events (SSE) and token streaming (`/api/generate`, `/api/chat`).
+- **Cron & Daemon Friendly**: Built-in PID tracking and auto-cleanup terminates previous instances cleanly upon re-execution; supports `--daemon` / `-d` for background crontab jobs.
 - **Edge IP Brute-Force Rate Limiting**: Automatic sliding-window rate limiter returns `429 Too Many Requests` on repeated failed authentications.
 - **Single-Directory Isolation**: Configuration files live exclusively in `~/.olp/` with strict `0600`/`0700` permissions.
 
@@ -156,13 +163,33 @@ heartbeat_timeout_sec = 5
 
 ---
 
+## Connecting from Cline / VS Code Extension
+
+Cline connects cleanly through `olp-proxy`:
+
+1. In Cline Settings, select **API Provider**: `Ollama`.
+2. Check **Use custom base URL**:
+   - `http://ssh3.blogofy.com:11434`
+3. Enter **Ollama API Key**: `<passkey_user>` (your `passkey_user` from `proxy.toml`).
+4. In **Model**, enter **any model name** (or `default`, `llama3.1`, etc.).
+   - `olp-server` automatically routes to whatever model is loaded in Ollama (e.g. `hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M`).
+5. Click **Done** and start chatting!
+
+---
+
 ## Querying the Proxied Ollama
 
-### Using curl with Bearer Token
+### Using curl with Bearer Token (or custom API Key)
 ```bash
+# Model name can be anything: olp-server automatically rewrites it to whatever is loaded!
 curl -X POST http://ssh3.blogofy.com:11434/api/generate \
   -H "Authorization: Bearer <passkey_user>" \
-  -d '{"model": "llama3", "prompt": "Why is the sky blue?"}'
+  -d '{"model": "auto", "prompt": "Why is the sky blue?"}'
+
+# Or using x-api-key header:
+curl -X POST http://ssh3.blogofy.com:11434/api/generate \
+  -H "x-api-key: <passkey_user>" \
+  -d '{"model": "default", "prompt": "Hello!"}'
 ```
 
 ### Using curl with HTTP Basic Auth
@@ -174,12 +201,28 @@ curl -u "user:<passkey_user>" http://ssh3.blogofy.com:11434/api/tags
 ```bash
 export OLLAMA_HOST="http://user:<passkey_user>@ssh3.blogofy.com:11434"
 ollama list
-ollama run llama3
+ollama run default
 ```
 
 ---
 
-## Running in Background via Systemd
+## Running in Background via Cron or Systemd
+
+### Running via Cron (`--daemon` mode)
+
+`start-proxy.sh` and `start-server.sh` include built-in PID tracking. If re-executed, they safely terminate the previous instance and start fresh. You can add them directly to `crontab -e`:
+
+```cron
+# Automatically restart olp-proxy on system reboot
+@reboot cd /home/royans/olp && ./start-proxy.sh --daemon
+
+# Automatically restart olp-server on system reboot
+@reboot cd /home/royans/olp && ./start-server.sh --daemon
+```
+
+Logs are written automatically to `~/.olp/proxy.log` and `~/.olp/server.log`.
+
+### Running via Systemd
 
 Systemd unit files are provided in `examples/`:
 

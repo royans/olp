@@ -112,6 +112,17 @@ fn test_verify_http_request_auth_schemes() {
     let creds_wrong = BASE64.encode("user:badpassword");
     assert!(!check(Some(&format!("Basic {}", creds_wrong))));
     assert!(!check(Some("Basic ???not-base64???")));
+
+    // Test custom API key headers
+    for hdr in &["x-api-key", "api-key", "ollama-api-key", "x-auth-token"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(*hdr, HeaderValue::from_str(pass).unwrap());
+        assert!(verify_http_headers_auth(&headers, &verifier));
+
+        let mut bad_headers = HeaderMap::new();
+        bad_headers.insert(*hdr, HeaderValue::from_str("wrong-key").unwrap());
+        assert!(!verify_http_headers_auth(&bad_headers, &verifier));
+    }
 }
 
 // ============================================================================
