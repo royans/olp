@@ -34,6 +34,21 @@ struct Args {
     non_interactive: bool,
 }
 
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -82,8 +97,8 @@ async fn main() -> Result<()> {
     let (_bound_addr, handle) = start_proxy_server(cfg).await?;
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            println!("\n[olp-proxy] Shutting down...");
+        _ = wait_for_shutdown_signal() => {
+            println!("\n[olp-proxy] Shutting down cleanly...");
         }
         _ = handle => {}
     }

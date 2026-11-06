@@ -1,43 +1,177 @@
 #!/usr/bin/env bash
+# ==============================================================================
+# Bootstrap & Lifecycle Script for `olp-proxy`
+# Handles graceful restarts, pre-compiled binary detection, and build auto-provisioning.
+# ==============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Auto-enable git pre-commit security protections if running in a git repo
+OLP_DATA_DIR="${OLP_HOME:-$HOME/.olp}"
+PID_FILE="$OLP_DATA_DIR/olp-proxy.pid"
+
+# Auto-enable git pre-commit security protections if in a git repo
 if [ -d ".git" ] && [ -d ".githooks" ]; then
     git config core.hooksPath .githooks 2>/dev/null || true
 fi
 
-BIN_PATH="$SCRIPT_DIR/target/release/olp-proxy"
+# Load Cargo environment if present
+if [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+fi
 
-ensure_build_deps() {
-    if ! command -v cc >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-        echo "[olp-proxy] Installing system build prerequisites silently..."
+# ------------------------------------------------------------------------------
+# 1. Detect if compiled binary already exists
+# ------------------------------------------------------------------------------
+find_compiled_binary() {
+    if [ -x "$SCRIPT_DIR/target/release/olp-proxy" ]; then
+        echo "$SCRIPT_DIR/target/release/olp-proxy"
+        return 0
+    fi
+    if [ -x "$SCRIPT_DIR/target/debug/olp-proxy" ]; then
+        echo "$SCRIPT_DIR/target/debug/olp-proxy"
+        return 0
+    fi
+    if [ -x "$HOME/.cargo/bin/olp-proxy" ]; then
+        echo "$HOME/.cargo/bin/olp-proxy"
+        return 0
+    fi
+    if command -v olp-proxy >/dev/null 2>&1; then
+        command -v olp-proxy
+        return 0
+    fi
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# 2. Process Lifecycle Management (Status / Stop / Restart)
+# ------------------------------------------------------------------------------
+is_running() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    # Fallback: check pgrep for running olp-proxy binary
+    local pgrep_pid
+    pgrep_pid=$(pgrep -x "olp-proxy" 2>/dev/null | head -n 1 || true)
+    if [ -n "$pgrep_pid" ]; then
+        echo "$pgrep_pid"
+        return 0
+    fi
+    return 1
+}
+
+stop_process() {
+    local pid
+    if pid=$(is_running); then
+        echo "[olp-proxy] Stopping running process (PID: $pid)..."
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in {1..20}; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                rm -f "$PID_FILE"
+                echo "[olp-proxy] Process stopped cleanly."
+                return 0
+            fi
+            sleep 0.25
+        done
+        echo "[olp-proxy] Process did not terminate; forcing shutdown (SIGKILL)..."
+        kill -9 "$pid" 2>/dev/null || true
+        rm -f "$PID_FILE"
+        echo "[olp-proxy] Process stopped."
+    else
+        echo "[olp-proxy] No running process found."
+        rm -f "$PID_FILE"
+    fi
+}
+
+# Handle CLI lifecycle subcommands (stop, restart, status)
+ACTION="${1:-}"
+if [ "$ACTION" = "stop" ]; then
+    stop_process
+    exit 0
+elif [ "$ACTION" = "status" ]; then
+    if pid=$(is_running); then
+        echo "[olp-proxy] Running (PID: $pid)"
+        exit 0
+    else
+        echo "[olp-proxy] Stopped"
+        exit 1
+    fi
+elif [ "$ACTION" = "restart" ]; then
+    stop_process
+    shift || true
+elif pid=$(is_running); then
+    # Running without 'restart' flag: check if user passed arguments like --show-pubkey
+    case "${1:-}" in
+        --show-pubkey|--add-key|-h|--help|-V|--version)
+            # Allow query commands to proceed without conflicting with the running daemon
+            ;;
+        *)
+            echo "[olp-proxy] Already running (PID: $pid)."
+            echo "  To restart:  ./start-proxy.sh restart"
+            echo "  To stop:     ./start-proxy.sh stop"
+            echo "  To check:    ./start-proxy.sh status"
+            exit 0
+            ;;
+    esac
+fi
+
+# ------------------------------------------------------------------------------
+# 3. Ensure Build Dependencies & Compile if not yet built
+# ------------------------------------------------------------------------------
+BIN_PATH=""
+if BIN_PATH=$(find_compiled_binary); then
+    echo "[olp-proxy] Detected compiled binary at $BIN_PATH"
+else
+    echo "[olp-proxy] Compiled binary not found. Checking build prerequisites..."
+
+    # Check for C linker (cc / gcc / clang)
+    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+        echo "[olp-proxy] C compiler/linker (cc/gcc) is required for building."
         if [ -f /etc/os-release ]; then
             . /etc/os-release
             case "${ID:-}" in
                 ubuntu|debian|linuxmint|pop)
-                    DEBIAN_FRONTEND=noninteractive sudo apt-get update -qq >/dev/null 2>&1 || true
-                    DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq build-essential curl ca-certificates >/dev/null 2>&1
+                    echo "[olp-proxy] Installing build-essential..."
+                    if sudo -n true 2>/dev/null; then
+                        DEBIAN_FRONTEND=noninteractive sudo apt-get update -qq >/dev/null 2>&1 || true
+                        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq build-essential curl ca-certificates >/dev/null 2>&1
+                    else
+                        echo "[olp-proxy] Sudo password required to install build-essential:"
+                        sudo apt-get update
+                        sudo apt-get install -y build-essential curl ca-certificates
+                    fi
                     ;;
                 fedora|rhel|centos|almalinux|rocky|amzn)
+                    echo "[olp-proxy] Installing gcc..."
                     if command -v dnf >/dev/null 2>&1; then
-                        sudo dnf install -y -q gcc curl ca-certificates >/dev/null 2>&1
+                        sudo dnf install -y gcc curl ca-certificates
                     else
-                        sudo yum install -y -q gcc curl ca-certificates >/dev/null 2>&1
+                        sudo yum install -y gcc curl ca-certificates
                     fi
                     ;;
                 alpine)
-                    sudo apk add --no-cache -q build-base curl ca-certificates >/dev/null 2>&1
+                    echo "[olp-proxy] Installing build-base..."
+                    sudo apk add --no-cache build-base curl ca-certificates
                     ;;
                 arch|manjaro)
-                    sudo pacman -Sy --noconfirm --quiet base-devel curl ca-certificates >/dev/null 2>&1
+                    echo "[olp-proxy] Installing base-devel..."
+                    sudo pacman -Sy --noconfirm base-devel curl ca-certificates
+                    ;;
+                *)
+                    echo "[olp-proxy] Warning: Unknown OS. Please install gcc/clang and curl manually."
                     ;;
             esac
         fi
     fi
 
+    # Check for Rust (cargo)
     if [ -f "$HOME/.cargo/env" ]; then
         # shellcheck disable=SC1091
         . "$HOME/.cargo/env"
@@ -45,17 +179,31 @@ ensure_build_deps() {
 
     if ! command -v cargo >/dev/null 2>&1; then
         echo "[olp-proxy] Installing minimal Rust toolchain silently (first-time only)..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --quiet >/dev/null 2>&1
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --quiet
         # shellcheck disable=SC1091
         . "$HOME/.cargo/env"
     fi
-}
 
-if [ ! -x "$BIN_PATH" ]; then
-    ensure_build_deps
-    echo "[olp-proxy] Compiling release binary (first-time only)..."
-    cargo build --release --quiet --bin olp-proxy
+    echo "[olp-proxy] Compiling release binary..."
+    cargo build --release --bin olp-proxy
+    BIN_PATH="$SCRIPT_DIR/target/release/olp-proxy"
 fi
 
-exec "$BIN_PATH" "$@"
+# ------------------------------------------------------------------------------
+# 4. Launch with PID Tracking & Graceful Cleanup
+# ------------------------------------------------------------------------------
+mkdir -p "$OLP_DATA_DIR"
+chmod 0700 "$OLP_DATA_DIR" 2>/dev/null || true
 
+cleanup() {
+    rm -f "$PID_FILE"
+}
+trap cleanup EXIT INT TERM
+
+# Run binary in foreground, recording PID
+"$BIN_PATH" "$@" &
+CHILD_PID=$!
+echo "$CHILD_PID" > "$PID_FILE"
+
+# Wait for process to exit
+wait "$CHILD_PID"

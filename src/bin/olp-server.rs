@@ -35,6 +35,21 @@ struct Args {
     non_interactive: bool,
 }
 
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -86,10 +101,9 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            println!("\n[olp-server] Shutting down...");
-            let _ = shutdown_tx.send(true);
-        }
+        wait_for_shutdown_signal().await;
+        println!("\n[olp-server] Shutting down cleanly...");
+        let _ = shutdown_tx.send(true);
     });
 
     run_server_with_shutdown(cfg, shutdown_rx).await

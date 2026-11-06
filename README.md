@@ -68,6 +68,11 @@ cd olp
 ./start-proxy.sh
 ```
 
+> **Lifecycle Controls**:
+> - `./start-proxy.sh restart` — Gracefully stops any running instance and starts a fresh one.
+> - `./start-proxy.sh stop` — Gracefully terminates the running process (`SIGTERM` $\to$ clean socket release).
+> - `./start-proxy.sh status` — Checks if the service is currently running and prints its PID.
+
 On first launch:
 1. It automatically generates `~/.olp/keys/proxy_id_ed25519` and displays your **Proxy Public Key**.
 2. It prompts you for basic options (press `Enter` to accept the defaults: listen on `0.0.0.0:4443`, allowed port range `10000-20000`).
@@ -83,6 +88,11 @@ git clone https://github.com/royans/olp.git
 cd olp
 ./start-server.sh
 ```
+
+> **Lifecycle Controls**:
+> - `./start-server.sh restart` — Gracefully stops any running instance and reconnects cleanly.
+> - `./start-server.sh stop` — Gracefully terminates the running tunnel client (`SIGTERM`).
+> - `./start-server.sh status` — Checks if the client is currently running and prints its PID.
 
 On first launch:
 1. It generates `~/.olp/keys/server_id_ed25519` and displays your **Server Public Key**.
