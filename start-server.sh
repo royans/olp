@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Bootstrap & Lifecycle Script for `olp-server`
-# Handles graceful restarts, pre-compiled binary detection, and build auto-provisioning.
+# Handles auto-updates on restart, graceful lifecycles, and binary detection.
 # ==============================================================================
 set -euo pipefail
 
@@ -10,6 +10,7 @@ cd "$SCRIPT_DIR"
 
 OLP_DATA_DIR="${OLP_HOME:-$HOME/.olp}"
 PID_FILE="$OLP_DATA_DIR/olp-server.pid"
+NEED_RECOMPILE=0
 
 # Auto-enable git pre-commit security protections if in a git repo
 if [ -d ".git" ] && [ -d ".githooks" ]; then
@@ -46,7 +47,33 @@ find_compiled_binary() {
 }
 
 # ------------------------------------------------------------------------------
-# 2. Process Lifecycle Management (Status / Stop / Restart)
+# 2. Git Auto-Update Logic
+# ------------------------------------------------------------------------------
+auto_update_from_git() {
+    if [ -d ".git" ] && command -v git >/dev/null 2>&1; then
+        if git remote get-url origin >/dev/null 2>&1; then
+            echo "[olp-server] Checking for repository updates from git..."
+            local HEAD_BEFORE
+            HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null || true)
+            # Try fast-forward pull
+            if git pull --ff-only -q 2>/dev/null || git pull --ff-only -q origin main 2>/dev/null; then
+                local HEAD_AFTER
+                HEAD_AFTER=$(git rev-parse HEAD 2>/dev/null || true)
+                if [ -n "$HEAD_BEFORE" ] && [ -n "$HEAD_AFTER" ] && [ "$HEAD_BEFORE" != "$HEAD_AFTER" ]; then
+                    echo "[olp-server] Successfully pulled new updates (${HEAD_BEFORE:0:7} -> ${HEAD_AFTER:0:7}). Recompiling binary..."
+                    NEED_RECOMPILE=1
+                else
+                    echo "[olp-server] Code is already up to date (${HEAD_BEFORE:0:7})."
+                fi
+            else
+                echo "[olp-server] Note: Could not pull latest git commits (offline or local modifications). Continuing."
+            fi
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 3. Process Lifecycle Management (Status / Stop / Restart / Update)
 # ------------------------------------------------------------------------------
 is_running() {
     if [ -f "$PID_FILE" ]; then
@@ -90,7 +117,6 @@ stop_process() {
     fi
 }
 
-# Handle CLI lifecycle subcommands (stop, restart, status)
 ACTION="${1:-}"
 if [ "$ACTION" = "stop" ]; then
     stop_process
@@ -103,33 +129,47 @@ elif [ "$ACTION" = "status" ]; then
         echo "[olp-server] Stopped"
         exit 1
     fi
+elif [ "$ACTION" = "update" ]; then
+    auto_update_from_git
+    if [ "$NEED_RECOMPILE" -eq 1 ] || [ ! -x "$SCRIPT_DIR/target/release/olp-server" ]; then
+        echo "[olp-server] Compiling release binary..."
+        cargo build --release --bin olp-server
+    fi
+    echo "[olp-server] Update complete."
+    exit 0
 elif [ "$ACTION" = "restart" ]; then
     stop_process
+    auto_update_from_git
     shift || true
 elif pid=$(is_running); then
-    # Running without 'restart' flag: check if user passed arguments like --show-pubkey
+    # Running without 'restart' flag: check if user passed query arguments
     case "${1:-}" in
         --show-pubkey|--set-proxy-key|-h|--help|-V|--version)
             # Allow query commands to proceed without conflicting with the running daemon
             ;;
         *)
             echo "[olp-server] Already running (PID: $pid)."
-            echo "  To restart:  ./start-server.sh restart"
-            echo "  To stop:     ./start-server.sh stop"
-            echo "  To check:    ./start-server.sh status"
+            echo "  To restart & auto-update:  ./start-server.sh restart"
+            echo "  To update code now:        ./start-server.sh update"
+            echo "  To stop:                   ./start-server.sh stop"
+            echo "  To check:                  ./start-server.sh status"
             exit 0
             ;;
     esac
 fi
 
 # ------------------------------------------------------------------------------
-# 3. Ensure Build Dependencies & Compile if not yet built
+# 4. Ensure Build Dependencies & Compile if not yet built or updated
 # ------------------------------------------------------------------------------
 BIN_PATH=""
-if BIN_PATH=$(find_compiled_binary); then
-    echo "[olp-server] Detected compiled binary at $BIN_PATH"
+if [ "$NEED_RECOMPILE" -eq 0 ] && BIN_PATH=$(find_compiled_binary); then
+    echo "[olp-server] Using compiled binary at $BIN_PATH"
 else
-    echo "[olp-server] Compiled binary not found. Checking build prerequisites..."
+    if [ "$NEED_RECOMPILE" -eq 1 ]; then
+        echo "[olp-server] Recompiling updated binary..."
+    else
+        echo "[olp-server] Compiled binary not found. Checking build prerequisites..."
+    fi
 
     # Check for C linker (cc / gcc / clang)
     if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
@@ -190,7 +230,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 4. Launch with PID Tracking & Graceful Cleanup
+# 5. Launch with PID Tracking & Graceful Cleanup
 # ------------------------------------------------------------------------------
 mkdir -p "$OLP_DATA_DIR"
 chmod 0700 "$OLP_DATA_DIR" 2>/dev/null || true
