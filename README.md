@@ -101,7 +101,7 @@ On the proxy machine, run:
 ./start-proxy.sh --add-key "olp-server-ed25519 AAAAC3NzaC1..."
 ```
 
-`olp-proxy` reads `~/.olp/keys/authorized_keys` dynamically on every handshake. The tunnel establishes immediately, and your Ollama endpoint is live on `http://<proxy-ip-or-domain>:11434`!
+`olp-proxy` reads `~/.olp/keys/authorized_keys` dynamically on every handshake. The tunnel establishes immediately, and your Ollama endpoint is live on `http://YOUR_PROXY_HOST:11434`!
 
 ---
 
