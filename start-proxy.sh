@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Bootstrap & Lifecycle Script for `olp-proxy`
-# Handles auto-updates on restart, graceful lifecycles, and binary detection.
+# Tries everything possible without root. If root packages are required,
+# explains exactly what is needed and fails quickly.
 # ==============================================================================
 set -euo pipefail
 
@@ -17,7 +18,7 @@ if [ -d ".git" ] && [ -d ".githooks" ]; then
     git config core.hooksPath .githooks 2>/dev/null || true
 fi
 
-# Load Cargo environment if present
+# Load Cargo user-space environment if present
 if [ -f "$HOME/.cargo/env" ]; then
     # shellcheck disable=SC1091
     . "$HOME/.cargo/env"
@@ -59,12 +60,11 @@ auto_update_from_git() {
             echo "[olp-proxy] Checking for repository updates from git..."
             local HEAD_BEFORE
             HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null || true)
-            # Try fast-forward pull
             if git pull --ff-only -q 2>/dev/null || git pull --ff-only -q origin main 2>/dev/null; then
                 local HEAD_AFTER
                 HEAD_AFTER=$(git rev-parse HEAD 2>/dev/null || true)
                 if [ -n "$HEAD_BEFORE" ] && [ -n "$HEAD_AFTER" ] && [ "$HEAD_BEFORE" != "$HEAD_AFTER" ]; then
-                    echo "[olp-proxy] Successfully pulled new updates (${HEAD_BEFORE:0:7} -> ${HEAD_AFTER:0:7}). Recompiling binary..."
+                    echo "[olp-proxy] Pulled updates (${HEAD_BEFORE:0:7} -> ${HEAD_AFTER:0:7}). Recompiling binary..."
                     NEED_RECOMPILE=1
                 else
                     echo "[olp-proxy] Code is already up to date (${HEAD_BEFORE:0:7})."
@@ -88,7 +88,6 @@ is_running() {
             return 0
         fi
     fi
-    # Fallback: check pgrep for running olp-proxy binary
     local pgrep_pid
     pgrep_pid=$(pgrep -x "olp-proxy" 2>/dev/null | head -n 1 || true)
     if [ -n "$pgrep_pid" ]; then
@@ -146,10 +145,8 @@ elif [ "$ACTION" = "restart" ]; then
     auto_update_from_git
     shift || true
 elif pid=$(is_running); then
-    # Running without 'restart' flag: check if user passed query arguments
     case "${1:-}" in
         --show-pubkey|--add-key|-h|--help|-V|--version)
-            # Allow query commands to proceed without conflicting with the running daemon
             ;;
         *)
             echo "[olp-proxy] Already running (PID: $pid)."
@@ -163,25 +160,15 @@ elif pid=$(is_running); then
 fi
 
 # ------------------------------------------------------------------------------
-# 4. Ensure Build Dependencies & Compile if not yet built or updated
+# 4. Resolve Binary: Try User-Space First, Explain Root Needs & Fail Fast
 # ------------------------------------------------------------------------------
 BIN_PATH=""
 if [ "$NEED_RECOMPILE" -eq 0 ] && BIN_PATH=$(find_compiled_binary); then
     echo "[olp-proxy] Using compiled binary at $BIN_PATH"
 else
-    if [ "$NEED_RECOMPILE" -eq 1 ]; then
-        echo "[olp-proxy] Recompiling updated binary..."
-    else
-        echo "[olp-proxy] Compiled binary not found. Checking build prerequisites..."
-    fi
-
-    # Check for C linker (cc / gcc / clang)
-    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
-        echo "[olp-proxy] C compiler/linker (cc/gcc) not found."
-
-        # Attempt to download pre-built release binary from GitHub Releases (no sudo needed!)
+    # 4a. Try downloading pre-built static binary from GitHub (requires ZERO root)
+    if [ "$NEED_RECOMPILE" -eq 0 ]; then
         mkdir -p "$SCRIPT_DIR/target/release"
-        local ARCH OS_NAME DOWNLOAD_URL
         ARCH="$(uname -m)"
         case "$(uname -s)" in
             Linux*)  OS_NAME="linux" ;;
@@ -189,84 +176,75 @@ else
             *)       OS_NAME="unknown" ;;
         esac
         DOWNLOAD_URL="https://github.com/royans/olp/releases/latest/download/olp-proxy-${OS_NAME}-${ARCH}"
-        echo "[olp-proxy] Attempting to download pre-built binary from GitHub Releases ($DOWNLOAD_URL)..."
-        if command -v curl >/dev/null 2>&1 && curl -sSfL "$DOWNLOAD_URL" -o "$SCRIPT_DIR/target/release/olp-proxy" 2>/dev/null; then
-            chmod +x "$SCRIPT_DIR/target/release/olp-proxy"
-            echo "[olp-proxy] Successfully downloaded pre-compiled binary! Skipping compilation."
-            BIN_PATH="$SCRIPT_DIR/target/release/olp-proxy"
-            return 0
-        fi
-
-        # If download is not available, check if sudo is available
-        local HAS_SUDO=0
-        if command -v sudo >/dev/null 2>&1; then
-            if sudo -n true 2>/dev/null || sudo -v 2>/dev/null; then
-                HAS_SUDO=1
+        if command -v curl >/dev/null 2>&1; then
+            echo "[olp-proxy] Compiled binary not found locally. Attempting user-space download from GitHub ($DOWNLOAD_URL)..."
+            if curl -sSfL "$DOWNLOAD_URL" -o "$SCRIPT_DIR/target/release/olp-proxy" 2>/dev/null; then
+                chmod +x "$SCRIPT_DIR/target/release/olp-proxy"
+                echo "[olp-proxy] Download successful! Starting pre-compiled binary without root."
+                BIN_PATH="$SCRIPT_DIR/target/release/olp-proxy"
             fi
         fi
+    fi
 
-        if [ "$HAS_SUDO" -eq 1 ] && [ -f /etc/os-release ]; then
-            . /etc/os-release
-            case "${ID:-}" in
-                ubuntu|debian|linuxmint|pop)
-                    echo "[olp-proxy] Installing build-essential via sudo..."
-                    DEBIAN_FRONTEND=noninteractive sudo apt-get update -qq >/dev/null 2>&1 || true
-                    DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq build-essential curl ca-certificates >/dev/null 2>&1 || true
-                    ;;
-                fedora|rhel|centos|almalinux|rocky|amzn)
-                    echo "[olp-proxy] Installing gcc via sudo..."
-                    if command -v dnf >/dev/null 2>&1; then
-                        sudo dnf install -y gcc curl ca-certificates || true
-                    else
-                        sudo yum install -y gcc curl ca-certificates || true
-                    fi
-                    ;;
-                alpine)
-                    echo "[olp-proxy] Installing build-base via sudo..."
-                    sudo apk add --no-cache build-base curl ca-certificates || true
-                    ;;
-                arch|manjaro)
-                    echo "[olp-proxy] Installing base-devel via sudo..."
-                    sudo pacman -Sy --noconfirm base-devel curl ca-certificates || true
-                    ;;
-            esac
-        fi
+    # 4b. If still no binary, we must compile from source
+    if [ -z "$BIN_PATH" ]; then
+        # Check for system C compiler/linker (cc/gcc/clang)
+        if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+            # FAIL FAST & EXPLAIN EXACTLY WHAT IS NEEDED AS ROOT
+            PKG_CMD="sudo apt install build-essential"
+            if [ -f /etc/os-release ]; then
+                . /etc/os-release
+                case "${ID:-}" in
+                    fedora|rhel|centos|almalinux|rocky|amzn) PKG_CMD="sudo dnf install gcc" ;;
+                    alpine) PKG_CMD="sudo apk add build-base" ;;
+                    arch|manjaro) PKG_CMD="sudo pacman -S base-devel" ;;
+                    *) PKG_CMD="sudo apt install build-essential (or equivalent C compiler)" ;;
+                esac
+            fi
 
-        # If cc is still missing after attempts:
-        if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
             echo ""
             echo "================================================================================"
-            echo "  [olp-proxy] Cannot compile from source without a C compiler/linker (cc/gcc)"
-            echo "  and user '$USER' does not have sudo privileges to install packages."
+            echo "  [olp-proxy] ROOT PRIVILEGES REQUIRED TO COMPILE ON THIS MACHINE"
+            echo "================================================================================"
+            echo "  To compile olp from source code, the system linker (gcc/cc) is missing."
             echo ""
-            echo "  SOLUTION: You don't need to compile on this machine! Simply copy the precompiled"
-            echo "  binary from your local machine to this host:"
+            echo "  What requires root:"
+            echo "    A system C compiler package must be installed once by an administrator."
+            echo "    Run as root / with sudo:"
+            echo ""
+            echo "      $PKG_CMD"
+            echo ""
+            echo "  ----------------------------------------------------------------------------"
+            echo "  HOW TO RUN WITHOUT ROOT (RECOMMENDED):"
+            echo "  ----------------------------------------------------------------------------"
+            echo "  You do NOT need to install anything as root on this server."
+            echo "  Simply copy the binary from a machine that already has it built:"
             echo ""
             echo "    scp target/release/olp-proxy $USER@$(hostname):~/olp/"
             echo ""
-            echo "  Once copied, run ./start-proxy.sh and it will start immediately with ZERO sudo."
+            echo "  Then re-run ./start-proxy.sh. It will detect it and start with zero root."
             echo "================================================================================"
             echo ""
             exit 1
         fi
-    fi
 
-    # Check for Rust (cargo)
-    if [ -f "$HOME/.cargo/env" ]; then
-        # shellcheck disable=SC1091
-        . "$HOME/.cargo/env"
-    fi
+        # 4c. Compiler is present: Install Rust user-space toolchain if needed (ZERO root!)
+        if [ -f "$HOME/.cargo/env" ]; then
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+        fi
 
-    if ! command -v cargo >/dev/null 2>&1; then
-        echo "[olp-proxy] Installing minimal Rust toolchain silently (first-time only)..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --quiet
-        # shellcheck disable=SC1091
-        . "$HOME/.cargo/env"
-    fi
+        if ! command -v cargo >/dev/null 2>&1; then
+            echo "[olp-proxy] Installing minimal Rust toolchain in user-space (~/.cargo) without root..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --quiet
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+        fi
 
-    echo "[olp-proxy] Compiling release binary..."
-    cargo build --release --bin olp-proxy
-    BIN_PATH="$SCRIPT_DIR/target/release/olp-proxy"
+        echo "[olp-proxy] Compiling release binary in user-space..."
+        cargo build --release --bin olp-proxy
+        BIN_PATH="$SCRIPT_DIR/target/release/olp-proxy"
+    fi
 fi
 
 # ------------------------------------------------------------------------------
@@ -280,10 +258,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Run binary in foreground, recording PID
 "$BIN_PATH" "$@" &
 CHILD_PID=$!
 echo "$CHILD_PID" > "$PID_FILE"
 
-# Wait for process to exit
 wait "$CHILD_PID"

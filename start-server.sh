@@ -163,25 +163,15 @@ elif pid=$(is_running); then
 fi
 
 # ------------------------------------------------------------------------------
-# 4. Ensure Build Dependencies & Compile if not yet built or updated
+# 4. Resolve Binary: Try User-Space First, Explain Root Needs & Fail Fast
 # ------------------------------------------------------------------------------
 BIN_PATH=""
 if [ "$NEED_RECOMPILE" -eq 0 ] && BIN_PATH=$(find_compiled_binary); then
     echo "[olp-server] Using compiled binary at $BIN_PATH"
 else
-    if [ "$NEED_RECOMPILE" -eq 1 ]; then
-        echo "[olp-server] Recompiling updated binary..."
-    else
-        echo "[olp-server] Compiled binary not found. Checking build prerequisites..."
-    fi
-
-    # Check for C linker (cc / gcc / clang)
-    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
-        echo "[olp-server] C compiler/linker (cc/gcc) not found."
-
-        # Attempt to download pre-built release binary from GitHub Releases (no sudo needed!)
+    # 4a. Try downloading pre-built static binary from GitHub (requires ZERO root)
+    if [ "$NEED_RECOMPILE" -eq 0 ]; then
         mkdir -p "$SCRIPT_DIR/target/release"
-        local ARCH OS_NAME DOWNLOAD_URL
         ARCH="$(uname -m)"
         case "$(uname -s)" in
             Linux*)  OS_NAME="linux" ;;
@@ -189,84 +179,75 @@ else
             *)       OS_NAME="unknown" ;;
         esac
         DOWNLOAD_URL="https://github.com/royans/olp/releases/latest/download/olp-server-${OS_NAME}-${ARCH}"
-        echo "[olp-server] Attempting to download pre-built binary from GitHub Releases ($DOWNLOAD_URL)..."
-        if command -v curl >/dev/null 2>&1 && curl -sSfL "$DOWNLOAD_URL" -o "$SCRIPT_DIR/target/release/olp-server" 2>/dev/null; then
-            chmod +x "$SCRIPT_DIR/target/release/olp-server"
-            echo "[olp-server] Successfully downloaded pre-compiled binary! Skipping compilation."
-            BIN_PATH="$SCRIPT_DIR/target/release/olp-server"
-            return 0
-        fi
-
-        # If download is not available, check if sudo is available
-        local HAS_SUDO=0
-        if command -v sudo >/dev/null 2>&1; then
-            if sudo -n true 2>/dev/null || sudo -v 2>/dev/null; then
-                HAS_SUDO=1
+        if command -v curl >/dev/null 2>&1; then
+            echo "[olp-server] Compiled binary not found locally. Attempting user-space download from GitHub ($DOWNLOAD_URL)..."
+            if curl -sSfL "$DOWNLOAD_URL" -o "$SCRIPT_DIR/target/release/olp-server" 2>/dev/null; then
+                chmod +x "$SCRIPT_DIR/target/release/olp-server"
+                echo "[olp-server] Download successful! Starting pre-compiled binary without root."
+                BIN_PATH="$SCRIPT_DIR/target/release/olp-server"
             fi
         fi
+    fi
 
-        if [ "$HAS_SUDO" -eq 1 ] && [ -f /etc/os-release ]; then
-            . /etc/os-release
-            case "${ID:-}" in
-                ubuntu|debian|linuxmint|pop)
-                    echo "[olp-server] Installing build-essential via sudo..."
-                    DEBIAN_FRONTEND=noninteractive sudo apt-get update -qq >/dev/null 2>&1 || true
-                    DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq build-essential curl ca-certificates >/dev/null 2>&1 || true
-                    ;;
-                fedora|rhel|centos|almalinux|rocky|amzn)
-                    echo "[olp-server] Installing gcc via sudo..."
-                    if command -v dnf >/dev/null 2>&1; then
-                        sudo dnf install -y gcc curl ca-certificates || true
-                    else
-                        sudo yum install -y gcc curl ca-certificates || true
-                    fi
-                    ;;
-                alpine)
-                    echo "[olp-server] Installing build-base via sudo..."
-                    sudo apk add --no-cache build-base curl ca-certificates || true
-                    ;;
-                arch|manjaro)
-                    echo "[olp-server] Installing base-devel via sudo..."
-                    sudo pacman -Sy --noconfirm base-devel curl ca-certificates || true
-                    ;;
-            esac
-        fi
+    # 4b. If still no binary, we must compile from source
+    if [ -z "$BIN_PATH" ]; then
+        # Check for system C compiler/linker (cc/gcc/clang)
+        if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+            # FAIL FAST & EXPLAIN EXACTLY WHAT IS NEEDED AS ROOT
+            PKG_CMD="sudo apt install build-essential"
+            if [ -f /etc/os-release ]; then
+                . /etc/os-release
+                case "${ID:-}" in
+                    fedora|rhel|centos|almalinux|rocky|amzn) PKG_CMD="sudo dnf install gcc" ;;
+                    alpine) PKG_CMD="sudo apk add build-base" ;;
+                    arch|manjaro) PKG_CMD="sudo pacman -S base-devel" ;;
+                    *) PKG_CMD="sudo apt install build-essential (or equivalent C compiler)" ;;
+                esac
+            fi
 
-        # If cc is still missing after attempts:
-        if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
             echo ""
             echo "================================================================================"
-            echo "  [olp-server] Cannot compile from source without a C compiler/linker (cc/gcc)"
-            echo "  and user '$USER' does not have sudo privileges to install packages."
+            echo "  [olp-server] ROOT PRIVILEGES REQUIRED TO COMPILE ON THIS MACHINE"
+            echo "================================================================================"
+            echo "  To compile olp from source code, the system linker (gcc/cc) is missing."
             echo ""
-            echo "  SOLUTION: You don't need to compile on this machine! Simply copy the precompiled"
-            echo "  binary from your local machine to this host:"
+            echo "  What requires root:"
+            echo "    A system C compiler package must be installed once by an administrator."
+            echo "    Run as root / with sudo:"
+            echo ""
+            echo "      $PKG_CMD"
+            echo ""
+            echo "  ----------------------------------------------------------------------------"
+            echo "  HOW TO RUN WITHOUT ROOT (RECOMMENDED):"
+            echo "  ----------------------------------------------------------------------------"
+            echo "  You do NOT need to install anything as root on this server."
+            echo "  Simply copy the binary from a machine that already has it built:"
             echo ""
             echo "    scp target/release/olp-server $USER@$(hostname):~/olp/"
             echo ""
-            echo "  Once copied, run ./start-server.sh and it will start immediately with ZERO sudo."
+            echo "  Then re-run ./start-server.sh. It will detect it and start with zero root."
             echo "================================================================================"
             echo ""
             exit 1
         fi
-    fi
 
-    # Check for Rust (cargo)
-    if [ -f "$HOME/.cargo/env" ]; then
-        # shellcheck disable=SC1091
-        . "$HOME/.cargo/env"
-    fi
+        # 4c. Compiler is present: Install Rust user-space toolchain if needed (ZERO root!)
+        if [ -f "$HOME/.cargo/env" ]; then
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+        fi
 
-    if ! command -v cargo >/dev/null 2>&1; then
-        echo "[olp-server] Installing minimal Rust toolchain silently (first-time only)..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --quiet
-        # shellcheck disable=SC1091
-        . "$HOME/.cargo/env"
-    fi
+        if ! command -v cargo >/dev/null 2>&1; then
+            echo "[olp-server] Installing minimal Rust toolchain in user-space (~/.cargo) without root..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --quiet
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+        fi
 
-    echo "[olp-server] Compiling release binary..."
-    cargo build --release --bin olp-server
-    BIN_PATH="$SCRIPT_DIR/target/release/olp-server"
+        echo "[olp-server] Compiling release binary in user-space..."
+        cargo build --release --bin olp-server
+        BIN_PATH="$SCRIPT_DIR/target/release/olp-server"
+    fi
 fi
 
 # ------------------------------------------------------------------------------
