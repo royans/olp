@@ -178,7 +178,7 @@ sudo crontab -e
 
 Add the following entry (runs weekly on Monday at 3:00 AM):
 ```cron
-0 3 * * 1 /home/royans/olp/renew-tls.sh --cron >> /var/log/olp-tls.log 2>&1
+0 3 * * 1 /path/to/olp/renew-tls.sh --cron >> /var/log/olp-tls.log 2>&1
 ```
 
 When renewal occurs, the script automatically exports the refreshed certs to `~/.olp/tls/` and reloads `olp-proxy` cleanly.
@@ -252,10 +252,10 @@ ollama run default
 
 ```cron
 # Automatically restart olp-proxy on system reboot
-@reboot cd /home/royans/olp && ./start-proxy.sh --daemon
+@reboot cd /path/to/olp && ./start-proxy.sh --daemon
 
 # Automatically restart olp-server on system reboot
-@reboot cd /home/royans/olp && ./start-server.sh --daemon
+@reboot cd /path/to/olp && ./start-server.sh --daemon
 ```
 
 Logs are written automatically to `~/.olp/proxy.log` and `~/.olp/server.log`.
