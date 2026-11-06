@@ -320,10 +320,9 @@ async fn handle_incoming_tunnel(
             "\n================================================================================\n\
              [AUTH ERROR] Tunnel connection from {} rejected: invalid passkey_proxy!\n\
              Please verify that [server].passkey_proxy in server.toml on the client matches\n\
-             [auth].passkey_proxy in {} on this proxy.\n\
+             [auth].passkey_proxy in proxy.toml on this proxy.\n\
              ================================================================================",
-            peer_addr,
-            state.config.auth.passkey_proxy
+            peer_addr
         );
 
         return Err(anyhow!(msg));

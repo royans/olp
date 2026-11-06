@@ -323,10 +323,9 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
     let (_tx, mut rx) = watch::channel(false);
     let res = run_single_tunnel_session(&wrong_passkey_server, &connector, &mut rx).await;
     assert!(res.is_err());
-    assert!(res
-        .unwrap_err()
-        .to_string()
-        .contains("ERR_INVALID_PASSKEY_PROXY"));
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("ERR_INVALID_PASSKEY_PROXY"));
+    assert!(!err_msg.contains("legit-proxy-passkey"));
 
     // Case B: Correct passkey_proxy -> registration accepted
     let correct_passkey_server = ServerConfig {
