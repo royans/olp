@@ -138,15 +138,37 @@ if [ -z "$DOMAIN" ] && [ -f "$DOMAIN_FILE" ]; then
     DOMAIN="$(cat "$DOMAIN_FILE" | tr -d '[:space:]')"
 fi
 
-# If still missing and interactive, prompt user
+# Detect system hostname / FQDN to propose as default
+DETECTED_HOST="$(hostname -f 2>/dev/null || hostname 2>/dev/null || uname -n 2>/dev/null || echo "")"
+DETECTED_HOST="$(echo "$DETECTED_HOST" | tr -d '[:space:]')"
+if [ "$DETECTED_HOST" = "localhost" ] || [ "$DETECTED_HOST" = "localhost.localdomain" ]; then
+    DETECTED_HOST=""
+fi
+
+# If still missing and interactive, prompt user with proposed hostname
 if [ -z "$DOMAIN" ]; then
     if [ -t 0 ] && [ "$CRON_MODE" -eq 0 ]; then
         echo -e "${CYAN}================================================================================${NC}"
         echo -e "${BOLD}  olp-proxy Let's Encrypt TLS Setup${NC}"
         echo -e "${CYAN}================================================================================${NC}"
         echo ""
-        read -r -p "Enter the public domain name for this server (e.g. ssh3.blogofy.com): " INPUT_DOMAIN
-        DOMAIN="$(echo "$INPUT_DOMAIN" | tr -d '[:space:]')"
+        if [ -n "$DETECTED_HOST" ]; then
+            read -r -p "Enter the public domain name for this server [${DETECTED_HOST}]: " INPUT_DOMAIN
+            DOMAIN="$(echo "$INPUT_DOMAIN" | tr -d '[:space:]')"
+            if [ -z "$DOMAIN" ]; then
+                DOMAIN="$DETECTED_HOST"
+            fi
+        else
+            read -r -p "Enter the public domain name for this server (e.g. ssh3.blogofy.com): " INPUT_DOMAIN
+            DOMAIN="$(echo "$INPUT_DOMAIN" | tr -d '[:space:]')"
+        fi
+    fi
+fi
+
+# If still missing (e.g. non-interactive/cron) but detected host has a domain dot, use it
+if [ -z "$DOMAIN" ] && [ -n "$DETECTED_HOST" ]; then
+    if [[ "$DETECTED_HOST" == *"."* ]]; then
+        DOMAIN="$DETECTED_HOST"
     fi
 fi
 
