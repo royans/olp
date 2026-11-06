@@ -69,10 +69,14 @@ async fn main() -> Result<()> {
     println!("  Allowed User CIDRs   : {:?}", cfg.security.allowed_user_cidrs);
     println!("================================================================================\n");
 
+    let pid_file = olp_home_dir()?.join("olp-proxy.pid");
+    let _ = std::fs::write(&pid_file, std::process::id().to_string());
+
     let (_bound_addr, _server_task) = start_proxy_server(cfg).await?;
 
     wait_for_shutdown_signal().await;
     println!("\n[olp-proxy] Shutting down cleanly...");
+    let _ = std::fs::remove_file(&pid_file);
 
     Ok(())
 }

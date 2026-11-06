@@ -70,6 +70,9 @@ async fn main() -> Result<()> {
     println!("  Remote Port  : {}", cfg.server.remote_port);
     println!("================================================================================\n");
 
+    let pid_file = olp_home_dir()?.join("olp-server.pid");
+    let _ = std::fs::write(&pid_file, std::process::id().to_string());
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let server_task = tokio::spawn(async move {
@@ -82,6 +85,7 @@ async fn main() -> Result<()> {
     println!("\n[olp-server] Shutting down...");
     let _ = shutdown_tx.send(true);
     let _ = server_task.await;
+    let _ = std::fs::remove_file(&pid_file);
 
     Ok(())
 }

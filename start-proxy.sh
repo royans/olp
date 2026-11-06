@@ -270,13 +270,12 @@ fi
 mkdir -p "$OLP_DATA_DIR"
 chmod 0700 "$OLP_DATA_DIR" 2>/dev/null || true
 
-cleanup() {
-    rm -f "$PID_FILE"
-}
-trap cleanup EXIT INT TERM
+# If config does not exist yet and stdin is a TTY, run first-time setup in foreground
+CONFIG_FILE="${OLP_CONFIG:-$OLP_DATA_DIR/proxy.toml}"
+if [ ! -f "$CONFIG_FILE" ] && [ -t 0 ]; then
+    "$BIN_PATH" --init-only
+fi
 
-"$BIN_PATH" "$@" &
-CHILD_PID=$!
-echo "$CHILD_PID" > "$PID_FILE"
-
-wait "$CHILD_PID"
+# Run binary replacing this shell with full TTY control
+echo $$ > "$PID_FILE"
+exec "$BIN_PATH" "$@"
