@@ -27,6 +27,10 @@ fi
 # 1. Detect if compiled binary already exists
 # ------------------------------------------------------------------------------
 find_compiled_binary() {
+    if [ -x "$SCRIPT_DIR/olp-server" ]; then
+        echo "$SCRIPT_DIR/olp-server"
+        return 0
+    fi
     if [ -x "$SCRIPT_DIR/target/release/olp-server" ]; then
         echo "$SCRIPT_DIR/target/release/olp-server"
         return 0
@@ -173,41 +177,77 @@ else
 
     # Check for C linker (cc / gcc / clang)
     if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
-        echo "[olp-server] C compiler/linker (cc/gcc) is required for building."
-        if [ -f /etc/os-release ]; then
+        echo "[olp-server] C compiler/linker (cc/gcc) not found."
+
+        # Attempt to download pre-built release binary from GitHub Releases (no sudo needed!)
+        mkdir -p "$SCRIPT_DIR/target/release"
+        local ARCH OS_NAME DOWNLOAD_URL
+        ARCH="$(uname -m)"
+        case "$(uname -s)" in
+            Linux*)  OS_NAME="linux" ;;
+            Darwin*) OS_NAME="darwin" ;;
+            *)       OS_NAME="unknown" ;;
+        esac
+        DOWNLOAD_URL="https://github.com/royans/olp/releases/latest/download/olp-server-${OS_NAME}-${ARCH}"
+        echo "[olp-server] Attempting to download pre-built binary from GitHub Releases ($DOWNLOAD_URL)..."
+        if command -v curl >/dev/null 2>&1 && curl -sSfL "$DOWNLOAD_URL" -o "$SCRIPT_DIR/target/release/olp-server" 2>/dev/null; then
+            chmod +x "$SCRIPT_DIR/target/release/olp-server"
+            echo "[olp-server] Successfully downloaded pre-compiled binary! Skipping compilation."
+            BIN_PATH="$SCRIPT_DIR/target/release/olp-server"
+            return 0
+        fi
+
+        # If download is not available, check if sudo is available
+        local HAS_SUDO=0
+        if command -v sudo >/dev/null 2>&1; then
+            if sudo -n true 2>/dev/null || sudo -v 2>/dev/null; then
+                HAS_SUDO=1
+            fi
+        fi
+
+        if [ "$HAS_SUDO" -eq 1 ] && [ -f /etc/os-release ]; then
             . /etc/os-release
             case "${ID:-}" in
                 ubuntu|debian|linuxmint|pop)
-                    echo "[olp-server] Installing build-essential..."
-                    if sudo -n true 2>/dev/null; then
-                        DEBIAN_FRONTEND=noninteractive sudo apt-get update -qq >/dev/null 2>&1 || true
-                        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq build-essential curl ca-certificates >/dev/null 2>&1
-                    else
-                        echo "[olp-server] Sudo password required to install build-essential:"
-                        sudo apt-get update
-                        sudo apt-get install -y build-essential curl ca-certificates
-                    fi
+                    echo "[olp-server] Installing build-essential via sudo..."
+                    DEBIAN_FRONTEND=noninteractive sudo apt-get update -qq >/dev/null 2>&1 || true
+                    DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq build-essential curl ca-certificates >/dev/null 2>&1 || true
                     ;;
                 fedora|rhel|centos|almalinux|rocky|amzn)
-                    echo "[olp-server] Installing gcc..."
+                    echo "[olp-server] Installing gcc via sudo..."
                     if command -v dnf >/dev/null 2>&1; then
-                        sudo dnf install -y gcc curl ca-certificates
+                        sudo dnf install -y gcc curl ca-certificates || true
                     else
-                        sudo yum install -y gcc curl ca-certificates
+                        sudo yum install -y gcc curl ca-certificates || true
                     fi
                     ;;
                 alpine)
-                    echo "[olp-server] Installing build-base..."
-                    sudo apk add --no-cache build-base curl ca-certificates
+                    echo "[olp-server] Installing build-base via sudo..."
+                    sudo apk add --no-cache build-base curl ca-certificates || true
                     ;;
                 arch|manjaro)
-                    echo "[olp-server] Installing base-devel..."
-                    sudo pacman -Sy --noconfirm base-devel curl ca-certificates
-                    ;;
-                *)
-                    echo "[olp-server] Warning: Unknown OS. Please install gcc/clang and curl manually."
+                    echo "[olp-server] Installing base-devel via sudo..."
+                    sudo pacman -Sy --noconfirm base-devel curl ca-certificates || true
                     ;;
             esac
+        fi
+
+        # If cc is still missing after attempts:
+        if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+            echo ""
+            echo "================================================================================"
+            echo "  [olp-server] Cannot compile from source without a C compiler/linker (cc/gcc)"
+            echo "  and user '$USER' does not have sudo privileges to install packages."
+            echo ""
+            echo "  SOLUTION: You don't need to compile on this machine! Simply copy the precompiled"
+            echo "  binary from your local machine to this host:"
+            echo ""
+            echo "    scp target/release/olp-server $USER@$(hostname):~/olp/"
+            echo ""
+            echo "  Once copied, run ./start-server.sh and it will start immediately with ZERO sudo."
+            echo "================================================================================"
+            echo ""
+            exit 1
         fi
     fi
 
