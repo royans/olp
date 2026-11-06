@@ -1,0 +1,38 @@
+# ==============================================================================
+# Sample Configuration for `olp-proxy`
+# Copy or let `olp-proxy` generate this file at: ~/.olp/proxy.toml
+# ==============================================================================
+
+[proxy]
+# Address and port where `olp-proxy` listens for incoming tunnel connections from `olp-server`
+listen_addr = "0.0.0.0:4443"
+
+# Allowed inclusive port range that authenticated `olp-server` instances may bind publicly
+allowed_ports = "10000-20000"
+
+# How long (in seconds) to hold the public port open (returning 503 Retry-After)
+# if an active tunnel drops unexpectedly while waiting for `olp-server` to reconnect
+listener_grace_period_sec = 300
+
+[keys]
+# Path to `olp-proxy`'s Ed25519 private key (auto-generated on first run)
+private_key = "~/.olp/keys/proxy_id_ed25519"
+
+# Path to `authorized_keys` containing allowed `olp-server` public keys (one per line)
+# Format: olp-server-ed25519 <base64-pubkey> [optional-comment] [ports=11434,11435]
+authorized_keys = "~/.olp/keys/authorized_keys"
+
+[security]
+# Maximum failed HTTP Basic/Bearer authentication attempts per IP per minute before returning 429
+max_auth_failures_per_min = 5
+
+# Maximum concurrent multiplexed HTTP streams per tunnel
+max_concurrent_streams = 128
+
+[tls]
+# Public endpoint TLS mode: "off" (plain HTTP), "manual" (custom PEM files), or "self-signed"
+mode = "off"
+# If mode = "manual":
+# cert_path = "~/.olp/keys/tls_cert.pem"
+# key_path = "~/.olp/keys/tls_key.pem"
+

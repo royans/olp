@@ -1,0 +1,40 @@
+# ==============================================================================
+# Sample Configuration for `olp-server`
+# Copy or let `olp-server` generate this file at: ~/.olp/server.toml
+# ==============================================================================
+
+[server]
+# Public address and tunnel control port of `olp-proxy`
+proxy_addr = "127.0.0.1:4443"
+
+# Local Ollama service address running inside the private network
+ollama_addr = "127.0.0.1:11434"
+
+# External public port to expose on `olp-proxy` (must be within proxy's allowed_ports)
+remote_port = 11434
+
+# Passkey required for end-users connecting to the public port on `olp-proxy`
+# Accepted via HTTP Basic Auth (`username:passkey`) or `Authorization: Bearer <passkey>`
+passkey = "change-me-to-a-strong-passkey"
+
+[keys]
+# Path to `olp-server`'s Ed25519 private key (auto-generated on first run)
+private_key = "~/.olp/keys/server_id_ed25519"
+
+# Path to file containing `olp-proxy`'s pinned public key (prevents MITM attacks)
+known_proxy_key = "~/.olp/keys/known_proxy.pub"
+
+[reconnect]
+# Reconnection backoff strategy ("fibonacci")
+strategy = "fibonacci"
+
+# Initial retry delay in seconds (1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 300)
+initial_delay_sec = 1
+
+# Maximum delay between reconnection attempts in seconds (300s = 5 minutes)
+max_delay_sec = 300
+
+# Application-level heartbeat interval and timeout in seconds
+heartbeat_interval_sec = 15
+heartbeat_timeout_sec = 5
+

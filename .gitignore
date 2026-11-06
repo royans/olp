@@ -1,0 +1,68 @@
+# ==============================================================================
+# Build & Rust Artifacts
+# ==============================================================================
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# ==============================================================================
+# Runtime Data, Configurations & Credentials
+# ==============================================================================
+# Never commit actual user runtime configurations (only *.example files are allowed)
+proxy.toml
+server.toml
+config.toml
+*.conf
+*.env
+*.env.*
+*.secret
+*.passkey
+
+# Never commit local .olp directories or runtime state
+.olp/
+**/.olp/
+acme_cache/
+**/*.acme/
+
+# ==============================================================================
+# Cryptographic Keys & Certificates
+# ==============================================================================
+# Never commit private keys, public keys, or certificate files
+*id_ed25519*
+*id_rsa*
+*id_ecdsa*
+*id_dsa*
+authorized_keys
+known_proxy.pub
+known_hosts
+*.pem
+*.key
+*.pkcs8
+*.crt
+*.cer
+*.der
+*.pfx
+*.p12
+
+# ==============================================================================
+# Logs, Dumps & Temp Files
+# ==============================================================================
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ==============================================================================
+# IDE & Tooling Caches
+# ==============================================================================
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.gemini/
+.system_generated/

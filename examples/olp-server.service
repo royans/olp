@@ -1,0 +1,17 @@
+[Unit]
+Description=Ollama Proxy Tunnel Client (olp-server)
+After=network.target ollama.service
+
+[Service]
+Type=simple
+# Run as the user running Ollama:
+User=ollama
+WorkingDirectory=/home/ollama/olp
+ExecStart=/home/ollama/olp/target/release/olp-server --non-interactive
+Restart=always
+RestartSec=5s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+

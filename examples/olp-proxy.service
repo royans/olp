@@ -1,0 +1,17 @@
+[Unit]
+Description=Ollama Proxy Gateway (olp-proxy)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# Adjust working directory and binary path to your installation:
+WorkingDirectory=/root/olp
+ExecStart=/root/olp/target/release/olp-proxy --non-interactive
+Restart=always
+RestartSec=5s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+

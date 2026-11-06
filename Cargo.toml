@@ -1,0 +1,43 @@
+[package]
+name = "olp"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight, resilient, mutually-authenticated reverse proxy and tunnel for Ollama (olp-proxy & olp-server)"
+license = "MIT"
+
+[[bin]]
+name = "olp-proxy"
+path = "src/bin/olp-proxy.rs"
+
+[[bin]]
+name = "olp-server"
+path = "src/bin/olp-server.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+blake3 = "1.5"
+bytes = "1.6"
+clap = { version = "4.5", features = ["derive"] }
+dirs = "5.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+futures = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1.4", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+rand = "0.8"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+socket2 = { version = "0.5", features = ["all"] }
+subtle = "2.6"
+tokio = { version = "1.38", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yamux = "0.12"
+
