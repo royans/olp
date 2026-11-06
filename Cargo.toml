@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Lightweight, resilient, mutually-authenticated reverse proxy and tunnel for Ollama (olp-proxy & olp-server)"
 license = "MIT"
+repository = "https://github.com/royans/olp"
+homepage = "https://github.com/royans/olp"
 
 [[bin]]
 name = "olp-proxy"
