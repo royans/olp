@@ -52,6 +52,10 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
   - Automatically rewrites model parameters in `/api/show` so agent context windows, capabilities, and templates work out of the box without manual configuration.
 - **Zero Inbound Port Forwarding on NAT**: `olp-server` initiates an *outbound* connection to `olp-proxy` over a single TLS 1.3 port (`:4443`).
 - **Encrypted TLS 1.3 Reverse Tunnel**: All multiplexed traffic is end-to-end encrypted with forward secrecy over TLS 1.3 using Yamux.
+- **Strict Multi-User Session Isolation & PII Safety**:
+  - Independent Yamux substreams and ephemeral local TCP connections per request guarantee zero session bleed or data mixing between concurrent users.
+  - Completely stateless architecture: no prompt logging, disk caching, or cross-request memory.
+  - Compatible with Ollama's isolated parallel slots (`OLLAMA_NUM_PARALLEL`).
 - **Built-in CORS & Webview Compatibility**: Full CORS preflight (`OPTIONS`) handling without authentication, enabling seamless integration with VS Code extensions (Cline, Roo Code) and browser web interfaces (Open WebUI).
 - **Flexible Client Authentication**: Supports Bearer tokens, HTTP Basic Auth, and custom `x-api-key` / `ollama-api-key` headers.
 - **Constant-Time Verification**: Plaintext passkeys are never verified with naive string equality; verification uses constant-time comparisons (`subtle::ConstantTimeEq`) and salted BLAKE3 hashing.
@@ -241,6 +245,20 @@ export OLLAMA_HOST="http://user:<passkey_user>@proxy.example.com:11434"
 ollama list
 ollama run default
 ```
+
+---
+
+## Multi-User Concurrency & Privacy Guarantees
+
+When multiple users query the same proxied Ollama instance:
+
+* **No Shared Sessions or Cross-Talk**: Each client request travels across an isolated Yamux substream with its own unique channel ID and triggers a distinct ephemeral TCP connection to local Ollama.
+* **No Cache Pollution or PII Leakage**: `olp` is strictly stateless. It does not cache prompts, conversation histories, or response bodies. Ollama's attention KV cache evaluates token prefixes strictly per sequence; attention tensors from one user are never injected into another user's generation.
+* **Independent IP Rate Limiting**: Brute-force protection tracks failures per IP address. One user's authentication mistakes will never lock out another user.
+* **Parallel Processing**: To allow Ollama to generate responses for multiple users concurrently (rather than queuing sequentially), set `OLLAMA_NUM_PARALLEL` on the Ollama host before starting Ollama:
+  ```bash
+  export OLLAMA_NUM_PARALLEL=2  # or 4, depending on GPU VRAM
+  ```
 
 ---
 
