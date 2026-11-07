@@ -9,7 +9,10 @@ use olp::keys::{enforce_private_file_permissions, IpRateLimiter, PasskeyVerifier
 use olp::protocol::{
     compute_proxy_auth_token, create_tunnel_tls_client_config, verify_proxy_auth_token,
 };
-use olp::proxy::{start_proxy_server, verify_http_headers_auth};
+use olp::proxy::{
+    extract_auth_token, extract_model, format_apache_timestamp, sanitize_for_log,
+    start_proxy_server, verify_http_headers_auth,
+};
 use olp::server::run_single_tunnel_session;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -471,4 +474,130 @@ fn test_server_should_verify_ca_auto_detection() {
 
     s.tls_verify = Some(true);
     assert!(s.should_verify_ca());
+}
+
+#[test]
+fn test_apache_access_log_helpers() {
+    // 1. Timestamp formatting
+    let now = std::time::SystemTime::now();
+    let ts = format_apache_timestamp(now);
+    assert!(ts.ends_with(" +0000"), "Must end with +0000: {}", ts);
+    assert_eq!(ts.chars().filter(|&c| c == '/').count(), 2);
+    assert_eq!(ts.chars().filter(|&c| c == ':').count(), 3);
+
+    // 2. Sanitization
+    let raw = "hello \"world\"\nnext line\r\t";
+    let sanitized = sanitize_for_log(raw, 50);
+    assert_eq!(sanitized, "hello \\\"world\\\"\\nnext line\\r\\t");
+
+    let long_str = "a".repeat(150);
+    let truncated = sanitize_for_log(&long_str, 20);
+    assert!(truncated.ends_with("..."));
+    assert!(truncated.len() <= 23);
+
+    assert_eq!(sanitize_for_log("", 10), "-");
+
+    // 3. Model extraction
+    let body_json = br#"{"model":"llama3:8b","prompt":"hi"}"#;
+    let dummy_uri: hyper::Uri = "/api/generate".parse().unwrap();
+    assert_eq!(extract_model(body_json, &dummy_uri), "llama3:8b");
+
+    let empty_body = b"";
+    let query_uri: hyper::Uri = "/api/show?model=mistral".parse().unwrap();
+    assert_eq!(extract_model(empty_body, &query_uri), "mistral");
+
+    let no_model_uri: hyper::Uri = "/api/tags".parse().unwrap();
+    assert_eq!(extract_model(empty_body, &no_model_uri), "-");
+
+    // 4. Token extraction
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer test-token-123"));
+    assert_eq!(extract_auth_token(&headers), "Bearer:test-token-123");
+
+    headers.clear();
+    headers.insert(hyper::header::HeaderName::from_static("x-api-key"), HeaderValue::from_static("custom-api-key"));
+    assert_eq!(extract_auth_token(&headers), "ApiKey:custom-api-key");
+
+    headers.clear();
+    assert_eq!(extract_auth_token(&headers), "-");
+}
+
+#[tokio::test]
+async fn test_apache_access_log_file_logging() {
+    let tmp = create_temp_dir("access-log");
+    let log_path = tmp.join("access.log");
+
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19100-19200".to_string(),
+            listener_grace_period_sec: 60,
+            access_log: Some(log_path.to_string_lossy().to_string()),
+        },
+        auth: ProxyAuthSection {
+            passkey_proxy: "access-log-proxy-pass".to_string(),
+            passkey_user: "access-log-user-pass".to_string(),
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            remote_port: 19150,
+            passkey_proxy: "access-log-proxy-pass".to_string(),
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&server_cfg, &connector, &mut { rx }).await;
+    });
+
+    // Wait for the public port to open
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:19150").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Send an unauthorized HTTP request (bad passkey_user)
+    let mut bad_req = tokio::net::TcpStream::connect("127.0.0.1:19150").await.unwrap();
+    let bad_payload = "POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1:19150\r\nAuthorization: Bearer bad-token\r\nContent-Length: 35\r\n\r\n{\"model\":\"llama3\",\"prompt\":\"hello\"}";
+    tokio::io::AsyncWriteExt::write_all(&mut bad_req, bad_payload.as_bytes()).await.unwrap();
+    let mut resp_buf = vec![0u8; 1024];
+    let _ = tokio::io::AsyncReadExt::read(&mut bad_req, &mut resp_buf).await;
+
+    // Send a CORS preflight OPTIONS request
+    let mut options_req = tokio::net::TcpStream::connect("127.0.0.1:19150").await.unwrap();
+    let options_payload = "OPTIONS /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19150\r\n\r\n";
+    tokio::io::AsyncWriteExt::write_all(&mut options_req, options_payload.as_bytes()).await.unwrap();
+    let _ = tokio::io::AsyncReadExt::read(&mut options_req, &mut resp_buf).await;
+
+    // Allow background logger to flush to disk
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(log_path.exists(), "access.log must be created");
+    let content = std::fs::read_to_string(&log_path).unwrap();
+
+    // Verify Apache log lines
+    assert!(content.contains("127.0.0.1"));
+    assert!(content.contains("401"));
+    assert!(content.contains("Bearer:bad-token"));
+    assert!(content.contains("model=\"llama3\""));
+    assert!(content.contains("req=\"{\\\"model\\\":\\\"llama3\\\",\\\"prompt\\\":\\\"hello\\\"}\""));
+    assert!(content.contains("OPTIONS /api/tags HTTP/1.1"));
+    assert!(content.contains("204"));
 }

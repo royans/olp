@@ -92,8 +92,10 @@ On first run, `olp-proxy` auto-generates two strong passkeys and displays:
 ================================================================================
 ```
 
-> **Lifecycle Commands**:
-> - `./start-proxy.sh restart` — Gracefully restarts and pulls latest updates.
+> **Lifecycle & Cron Commands**:
+> - `./start-proxy.sh restart` — Gracefully restarts and pulls latest updates from git.
+> - `./start-proxy.sh install-cron` — Installs automated 24h git auto-update + 15-min watchdog into crontab.
+> - `./start-proxy.sh uninstall-cron` — Removes managed cronjobs from crontab.
 > - `./start-proxy.sh stop` — Stops the proxy cleanly (`SIGTERM`).
 > - `./start-proxy.sh status` — Shows process status.
 
@@ -117,6 +119,13 @@ The tunnel connects immediately:
 Tunnel established! Exposing local Ollama (127.0.0.1:11434) on remote port :11434
 ```
 
+> **Lifecycle & Cron Commands**:
+> - `./start-server.sh restart` — Gracefully restarts and pulls latest updates from git.
+> - `./start-server.sh install-cron` — Installs automated 24h git auto-update + 15-min watchdog into crontab.
+> - `./start-server.sh uninstall-cron` — Removes managed cronjobs from crontab.
+> - `./start-server.sh stop` — Stops the server cleanly (`SIGTERM`).
+> - `./start-server.sh status` — Shows process status.
+
 ---
 
 ## Configuration Reference
@@ -127,6 +136,7 @@ Tunnel established! Exposing local Ollama (127.0.0.1:11434) on remote port :1143
 listen_addr = "0.0.0.0:4443"
 allowed_ports = "10000-20000"
 listener_grace_period_sec = 60
+access_log = "~/.olp/access.log" # Apache-style access log (set to "off" to disable)
 
 [auth]
 # Passkey required by olp-server to register a reverse tunnel

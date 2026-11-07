@@ -14,6 +14,10 @@ allowed_ports = "10000-20000"
 # if an active tunnel drops unexpectedly while waiting for `olp-server` to reconnect
 listener_grace_period_sec = 60
 
+# Apache-style access log file (defaults to ~/.olp/access.log, set to "off" to disable)
+# Logs timestamp, IP, token, method, URI, status, resp_bytes, duration_ms, model, req_bytes, req snippet, resp snippet
+access_log = "~/.olp/access.log"
+
 [auth]
 # 1. passkey_proxy: Shared between olp-proxy and olp-server for tunnel registration.
 # The connecting olp-server must provide this exact passkey.

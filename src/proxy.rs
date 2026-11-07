@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::header::{AUTHORIZATION, RETRY_AFTER, WWW_AUTHENTICATE};
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -109,6 +110,259 @@ impl PortWorker {
     }
 }
 
+/// Background access logger for writing Apache-style access log entries to file and tracing.
+#[derive(Clone)]
+pub struct AccessLogger {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl AccessLogger {
+    pub fn new(log_path: Option<PathBuf>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut file = if let Some(ref path) = log_path {
+                if let Some(parent) = path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .await
+                {
+                    Ok(f) => {
+                        let _ = enforce_private_file_permissions(path);
+                        Some(f)
+                    }
+                    Err(e) => {
+                        warn!("Failed to open access log file {}: {}", path.display(), e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            while let Some(line) = rx.recv().await {
+                info!(target: "access", "{}", line);
+                if let Some(ref mut f) = file {
+                    let _ = f.write_all(line.as_bytes()).await;
+                    let _ = f.write_all(b"\n").await;
+                    let _ = f.flush().await;
+                }
+            }
+        });
+
+        Self { tx }
+    }
+
+    pub fn log(&self, line: String) {
+        let _ = self.tx.send(line);
+    }
+}
+
+/// Formats a SystemTime into Apache Common Log Format timestamp: DD/Mon/YYYY:HH:MM:SS +0000
+pub fn format_apache_timestamp(now: std::time::SystemTime) -> String {
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut days = (secs / 86400) as i64;
+    days += 719468;
+    let era = if days >= 0 { days } else { days - 146096 } / 146097;
+    let doe = (days - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y } as i32;
+
+    let month_str = match m {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "Jan",
+    };
+
+    let rem = (secs % 86400) as u32;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+
+    format!(
+        "{:02}/{}/{:04}:{:02}:{:02}:{:02} +0000",
+        d, month_str, y, hour, min, sec
+    )
+}
+
+/// Sanitizes a string for single-line log output, escaping quotes, backslashes, and newlines.
+pub fn sanitize_for_log(s: &str, max_len: usize) -> String {
+    let mut out = String::with_capacity(max_len + 8);
+    for ch in s.chars() {
+        if out.len() >= max_len {
+            out.push_str("...");
+            break;
+        }
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push('?'),
+            c => out.push(c),
+        }
+    }
+    if out.is_empty() {
+        "-".to_string()
+    } else {
+        out
+    }
+}
+
+/// Extracts the model name from a JSON request body or URI query string.
+pub fn extract_model(body_bytes: &[u8], uri: &hyper::Uri) -> String {
+    if !body_bytes.is_empty() {
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+            if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
+                if !m.is_empty() {
+                    return m.to_string();
+                }
+            }
+        }
+    }
+
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "model" && !v.is_empty() {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+
+    "-".to_string()
+}
+
+/// Extracts the client authentication credential / token string for logging.
+pub fn extract_auth_token(headers: &hyper::HeaderMap) -> String {
+    if let Some(auth) = headers.get(AUTHORIZATION).and_then(|h| h.to_str().ok()) {
+        let auth = auth.trim();
+        if let Some(token) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
+            return format!("Bearer:{}", token.trim());
+        }
+        if let Some(b64) = auth.strip_prefix("Basic ").or_else(|| auth.strip_prefix("basic ")) {
+            if let Ok(decoded) = BASE64.decode(b64.trim()) {
+                if let Ok(str_val) = String::from_utf8(decoded) {
+                    return format!("Basic:{}", str_val);
+                }
+            }
+            return format!("Basic:{}", b64.trim());
+        }
+        return auth.replace(' ', "_");
+    }
+
+    for header_name in &["x-api-key", "api-key", "ollama-api-key", "x-auth-token"] {
+        if let Some(val) = headers.get(*header_name).and_then(|h| h.to_str().ok()) {
+            return format!("ApiKey:{}", val.trim());
+        }
+    }
+
+    "-".to_string()
+}
+
+/// Streaming body wrapper that passes chunks in real-time, counts total bytes,
+/// captures a snippet of the response, and triggers a callback when complete or dropped.
+pub struct LoggingBody<B> {
+    inner: B,
+    on_complete: Option<Box<dyn FnOnce(usize, String) + Send + Sync + 'static>>,
+    total_bytes: usize,
+    snippet_buf: Vec<u8>,
+}
+
+impl<B> LoggingBody<B> {
+    pub fn new(
+        inner: B,
+        on_complete: impl FnOnce(usize, String) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner,
+            on_complete: Some(Box::new(on_complete)),
+            total_bytes: 0,
+            snippet_buf: Vec::with_capacity(128),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(cb) = self.on_complete.take() {
+            let snippet = sanitize_for_log(&String::from_utf8_lossy(&self.snippet_buf), 100);
+            cb(self.total_bytes, snippet);
+        }
+    }
+}
+
+impl<B> Body for LoggingBody<B>
+where
+    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+{
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.total_bytes += data.len();
+                    if this.snippet_buf.len() < 128 {
+                        let take = (128 - this.snippet_buf.len()).min(data.len());
+                        this.snippet_buf.extend_from_slice(&data[..take]);
+                    }
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                this.finish();
+                std::task::Poll::Ready(Some(Err(e)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.finish();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl<B> Drop for LoggingBody<B> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 pub struct ProxyState {
     pub config: ProxyConfig,
     pub user_verifier: PasskeyVerifier,
@@ -119,6 +373,7 @@ pub struct ProxyState {
     pub workers: Mutex<HashMap<u16, Arc<PortWorker>>>,
     pub rate_limiter: Arc<IpRateLimiter>,
     pub public_tls_acceptor: Option<TlsAcceptor>,
+    pub access_logger: Arc<AccessLogger>,
 }
 
 pub fn verify_http_headers_auth(
@@ -246,6 +501,13 @@ pub async fn start_proxy_server(
         TlsAcceptor::from(create_tunnel_tls_server_config()?)
     };
 
+    let access_log_path = match &config.proxy.access_log {
+        Some(val) if val == "off" || val.is_empty() => None,
+        Some(path_str) => Some(expand_path(path_str)?),
+        None => None,
+    };
+    let access_logger = Arc::new(AccessLogger::new(access_log_path));
+
     let state = Arc::new(ProxyState {
         rate_limiter: Arc::new(IpRateLimiter::new(
             config.security.max_auth_failures_per_min,
@@ -258,6 +520,7 @@ pub async fn start_proxy_server(
         user_ip_filter,
         workers: Mutex::new(HashMap::new()),
         public_tls_acceptor,
+        access_logger,
     });
 
     info!(
@@ -559,8 +822,73 @@ async fn handle_public_http_request(
     worker: Arc<PortWorker>,
     state: Arc<ProxyState>,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
+    let start_time = std::time::Instant::now();
+    let timestamp_str = format_apache_timestamp(std::time::SystemTime::now());
+    let method = req.method().clone();
+    let uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| req.uri().path())
+        .to_string();
+    let version = format!("{:?}", req.version());
+    let token = extract_auth_token(req.headers());
+
+    let (mut parts, incoming_body) = req.into_parts();
+    let body_bytes = if parts.method == Method::GET
+        || parts.method == Method::HEAD
+        || parts.method == Method::OPTIONS
+    {
+        Bytes::new()
+    } else {
+        match incoming_body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => Bytes::new(),
+        }
+    };
+
+    let req_size = body_bytes.len();
+    let req_snippet = if body_bytes.is_empty() {
+        "-".to_string()
+    } else {
+        sanitize_for_log(&String::from_utf8_lossy(&body_bytes), 100)
+    };
+    let model = extract_model(&body_bytes, &parts.uri);
+
+    let access_logger = state.access_logger.clone();
+    let log_event = {
+        let timestamp_str = timestamp_str.clone();
+        let method = method.clone();
+        let uri = uri.clone();
+        let version = version.clone();
+        let token = token.clone();
+        let model = model.clone();
+        let req_snippet = req_snippet.clone();
+        move |status: StatusCode, resp_bytes: usize, resp_snippet: String| {
+            let duration_ms = start_time.elapsed().as_millis();
+            let line = format!(
+                r#"{ip} - {token} [{timestamp}] "{method} {uri} {version}" {status} {resp_bytes} {duration_ms}ms model="{model}" req_bytes={req_bytes} req="{req_snippet}" resp="{resp_snippet}""#,
+                ip = client_ip,
+                token = token,
+                timestamp = timestamp_str,
+                method = method,
+                uri = uri,
+                version = version,
+                status = status.as_u16(),
+                resp_bytes = resp_bytes,
+                duration_ms = duration_ms,
+                model = model,
+                req_bytes = req_size,
+                req_snippet = req_snippet,
+                resp_snippet = resp_snippet,
+            );
+            access_logger.log(line);
+        }
+    };
+
     // 1. Handle CORS preflight without requiring authentication
-    if req.method() == Method::OPTIONS {
+    if parts.method == Method::OPTIONS {
+        log_event(StatusCode::NO_CONTENT, 0, "-".to_string());
         let mut resp = Response::new(full_body(Bytes::new()));
         *resp.status_mut() = StatusCode::NO_CONTENT;
         resp.headers_mut().insert(
@@ -588,9 +916,9 @@ async fn handle_public_http_request(
             "[IP FILTER] Rejected user HTTP connection from {} (not in allowed_user_cidrs)",
             client_ip
         );
-        let mut resp = Response::new(full_body(
-            r#"{"error":"forbidden: IP address not allowed by proxy filter"}"#,
-        ));
+        let err_json = r#"{"error":"forbidden: IP address not allowed by proxy filter"}"#;
+        log_event(StatusCode::FORBIDDEN, err_json.len(), sanitize_for_log(err_json, 100));
+        let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::FORBIDDEN;
         resp.headers_mut().insert(
             hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -601,9 +929,9 @@ async fn handle_public_http_request(
 
     // 3. Check pre-tunnel IP brute-force rate limiter
     if state.rate_limiter.is_locked_out(&client_ip).is_some() {
-        let mut resp = Response::new(full_body(
-            r#"{"error":"too many failed authentication attempts, try again later"}"#,
-        ));
+        let err_json = r#"{"error":"too many failed authentication attempts, try again later"}"#;
+        log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), sanitize_for_log(err_json, 100));
+        let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         resp.headers_mut()
             .insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("60"));
@@ -615,11 +943,11 @@ async fn handle_public_http_request(
     }
 
     // 4. Verify passkey_user using Basic Auth or Bearer Token in constant time
-    if !verify_http_request_auth(&req, &state.user_verifier) {
+    if !verify_http_headers_auth(&parts.headers, &state.user_verifier) {
         state.rate_limiter.record_failure(client_ip);
-        let mut resp = Response::new(full_body(
-            r#"{"error":"unauthorized: valid Basic Auth (username:passkey_user) or Bearer passkey_user required"}"#,
-        ));
+        let err_json = r#"{"error":"unauthorized: valid Basic Auth (username:passkey_user) or Bearer passkey_user required"}"#;
+        log_event(StatusCode::UNAUTHORIZED, err_json.len(), sanitize_for_log(err_json, 100));
+        let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
         resp.headers_mut().insert(
             WWW_AUTHENTICATE,
@@ -643,9 +971,9 @@ async fn handle_public_http_request(
     let mux = match mux {
         Some(m) if !m.is_closed() => m,
         _ => {
-            let mut resp = Response::new(full_body(
-                r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#,
-            ));
+            let err_json = r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#;
+            log_event(StatusCode::SERVICE_UNAVAILABLE, err_json.len(), sanitize_for_log(err_json, 100));
+            let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
             resp.headers_mut().insert(
                 hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -659,9 +987,9 @@ async fn handle_public_http_request(
     let mux_stream = match mux.open_stream().await {
         Ok(s) => s,
         Err(_) => {
-            let mut resp = Response::new(full_body(
-                r#"{"error":"failed to open substream to olp-server"}"#,
-            ));
+            let err_json = r#"{"error":"failed to open substream to olp-server"}"#;
+            log_event(StatusCode::BAD_GATEWAY, err_json.len(), sanitize_for_log(err_json, 100));
+            let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             resp.headers_mut().insert(
                 hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -676,9 +1004,9 @@ async fn handle_public_http_request(
         match hyper::client::conn::http1::handshake(TokioIo::new(mux_stream)).await {
             Ok(pair) => pair,
             Err(_) => {
-                let mut resp = Response::new(full_body(
-                    r#"{"error":"failed HTTP handshake over tunnel substream"}"#,
-                ));
+                let err_json = r#"{"error":"failed HTTP handshake over tunnel substream"}"#;
+                log_event(StatusCode::BAD_GATEWAY, err_json.len(), sanitize_for_log(err_json, 100));
+                let mut resp = Response::new(full_body(err_json));
                 *resp.status_mut() = StatusCode::BAD_GATEWAY;
                 resp.headers_mut().insert(
                     hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -692,13 +1020,12 @@ async fn handle_public_http_request(
         let _ = conn.await;
     });
 
-    let (mut parts, body) = req.into_parts();
     parts.headers.remove(AUTHORIZATION);
     parts.headers.remove("x-api-key");
     parts.headers.remove("api-key");
     parts.headers.remove("ollama-api-key");
     parts.headers.remove("x-auth-token");
-    let forward_req = Request::from_parts(parts, body);
+    let forward_req = Request::from_parts(parts, full_body(body_bytes));
 
     match client_sender.send_request(forward_req).await {
         Ok(upstream_resp) => {
@@ -707,13 +1034,17 @@ async fn handle_public_http_request(
                 .headers
                 .entry(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .or_insert_with(|| hyper::header::HeaderValue::from_static("*"));
-            let boxed_body = u_body.map_err(|e| e).boxed();
-            Ok(Response::from_parts(u_parts, boxed_body))
+            let status = u_parts.status;
+            let boxed_upstream = u_body.map_err(|e| e).boxed();
+            let logging_body = LoggingBody::new(boxed_upstream, move |resp_bytes, resp_snippet| {
+                log_event(status, resp_bytes, resp_snippet);
+            });
+            Ok(Response::from_parts(u_parts, logging_body.boxed()))
         }
         Err(_) => {
-            let mut resp = Response::new(full_body(
-                r#"{"error":"upstream olp-server failed to respond"}"#,
-            ));
+            let err_json = r#"{"error":"upstream olp-server failed to respond"}"#;
+            log_event(StatusCode::BAD_GATEWAY, err_json.len(), sanitize_for_log(err_json, 100));
+            let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             resp.headers_mut().insert(
                 hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,

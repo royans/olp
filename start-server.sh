@@ -248,6 +248,34 @@ write_crontab() {
     echo "$entries" | sed 's/^/    /'
 }
 
+install_managed_cron() {
+    command -v crontab >/dev/null 2>&1 || {
+        echo "[olp-server] Error: crontab command not found on this system." >&2
+        return 1
+    }
+    local existing legacy kept
+    existing="$(crontab -l 2>/dev/null || true)"
+    legacy="@reboot cd $SCRIPT_DIR && ./start-server.sh --daemon"
+    kept="$(printf '%s\n' "$existing" | grep -v -F -x -- "$legacy" | grep -v -F -- "$CRON_MARKER" || true)"
+    echo "[olp-server] Installing managed cronjobs (watchdog every 15 min + daily 24h git pull/restart):"
+    write_crontab "$kept"
+    echo "[olp-server] [✓] Managed cronjobs successfully installed into crontab!"
+}
+
+uninstall_managed_cron() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    local existing legacy kept
+    existing="$(crontab -l 2>/dev/null || true)"
+    legacy="@reboot cd $SCRIPT_DIR && ./start-server.sh --daemon"
+    kept="$(printf '%s\n' "$existing" | grep -v -F -x -- "$legacy" | grep -v -F -- "$CRON_MARKER" || true)"
+    if [ -n "$kept" ]; then
+        printf '%s\n' "$kept" | crontab -
+    else
+        crontab -r 2>/dev/null || true
+    fi
+    echo "[olp-server] [✓] Managed cronjobs removed from crontab."
+}
+
 manage_cronjob() {
     command -v crontab >/dev/null 2>&1 || return 0
     local existing legacy managed kept
@@ -306,7 +334,7 @@ manage_cronjob() {
 
 ACTION="${1:-}"
 case "$ACTION" in
-    status|-h|--help|-V|--version)
+    status|-h|--help|-V|--version|cron|install-cron|uninstall-cron)
         ;;
     ensure)
         # Watchdog: if anything else holds the lock, a start/restart is in progress.
@@ -321,6 +349,14 @@ case "$ACTION" in
         fi
         ;;
 esac
+
+if [ "$ACTION" = "cron" ] || [ "$ACTION" = "install-cron" ]; then
+    install_managed_cron
+    exit 0
+elif [ "$ACTION" = "uninstall-cron" ]; then
+    uninstall_managed_cron
+    exit 0
+fi
 
 if [ "$ACTION" = "ensure" ]; then
     if is_running >/dev/null; then
