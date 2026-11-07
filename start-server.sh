@@ -531,8 +531,8 @@ if [ "$DAEMON_MODE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
     echo "[olp-server] Started in background (PID: $CHILD_PID, log: $LOG_FILE)"
     exit 0
 else
-    # Run in foreground with full TTY control
+    # Run in foreground with full TTY control, teeing to log file so ~/.olp/server.log always records activity
     echo $$ > "$PID_FILE"
     exec 9>&-
-    exec "$BIN_PATH" ${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"}
+    "$BIN_PATH" ${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"} 2>&1 | tee -a "$LOG_FILE"
 fi
