@@ -65,9 +65,16 @@ async fn main() -> Result<()> {
     println!("\n================================================================================");
     println!("  olp-server starting");
     println!("  Config       : {}", config_path.display());
+    println!("  Server ID    : {}", cfg.server.olp_server_id);
     println!("  Proxy Target : {} (TLS 1.3 encrypted)", cfg.server.proxy_addr);
     println!("  Local Ollama : {}", cfg.server.ollama_addr);
-    println!("  Remote Port  : {}", cfg.server.remote_port);
+    println!(
+        "  Assigned Port: {}",
+        cfg.server
+            .remote_port
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "Dynamic (allocated by proxy)".to_string())
+    );
     println!("================================================================================\n");
 
     let pid_file = olp_home_dir()?.join("olp-server.pid");

@@ -7,7 +7,8 @@ use olp::config::{
 };
 use olp::keys::{enforce_private_file_permissions, IpRateLimiter, PasskeyVerifier};
 use olp::protocol::{
-    compute_proxy_auth_token, create_tunnel_tls_client_config, verify_proxy_auth_token,
+    compute_server_auth_token, create_tunnel_tls_client_config, is_safe_identifier,
+    verify_server_auth_token,
 };
 use olp::proxy::{
     extract_auth_token, extract_model, format_apache_timestamp, sanitize_for_log,
@@ -158,19 +159,23 @@ fn test_cidr_filter_matching_and_rejection() {
 }
 
 #[test]
-fn test_passkey_proxy_nonce_binding() {
+fn test_olp_api_key_nonce_and_server_binding() {
     let nonce_a = [1u8; 32];
     let nonce_b = [2u8; 32];
-    let passkey = "proxy-secret-123";
+    let api_key = "proxy-secret-123";
+    let srv_id = "srv_alpha";
 
-    let token_a = compute_proxy_auth_token(passkey, &nonce_a);
-    assert!(verify_proxy_auth_token(&token_a, passkey, &nonce_a));
+    let token_a = compute_server_auth_token(&nonce_a, srv_id, api_key);
+    assert!(verify_server_auth_token(&token_a, &nonce_a, srv_id, api_key));
 
     // Replay on different session nonce fails
-    assert!(!verify_proxy_auth_token(&token_a, passkey, &nonce_b));
+    assert!(!verify_server_auth_token(&token_a, &nonce_b, srv_id, api_key));
+
+    // Wrong server_id fails
+    assert!(!verify_server_auth_token(&token_a, &nonce_a, "srv_beta", api_key));
 
     // Wrong passkey fails
-    assert!(!verify_proxy_auth_token(&token_a, "wrong-pass", &nonce_a));
+    assert!(!verify_server_auth_token(&token_a, &nonce_a, srv_id, "wrong-pass"));
 }
 
 // ============================================================================
@@ -278,8 +283,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             access_log: None,
         },
         auth: ProxyAuthSection {
-            passkey_proxy: "legit-proxy-pass".to_string(),
-            passkey_user: "legit-user-pass".to_string(),
+            olp_api_keys: vec!["legit-proxy-pass".to_string()],
         },
         security: ProxySecuritySection::default(),
         tls: ProxyTlsSection::default(),
@@ -290,47 +294,61 @@ async fn test_port_range_and_forbidden_port_rejection() {
     let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
     let connector = TlsConnector::from(tls_client_cfg);
 
-    // Case 1: Requesting privileged port 80 -> rejected by proxy
-    let server_cfg_priv = ServerConfig {
+    // Case 1: Requesting privileged port 80 -> proxy safely ignores invalid port and assigns safe port
+    let mut server_cfg_priv = ServerConfig {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: "127.0.0.1:11434".to_string(),
-            remote_port: 80, // privileged port!
-            passkey_proxy: "legit-proxy-pass".to_string(),
+            olp_api_key: "legit-proxy-pass".to_string(),
+            olp_server_id: "srv_priv".to_string(),
+            passkey_user: "user-pass".to_string(),
+            remote_port: Some(80), // privileged port!
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
     };
 
-    let (_tx, mut rx) = watch::channel(false);
-    let res_priv = run_single_tunnel_session(&server_cfg_priv, &connector, &mut rx).await;
-    assert!(res_priv.is_err());
-    assert!(res_priv
-        .unwrap_err()
-        .to_string()
-        .contains("ERR_PORT_FORBIDDEN"));
+    let (tx1, mut rx1) = watch::channel(false);
+    let conn1 = connector.clone();
+    let handle_priv = tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut server_cfg_priv, &conn1, &mut rx1).await;
+        server_cfg_priv
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = tx1.send(true);
+    let s_priv = handle_priv.await.unwrap();
+    let assigned_priv = s_priv.server.remote_port.unwrap();
+    assert_ne!(assigned_priv, 80, "Privileged port 80 must never be assigned");
+    assert!(assigned_priv >= 15000 && assigned_priv <= 16000);
 
-    // Case 2: Requesting port outside allowed range 15000-16000 (e.g. 25000) -> rejected
-    let server_cfg_out = ServerConfig {
+    // Case 2: Requesting port outside allowed range 15000-16000 (e.g. 25000) -> rejected or reassigned within allowed range
+    let mut server_cfg_out = ServerConfig {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: "127.0.0.1:11434".to_string(),
-            remote_port: 25000, // outside allowed 15000-16000
-            passkey_proxy: "legit-proxy-pass".to_string(),
+            olp_api_key: "legit-proxy-pass".to_string(),
+            olp_server_id: "srv_out".to_string(),
+            passkey_user: "user-pass".to_string(),
+            remote_port: Some(25000), // outside allowed 15000-16000
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
     };
 
-    let (_tx, mut rx2) = watch::channel(false);
-    let res_out = run_single_tunnel_session(&server_cfg_out, &connector, &mut rx2).await;
-    assert!(res_out.is_err());
-    assert!(res_out
-        .unwrap_err()
-        .to_string()
-        .contains("ERR_PORT_FORBIDDEN"));
+    let (tx2, mut rx2) = watch::channel(false);
+    let conn2 = connector.clone();
+    // When an invalid recommended_port is requested, the proxy safely assigns a valid port in the range
+    let handle = tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut server_cfg_out, &conn2, &mut rx2).await;
+        server_cfg_out
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = tx2.send(true);
+    let s_out = handle.await.unwrap();
+    let assigned_out = s_out.server.remote_port.unwrap();
+    assert!(assigned_out >= 15000 && assigned_out <= 16000);
 }
 
 #[tokio::test]
@@ -343,8 +361,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             access_log: None,
         },
         auth: ProxyAuthSection {
-            passkey_proxy: "shared-proxy-pass".to_string(),
-            passkey_user: "shared-user-pass".to_string(),
+            olp_api_keys: vec!["shared-proxy-pass".to_string()],
         },
         security: ProxySecuritySection::default(),
         tls: ProxyTlsSection::default(),
@@ -355,41 +372,45 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
     let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
     let connector = TlsConnector::from(tls_client_cfg);
 
-    let server_cfg1 = ServerConfig {
+    let mut server_cfg1 = ServerConfig {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: "127.0.0.1:11434".to_string(),
-            remote_port: 17101,
-            passkey_proxy: "shared-proxy-pass".to_string(),
+            olp_api_key: "shared-proxy-pass".to_string(),
+            olp_server_id: "srv_simul_1".to_string(),
+            passkey_user: "user-pass-1".to_string(),
+            remote_port: Some(17101),
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
     };
 
-    let server_cfg2 = ServerConfig {
+    let mut server_cfg2 = ServerConfig {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: "127.0.0.1:11434".to_string(),
-            remote_port: 17102,
-            passkey_proxy: "shared-proxy-pass".to_string(),
+            olp_api_key: "shared-proxy-pass".to_string(),
+            olp_server_id: "srv_simul_2".to_string(),
+            passkey_user: "user-pass-2".to_string(),
+            remote_port: Some(17102),
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
     };
 
-    let (_tx1, rx1) = watch::channel(false);
-    let (_tx2, rx2) = watch::channel(false);
+    let (_tx1, mut rx1) = watch::channel(false);
+    let (_tx2, mut rx2) = watch::channel(false);
 
     let connector_clone = connector.clone();
     let task1 = tokio::spawn(async move {
-        run_single_tunnel_session(&server_cfg1, &connector_clone, &mut { rx1 }).await
+        run_single_tunnel_session(&mut server_cfg1, &connector_clone, &mut rx1).await
     });
 
     let connector_clone2 = connector.clone();
     let task2 = tokio::spawn(async move {
-        run_single_tunnel_session(&server_cfg2, &connector_clone2, &mut { rx2 }).await
+        run_single_tunnel_session(&mut server_cfg2, &connector_clone2, &mut rx2).await
     });
 
     for _ in 0..40 {
@@ -418,8 +439,7 @@ async fn test_ca_verification_rejects_untrusted_certificates() {
             access_log: None,
         },
         auth: ProxyAuthSection {
-            passkey_proxy: "ca-test-passkey".to_string(),
-            passkey_user: "ca-test-user".to_string(),
+            olp_api_keys: vec!["ca-test-passkey".to_string()],
         },
         security: ProxySecuritySection::default(),
         tls: ProxyTlsSection::default(),
@@ -449,12 +469,24 @@ async fn test_ca_verification_rejects_untrusted_certificates() {
 }
 
 #[test]
+fn test_path_traversal_identifier_rejection() {
+    assert!(!is_safe_identifier("../bad"));
+    assert!(!is_safe_identifier("../../etc/shadow"));
+    assert!(!is_safe_identifier("user\0injection"));
+    assert!(!is_safe_identifier("user/slash"));
+    assert!(!is_safe_identifier("user\\backslash"));
+    assert!(is_safe_identifier("normal_user-123"));
+}
+
+#[test]
 fn test_server_should_verify_ca_auto_detection() {
     let mut s = ServerSection {
         proxy_addr: "127.0.0.1:4443".to_string(),
         ollama_addr: "127.0.0.1:11434".to_string(),
-        remote_port: 18434,
-        passkey_proxy: "pass".to_string(),
+        olp_api_key: "pass".to_string(),
+        olp_server_id: "srv_test".to_string(),
+        passkey_user: "user_test".to_string(),
+        remote_port: Some(18434),
         tls_verify: None,
     };
     assert!(!s.should_verify_ca());
@@ -535,8 +567,7 @@ async fn test_apache_access_log_file_logging() {
             access_log: Some(log_path.to_string_lossy().to_string()),
         },
         auth: ProxyAuthSection {
-            passkey_proxy: "access-log-proxy-pass".to_string(),
-            passkey_user: "access-log-user-pass".to_string(),
+            olp_api_keys: vec!["access-log-proxy-pass".to_string()],
         },
         security: ProxySecuritySection::default(),
         tls: ProxyTlsSection::default(),
@@ -548,21 +579,23 @@ async fn test_apache_access_log_file_logging() {
     let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
     let connector = TlsConnector::from(tls_client_cfg);
 
-    let server_cfg = ServerConfig {
+    let mut server_cfg = ServerConfig {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: "127.0.0.1:11434".to_string(),
-            remote_port: 19150,
-            passkey_proxy: "access-log-proxy-pass".to_string(),
+            olp_api_key: "access-log-proxy-pass".to_string(),
+            olp_server_id: "srv_access_log".to_string(),
+            passkey_user: "access-log-user-pass".to_string(),
+            remote_port: Some(19150),
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
     };
 
-    let (_tx, rx) = watch::channel(false);
+    let (_tx, mut rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = run_single_tunnel_session(&server_cfg, &connector, &mut { rx }).await;
+        let _ = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
     });
 
     // Wait for the public port to open

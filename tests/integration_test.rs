@@ -143,8 +143,8 @@ async fn send_http_request(
 async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
     let ollama_addr = start_mock_ollama().await;
 
-    let passkey_proxy = "test-proxy-secret-12345";
-    let passkey_user = "test-user-secret-67890";
+    let olp_api_key = "test_proxy_api_key_12345";
+    let passkey_user = "test_user_secret_67890";
 
     // 1. Start olp-proxy
     let proxy_cfg = ProxyConfig {
@@ -155,8 +155,7 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             access_log: None,
         },
         auth: ProxyAuthSection {
-            passkey_proxy: passkey_proxy.to_string(),
-            passkey_user: passkey_user.to_string(),
+            olp_api_keys: vec![olp_api_key.to_string()],
         },
         security: ProxySecuritySection {
             allowed_server_cidrs: vec!["127.0.0.1/32".to_string()],
@@ -176,8 +175,10 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: ollama_addr.to_string(),
-            remote_port,
-            passkey_proxy: passkey_proxy.to_string(),
+            olp_api_key: olp_api_key.to_string(),
+            olp_server_id: "srv_integration_1".to_string(),
+            passkey_user: passkey_user.to_string(),
+            remote_port: Some(remote_port),
             tls_verify: None,
         },
         reconnect: ReconnectSection {
@@ -290,6 +291,7 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
 
 #[tokio::test]
 async fn test_passkey_proxy_rejection_and_cidr_filtering() {
+    let legit_key = "legit_proxy_key";
     let proxy_cfg = ProxyConfig {
         proxy: ProxySection {
             listen_addr: "127.0.0.1:0".to_string(),
@@ -298,8 +300,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             access_log: None,
         },
         auth: ProxyAuthSection {
-            passkey_proxy: "legit-proxy-passkey".to_string(),
-            passkey_user: "legit-user-passkey".to_string(),
+            olp_api_keys: vec![legit_key.to_string()],
         },
         security: ProxySecuritySection {
             allowed_server_cidrs: vec!["127.0.0.1/32".to_string()],
@@ -315,13 +316,15 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
     let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
     let connector = TlsConnector::from(tls_client_cfg);
 
-    // Case A: Wrong passkey_proxy -> rejection with ERR_INVALID_PASSKEY_PROXY
-    let wrong_passkey_server = ServerConfig {
+    // Case A: Wrong olp_api_key -> rejection with ERR_UNAUTHORIZED_KEY
+    let mut wrong_passkey_server = ServerConfig {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: "127.0.0.1:11434".to_string(),
-            remote_port: 18450,
-            passkey_proxy: "wrong-passkey".to_string(),
+            olp_api_key: "wrong_api_key".to_string(),
+            olp_server_id: "srv_wrong".to_string(),
+            passkey_user: "some_user_pass".to_string(),
+            remote_port: Some(18450),
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
@@ -329,28 +332,30 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
     };
 
     let (_tx, mut rx) = watch::channel(false);
-    let res = run_single_tunnel_session(&wrong_passkey_server, &connector, &mut rx).await;
+    let res = run_single_tunnel_session(&mut wrong_passkey_server, &connector, &mut rx).await;
     assert!(res.is_err());
     let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("ERR_INVALID_PASSKEY_PROXY"));
-    assert!(!err_msg.contains("legit-proxy-passkey"));
+    assert!(err_msg.contains("ERR_UNAUTHORIZED_KEY"));
+    assert!(!err_msg.contains(legit_key));
 
-    // Case B: Correct passkey_proxy -> registration accepted
-    let correct_passkey_server = ServerConfig {
+    // Case B: Correct olp_api_key -> registration accepted
+    let mut correct_passkey_server = ServerConfig {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: "127.0.0.1:11434".to_string(),
-            remote_port: 18451,
-            passkey_proxy: "legit-proxy-passkey".to_string(),
+            olp_api_key: legit_key.to_string(),
+            olp_server_id: "srv_correct".to_string(),
+            passkey_user: "legit-user-passkey".to_string(),
+            remote_port: Some(18451),
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
     };
 
-    let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
+    let (server_shutdown_tx, mut server_shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = run_single_tunnel_session(&correct_passkey_server, &connector, &mut { server_shutdown_rx }).await;
+        let _ = run_single_tunnel_session(&mut correct_passkey_server, &connector, &mut server_shutdown_rx).await;
     });
 
     let public_addr: SocketAddr = "127.0.0.1:18451".parse().unwrap();
@@ -458,8 +463,7 @@ async fn test_model_auto_mapping_and_cors() {
             access_log: None,
         },
         auth: ProxyAuthSection {
-            passkey_proxy: "test-proxy-passkey".to_string(),
-            passkey_user: "test-user-passkey".to_string(),
+            olp_api_keys: vec!["test-proxy-passkey".to_string()],
         },
         security: ProxySecuritySection {
             allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
@@ -478,8 +482,10 @@ async fn test_model_auto_mapping_and_cors() {
         server: ServerSection {
             proxy_addr: proxy_control_addr.to_string(),
             ollama_addr: mock_addr.to_string(),
-            remote_port: 18550,
-            passkey_proxy: "test-proxy-passkey".to_string(),
+            olp_api_key: "test-proxy-passkey".to_string(),
+            olp_server_id: "srv_model1".to_string(),
+            passkey_user: "test-user-passkey".to_string(),
+            remote_port: Some(18550),
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
@@ -563,4 +569,167 @@ async fn test_model_auto_mapping_and_cors() {
     assert!(show_body.starts_with(b"{\"license\":\"MIT\""));
 
     let _ = server_shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
+    let mock_addr = start_mock_ollama().await;
+
+    let user_alice = "alice_api_key_111";
+    let user_bob = "bob_api_key_222";
+
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19100-19200".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_alice.to_string(), user_bob.to_string()],
+        },
+        security: ProxySecuritySection {
+            allowed_server_cidrs: vec!["127.0.0.1/32".to_string()],
+            allowed_user_cidrs: vec!["127.0.0.1/32".to_string()],
+            max_auth_failures_per_min: 60,
+            max_concurrent_streams: 64,
+        },
+        tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+
+    // Alice Server 1: dynamic port allocation (remote_port = None)
+    let alice_srv1 = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_alice.to_string(),
+            olp_server_id: "srv_alice_1".to_string(),
+            passkey_user: "alice_pass_1".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (tx1, rx1) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_server_with_shutdown(alice_srv1, rx1).await;
+    });
+
+    // Alice Server 2: dynamic port allocation (remote_port = None)
+    let alice_srv2 = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_alice.to_string(),
+            olp_server_id: "srv_alice_2".to_string(),
+            passkey_user: "alice_pass_2".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (tx2, rx2) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_server_with_shutdown(alice_srv2, rx2).await;
+    });
+
+    // Bob Server 1: dynamic port allocation (remote_port = None)
+    let bob_srv1 = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_bob.to_string(),
+            olp_server_id: "srv_bob_1".to_string(),
+            passkey_user: "bob_pass_1".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (tx3, rx3) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_server_with_shutdown(bob_srv1, rx3).await;
+    });
+
+    // Ports should be sequentially allocated: 19100, 19101, 19102
+    let alice_port1 = 19100;
+    let alice_port2 = 19101;
+    let bob_port1 = 19102;
+
+    for _ in 0..40 {
+        let p1 = TcpStream::connect(format!("127.0.0.1:{}", alice_port1)).await;
+        let p2 = TcpStream::connect(format!("127.0.0.1:{}", alice_port2)).await;
+        let p3 = TcpStream::connect(format!("127.0.0.1:{}", bob_port1)).await;
+        if p1.is_ok() && p2.is_ok() && p3.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Verify User isolation on Alice Port 1
+    let addr_alice1: SocketAddr = format!("127.0.0.1:{}", alice_port1).parse().unwrap();
+    let (status_ok, _, _) = send_http_request(
+        addr_alice1,
+        Method::GET,
+        "/api/tags",
+        Some("Bearer alice_pass_1"),
+        b"",
+    )
+    .await;
+    assert_eq!(status_ok, StatusCode::OK);
+
+    let (status_unauth, _, _) = send_http_request(
+        addr_alice1,
+        Method::GET,
+        "/api/tags",
+        Some("Bearer alice_pass_2"),
+        b"",
+    )
+    .await;
+    assert_eq!(status_unauth, StatusCode::UNAUTHORIZED);
+
+    let (status_unauth_bob, _, _) = send_http_request(
+        addr_alice1,
+        Method::GET,
+        "/api/tags",
+        Some("Bearer bob_pass_1"),
+        b"",
+    )
+    .await;
+    assert_eq!(status_unauth_bob, StatusCode::UNAUTHORIZED);
+
+    // Verify Bob's port
+    let addr_bob: SocketAddr = format!("127.0.0.1:{}", bob_port1).parse().unwrap();
+    let (status_bob_ok, _, _) = send_http_request(
+        addr_bob,
+        Method::GET,
+        "/api/tags",
+        Some("Bearer bob_pass_1"),
+        b"",
+    )
+    .await;
+    assert_eq!(status_bob_ok, StatusCode::OK);
+
+    let (status_bob_reject, _, _) = send_http_request(
+        addr_bob,
+        Method::GET,
+        "/api/tags",
+        Some("Bearer alice_pass_1"),
+        b"",
+    )
+    .await;
+    assert_eq!(status_bob_reject, StatusCode::UNAUTHORIZED);
+
+    let _ = tx1.send(true);
+    let _ = tx2.send(true);
+    let _ = tx3.send(true);
 }

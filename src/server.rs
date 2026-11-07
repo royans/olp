@@ -35,9 +35,21 @@ fn full_body<T: Into<Bytes>>(chunk: T) -> BoxHttpBody {
 /// Main entry point for `olp-server`. Maintains a persistent Yamux reverse tunnel
 /// over TLS 1.3 to `olp-proxy` with Fibonacci reconnection backoff.
 pub async fn run_server_with_shutdown(
-    config: ServerConfig,
+    mut config: ServerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    if config.server.olp_server_id.is_empty() {
+        config.server.olp_server_id = crate::config::generate_random_server_id();
+        let cfg_path = match std::env::var("OLP_CONFIG") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => match crate::config::olp_home_dir() {
+                Ok(h) => h.join("server.toml"),
+                Err(_) => std::path::PathBuf::from("server.toml"),
+            },
+        };
+        let _ = config.save_to_path(&cfg_path);
+    }
+
     let verify_ca = config.server.should_verify_ca();
     if verify_ca {
         info!("TLS certificate verification enabled (Mozilla WebPKI CA roots)");
@@ -59,7 +71,7 @@ pub async fn run_server_with_shutdown(
         }
 
         let session_start = Instant::now();
-        let res = run_single_tunnel_session(&config, &connector, &mut shutdown_rx).await;
+        let res = run_single_tunnel_session(&mut config, &connector, &mut shutdown_rx).await;
 
         if *shutdown_rx.borrow() {
             info!("olp-server shutting down cleanly");
@@ -82,13 +94,13 @@ pub async fn run_server_with_shutdown(
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("ERR_INVALID_PASSKEY_PROXY") {
+                if err_str.contains("ERR_UNAUTHORIZED_KEY") || err_str.contains("ERR_INVALID_AUTH_TOKEN") {
                     if backoff.attempt() == 1 || backoff.attempt() % 5 == 0 {
                         error!(
                             "\n================================================================================\n\
-                             [AUTH ERROR] Proxy rejected your passkey_proxy!\n\
-                             Please check that [server].passkey_proxy in ~/.olp/server.toml matches\n\
-                             [auth].passkey_proxy in ~/.olp/proxy.toml on the proxy host.\n\
+                             [AUTH ERROR] Proxy rejected your olp_api_key!\n\
+                             Please check that [server].olp_api_key in ~/.olp/server.toml is a valid\n\
+                             user API key recognized by the proxy.\n\
                              ================================================================================"
                         );
                     }
@@ -115,7 +127,7 @@ pub async fn run_server_with_shutdown(
 
 /// Runs a single outbound tunnel session to `olp-proxy`.
 pub async fn run_single_tunnel_session(
-    config: &ServerConfig,
+    config: &mut ServerConfig,
     connector: &TlsConnector,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
@@ -150,10 +162,12 @@ pub async fn run_single_tunnel_session(
     .await
     .context("Timed out waiting for ProxyHelloChallenge")??;
 
-    // Step 2: Send ServerAuthRegister with auth token computed from passkey_proxy
+    // Step 2: Send ServerAuthRegister with auth token computed from olp_api_key
     let register = ServerAuthRegister::new(
+        &config.server.olp_api_key,
+        &config.server.olp_server_id,
         config.server.remote_port,
-        &config.server.passkey_proxy,
+        &config.server.passkey_user,
         &challenge.proxy_nonce,
     );
 
@@ -180,9 +194,24 @@ pub async fn run_single_tunnel_session(
     }
 
     info!(
-        "TLS 1.3 tunnel established! Exposing local Ollama ({}) on remote port :{}",
-        config.server.ollama_addr, config.server.remote_port
+        "TLS 1.3 tunnel established! Exposing local Ollama ({}) on remote port :{} (server_id: {})",
+        config.server.ollama_addr, established.assigned_port, config.server.olp_server_id
     );
+
+    // Save assigned_port back into server config if different
+    if config.server.remote_port != Some(established.assigned_port) {
+        config.server.remote_port = Some(established.assigned_port);
+        let cfg_path = match std::env::var("OLP_CONFIG") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => match crate::config::olp_home_dir() {
+                Ok(h) => h.join("server.toml"),
+                Err(_) => std::path::PathBuf::from("server.toml"),
+            },
+        };
+        if let Err(e) = config.save_to_path(&cfg_path) {
+            warn!("Failed to persist assigned port to {}: {}", cfg_path.display(), e);
+        }
+    }
 
     // Upgrade connection to Yamux multiplexer
     let (mux_handle, mut inbound_rx) = spawn_mux_session(tls_stream, Mode::Client, 128);

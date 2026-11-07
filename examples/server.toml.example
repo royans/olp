@@ -12,11 +12,19 @@ proxy_addr = "proxy.example.com:4443"
 # model is currently loaded in memory, regardless of what model name the client requests.
 ollama_addr = "127.0.0.1:11434"
 
-# External port to expose on olp-proxy (must fall within proxy's allowed_ports)
-remote_port = 11434
+# User API key recognized by the proxy (matches olp_api_keys in proxy.toml or ~/.olp/config/<olp_api_key>.toml)
+olp_api_key = "change-me-to-your-olp-api-key"
 
-# Passkey matching [auth].passkey_proxy in proxy.toml on olp-proxy
-passkey_proxy = "change-me-to-a-secure-proxy-passkey"
+# Unique identifier for this server instance (auto-generated e.g. srv_8aBcD123 if empty)
+olp_server_id = "srv_my_ollama_box"
+
+# Passkey required by end-users to query Ollama on this server's exposed port.
+# Supports HTTP Basic Auth (any-username:passkey_user) or Bearer Token (Authorization: Bearer <passkey_user>).
+passkey_user = "change-me-to-a-secure-user-passkey"
+
+# Optional recommended external port to expose on olp-proxy (must fall within proxy's allowed_ports).
+# If omitted or already in use, the proxy will dynamically allocate an unused port.
+# remote_port = 11434
 
 # TLS CA Certificate Verification (optional, defaults to true for domain names, false for raw IP/localhost)
 # Set to true to enforce Mozilla WebPKI root certificate verification (e.g. Let's Encrypt).

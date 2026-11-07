@@ -1,10 +1,11 @@
 use crate::cidr::IpFilter;
-use crate::config::{expand_path, ProxyConfig};
+use crate::config::{expand_path, olp_config_dir, ProxyConfig, UserProfile, UserServerConfig};
 use crate::keys::{enforce_private_file_permissions, IpRateLimiter, PasskeyVerifier};
 use crate::mux::{spawn_mux_session, MuxHandle};
 use crate::protocol::{
-    configure_tunnel_socket, create_tunnel_tls_server_config, read_frame, verify_proxy_auth_token,
-    write_frame, ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished,
+    configure_tunnel_socket, create_tunnel_tls_server_config, is_safe_identifier, read_frame,
+    verify_server_auth_token, write_frame, ProxyHelloChallenge, ServerAuthRegister,
+    TunnelEstablished,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -98,6 +99,9 @@ pub struct PortWorker {
     pub active_mux: RwLock<Option<MuxHandle>>,
     pub session_gen: AtomicU64,
     pub shutdown_notify: Notify,
+    pub user_verifier: RwLock<PasskeyVerifier>,
+    pub user_ip_filter: RwLock<Arc<IpFilter>>,
+    pub assigned_server_id: RwLock<Option<String>>,
 }
 
 impl PortWorker {
@@ -365,15 +369,180 @@ impl<B> Drop for LoggingBody<B> {
 
 pub struct ProxyState {
     pub config: ProxyConfig,
-    pub user_verifier: PasskeyVerifier,
+    pub config_dir: PathBuf,
     pub allowed_port_range: (u16, u16),
     pub control_port: u16,
     pub server_ip_filter: Arc<IpFilter>,
-    pub user_ip_filter: Arc<IpFilter>,
     pub workers: Mutex<HashMap<u16, Arc<PortWorker>>>,
+    pub allocation_lock: tokio::sync::Mutex<()>,
     pub rate_limiter: Arc<IpRateLimiter>,
     pub public_tls_acceptor: Option<TlsAcceptor>,
     pub access_logger: Arc<AccessLogger>,
+}
+
+impl ProxyState {
+    pub fn is_authorized_api_key(&self, api_key: &str) -> bool {
+        if !is_safe_identifier(api_key) {
+            return false;
+        }
+        if self.config.auth.olp_api_keys.iter().any(|k| k == api_key) {
+            return true;
+        }
+        let profile_path = self.config_dir.join(format!("{}.toml", api_key));
+        profile_path.is_file()
+    }
+
+    pub fn load_user_profile(&self, api_key: &str) -> Result<UserProfile> {
+        let profile_path = self.config_dir.join(format!("{}.toml", api_key));
+        if profile_path.is_file() {
+            UserProfile::load_from_path(&profile_path)
+        } else if self.config.auth.olp_api_keys.iter().any(|k| k == api_key) {
+            let profile = UserProfile::new(api_key);
+            profile.save_atomic(&profile_path)?;
+            Ok(profile)
+        } else {
+            Err(anyhow!("User profile not found for key"))
+        }
+    }
+
+    pub fn save_user_profile(&self, profile: &UserProfile) -> Result<()> {
+        let profile_path = self.config_dir.join(format!("{}.toml", profile.user.api_key));
+        profile.save_atomic(&profile_path)
+    }
+
+    pub async fn allocate_server_port(
+        &self,
+        api_key: &str,
+        server_id: &str,
+        recommended_port: Option<u16>,
+        passkey_user: &str,
+    ) -> Result<u16> {
+        let _guard = self.allocation_lock.lock().await;
+
+        let mut profile = self.load_user_profile(api_key)?;
+        if profile.user.disabled {
+            return Err(anyhow!("ERR_USER_DISABLED: this API key has been disabled"));
+        }
+
+        let (min_port, max_port) = self.allowed_port_range;
+
+        // 1. Check if server already has a registered port in this profile
+        if let Some(existing_srv) = profile.servers.get_mut(server_id) {
+            let p = existing_srv.port;
+            if p >= min_port && p <= max_port && p != self.control_port {
+                let in_use_by_other = {
+                    let workers = self.workers.lock().unwrap();
+                    if let Some(w) = workers.get(&p) {
+                        let current_sid = w.assigned_server_id.read().unwrap();
+                        current_sid.as_deref() != Some(server_id) && w.has_active_session()
+                    } else {
+                        false
+                    }
+                };
+                if !in_use_by_other {
+                    existing_srv.passkey_user = passkey_user.to_string();
+                    self.save_user_profile(&profile)?;
+                    return Ok(p);
+                }
+            }
+        }
+
+        // 2. New server for this user: enforce max_servers limit
+        if !profile.servers.contains_key(server_id)
+            && profile.servers.len() >= profile.user.max_servers
+        {
+            return Err(anyhow!(
+                "ERR_MAX_SERVERS_EXCEEDED: account server limit ({}) reached",
+                profile.user.max_servers
+            ));
+        }
+
+        // 3. Collect all ports currently assigned or reserved across ALL user profiles
+        let mut used_ports = std::collections::HashSet::new();
+        used_ports.insert(self.control_port);
+
+        {
+            let workers = self.workers.lock().unwrap();
+            for (&port, w) in workers.iter() {
+                if w.has_active_session() {
+                    used_ports.insert(port);
+                }
+            }
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&self.config_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                    if let Ok(up) = UserProfile::load_from_path(&path) {
+                        for (sid, s_cfg) in &up.servers {
+                            if up.user.api_key == api_key && sid == server_id {
+                                continue;
+                            }
+                            used_ports.insert(s_cfg.port);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Try recommended_port if available
+        let assigned_port = if let Some(rec) = recommended_port {
+            if rec >= min_port && rec <= max_port && !used_ports.contains(&rec) {
+                Some(rec)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 5. Otherwise allocate first free port in range
+        let port = match assigned_port {
+            Some(p) => p,
+            None => {
+                let mut found = None;
+                for p in min_port..=max_port {
+                    if !used_ports.contains(&p) {
+                        found = Some(p);
+                        break;
+                    }
+                }
+                found.ok_or_else(|| {
+                    anyhow!(
+                        "ERR_NO_PORTS_AVAILABLE: all ports in range {}-{} are assigned or in use",
+                        min_port,
+                        max_port
+                    )
+                })?
+            }
+        };
+
+        // 6. Persist into user profile
+        let existing = profile.servers.get(server_id).cloned();
+        profile.servers.insert(
+            server_id.to_string(),
+            UserServerConfig {
+                port,
+                reserved: existing.as_ref().map(|s| s.reserved).unwrap_or(false),
+                passkey_user: passkey_user.to_string(),
+                allowed_user_cidrs: existing
+                    .as_ref()
+                    .map(|s| s.allowed_user_cidrs.clone())
+                    .unwrap_or_else(|| self.config.security.allowed_user_cidrs.clone()),
+                allowed_server_cidrs: existing
+                    .as_ref()
+                    .map(|s| s.allowed_server_cidrs.clone())
+                    .unwrap_or_else(|| self.config.security.allowed_server_cidrs.clone()),
+                created_at: existing
+                    .and_then(|s| s.created_at)
+                    .or_else(|| Some(format_apache_timestamp(std::time::SystemTime::now()))),
+            },
+        );
+
+        self.save_user_profile(&profile)?;
+        Ok(port)
+    }
 }
 
 pub fn verify_http_headers_auth(
@@ -448,12 +617,10 @@ pub async fn start_proxy_server(
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let allowed_port_range = config.parse_allowed_port_range()?;
     let public_tls_acceptor = build_public_tls_acceptor(&config)?;
-    let user_verifier = PasskeyVerifier::from_passkey(&config.auth.passkey_user);
+    let config_dir = olp_config_dir()?;
 
     let server_ip_filter =
         Arc::new(IpFilter::new(&config.security.allowed_server_cidrs).context("Invalid allowed_server_cidrs")?);
-    let user_ip_filter =
-        Arc::new(IpFilter::new(&config.security.allowed_user_cidrs).context("Invalid allowed_user_cidrs")?);
 
     let listen_sock_addr: SocketAddr = config
         .proxy
@@ -513,12 +680,12 @@ pub async fn start_proxy_server(
             config.security.max_auth_failures_per_min,
         )),
         config,
-        user_verifier,
+        config_dir,
         allowed_port_range,
         control_port: local_addr.port(),
         server_ip_filter,
-        user_ip_filter,
         workers: Mutex::new(HashMap::new()),
+        allocation_lock: tokio::sync::Mutex::new(()),
         public_tls_acceptor,
         access_logger,
     });
@@ -595,64 +762,127 @@ async fn handle_incoming_tunnel(
     .await
     .context("Timed out waiting for ServerAuthRegister")??;
 
-    // Step 3: Verify passkey_proxy in constant time
-    let is_valid = verify_proxy_auth_token(
-        &register.auth_token,
-        &state.config.auth.passkey_proxy,
-        &challenge.proxy_nonce,
-    );
-
-    if !is_valid {
-        let msg = "ERR_INVALID_PASSKEY_PROXY: The proxy rejected your passkey_proxy. Ensure [server].passkey_proxy in server.toml matches [auth].passkey_proxy in proxy.toml.".to_string();
+    // Step 3: Validate safe alphanumeric identifiers
+    if !is_safe_identifier(&register.olp_api_key) || !is_safe_identifier(&register.olp_server_id) {
+        let msg = "ERR_INVALID_IDENTIFIER: olp_api_key and olp_server_id must be alphanumeric, dash, or underscore (1-64 chars)".to_string();
         let _ = write_frame(
             &mut tls_stream,
             &TunnelEstablished {
                 accepted: false,
+                assigned_port: 0,
+                message: msg.clone(),
+            },
+        )
+        .await;
+        warn!("[SECURITY] Rejected tunnel with invalid identifier chars from {}", peer_addr);
+        return Err(anyhow!(msg));
+    }
+
+    // Step 4: Verify that olp_api_key is recognized
+    if !state.is_authorized_api_key(&register.olp_api_key) {
+        let msg = "ERR_UNAUTHORIZED_KEY: olp_api_key is not recognized by this proxy".to_string();
+        let _ = write_frame(
+            &mut tls_stream,
+            &TunnelEstablished {
+                accepted: false,
+                assigned_port: 0,
+                message: msg.clone(),
+            },
+        )
+        .await;
+        error!("[AUTH ERROR] Tunnel connection from {} rejected: unknown olp_api_key", peer_addr);
+        return Err(anyhow!(msg));
+    }
+
+    // Step 5: Verify cryptographic token binding nonce + olp_server_id to olp_api_key in constant time
+    let is_valid = verify_server_auth_token(
+        &register.auth_token,
+        &challenge.proxy_nonce,
+        &register.olp_server_id,
+        &register.olp_api_key,
+    );
+
+    if !is_valid {
+        let msg = "ERR_INVALID_AUTH_TOKEN: server authentication failed".to_string();
+        let _ = write_frame(
+            &mut tls_stream,
+            &TunnelEstablished {
+                accepted: false,
+                assigned_port: 0,
                 message: msg.clone(),
             },
         )
         .await;
 
         error!(
-            "\n================================================================================\n\
-             [AUTH ERROR] Tunnel connection from {} rejected: invalid passkey_proxy!\n\
-             Please verify that [server].passkey_proxy in server.toml on the client matches\n\
-             [auth].passkey_proxy in proxy.toml on this proxy.\n\
-             ================================================================================",
-            peer_addr
+            "[AUTH ERROR] Tunnel connection from {} rejected: authentication token mismatch for server {}",
+            peer_addr, register.olp_server_id
         );
-
         return Err(anyhow!(msg));
     }
 
-    let req_port = register.remote_port;
+    // Step 6: Allocate or assign public port for this server
+    let assigned_port = match state
+        .allocate_server_port(
+            &register.olp_api_key,
+            &register.olp_server_id,
+            register.recommended_port,
+            &register.passkey_user,
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("ERR_PORT_ALLOCATION_FAILED: {}", e);
+            let _ = write_frame(
+                &mut tls_stream,
+                &TunnelEstablished {
+                    accepted: false,
+                    assigned_port: 0,
+                    message: msg.clone(),
+                },
+            )
+            .await;
+            return Err(e);
+        }
+    };
 
-    // Check port range guardrails
-    let (min_port, max_port) = state.allowed_port_range;
-    if req_port < min_port || req_port > max_port || req_port == state.control_port {
-        let msg = format!(
-            "ERR_PORT_FORBIDDEN: requested port {} is outside allowed range {}-{} (or conflicts with control port)",
-            req_port, min_port, max_port
-        );
+    // Step 7: Enforce per-server CIDR ACL
+    let profile = state.load_user_profile(&register.olp_api_key)?;
+    let server_cfg = profile
+        .servers
+        .get(&register.olp_server_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Server configuration missing after allocation"))?;
+
+    let srv_filter = IpFilter::new(&server_cfg.allowed_server_cidrs)?;
+    if !srv_filter.is_allowed(&peer_addr.ip()) {
+        let msg = "ERR_SERVER_IP_FORBIDDEN: your IP is not in allowed_server_cidrs for this server".to_string();
         let _ = write_frame(
             &mut tls_stream,
             &TunnelEstablished {
                 accepted: false,
+                assigned_port: 0,
                 message: msg.clone(),
             },
         )
         .await;
+        warn!(
+            "[IP FILTER] Dropped tunnel connection for server {} from {} (not in allowed_server_cidrs)",
+            register.olp_server_id, peer_addr
+        );
         return Err(anyhow!(msg));
     }
 
-    // Acquire or hot-swap PortWorker for `req_port`
-    let worker = match get_or_create_port_worker(&state, req_port) {
+    // Step 8: Acquire or initialize PortWorker for assigned_port
+    let worker = match get_or_create_port_worker(&state, assigned_port) {
         Ok(w) => w,
         Err(e) => {
             let _ = write_frame(
                 &mut tls_stream,
                 &TunnelEstablished {
                     accepted: false,
+                    assigned_port: 0,
                     message: format!("ERR_PORT_CONFLICT: {}", e),
                 },
             )
@@ -661,12 +891,20 @@ async fn handle_incoming_tunnel(
         }
     };
 
-    // Acknowledge tunnel registration before upgrading stream to Yamux
+    // Configure worker credentials & ACL specifically for this server
+    {
+        *worker.user_verifier.write().unwrap() = PasskeyVerifier::from_passkey(&server_cfg.passkey_user);
+        *worker.user_ip_filter.write().unwrap() = Arc::new(IpFilter::new(&server_cfg.allowed_user_cidrs)?);
+        *worker.assigned_server_id.write().unwrap() = Some(register.olp_server_id.clone());
+    }
+
+    // Step 9: Acknowledge tunnel registration before upgrading stream to Yamux
     write_frame(
         &mut tls_stream,
         &TunnelEstablished {
             accepted: true,
-            message: format!("Port {} bound successfully", req_port),
+            assigned_port,
+            message: format!("Port {} bound successfully", assigned_port),
         },
     )
     .await?;
@@ -683,8 +921,8 @@ async fn handle_incoming_tunnel(
     }
 
     info!(
-        "Tunnel established from {} -> public port :{} (session #{})",
-        peer_addr, req_port, my_gen
+        "Tunnel established from {} [user: {}, srv: {}] -> public port :{} (session #{})",
+        peer_addr, register.olp_api_key, register.olp_server_id, assigned_port, my_gen
     );
 
     // Process control/heartbeat streams opened by `olp-server`
@@ -704,7 +942,7 @@ async fn handle_incoming_tunnel(
         *worker.active_mux.write().unwrap() = None;
         info!(
             "Tunnel on port :{} disconnected (holding port for {}s grace period)",
-            req_port, state.config.proxy.listener_grace_period_sec
+            assigned_port, state.config.proxy.listener_grace_period_sec
         );
     }
 
@@ -724,11 +962,15 @@ fn get_or_create_port_worker(
     let public_listener = bind_reusable_listener(bind_addr)
         .with_context(|| format!("Failed to bind public port {}", port))?;
 
+    let default_user_filter = Arc::new(IpFilter::new(&state.config.security.allowed_user_cidrs)?);
     let worker = Arc::new(PortWorker {
         port,
         active_mux: RwLock::new(None),
         session_gen: AtomicU64::new(0),
         shutdown_notify: Notify::new(),
+        user_verifier: RwLock::new(PasskeyVerifier::from_passkey("")),
+        user_ip_filter: RwLock::new(default_user_filter),
+        assigned_server_id: RwLock::new(None),
     });
 
     guard.insert(port, worker.clone());
@@ -911,10 +1153,11 @@ async fn handle_public_http_request(
     }
 
     // 2. Check CIDR IP filter for user HTTP connections
-    if !state.user_ip_filter.is_allowed(&client_ip) {
+    let ip_filter = worker.user_ip_filter.read().unwrap().clone();
+    if !ip_filter.is_allowed(&client_ip) {
         warn!(
-            "[IP FILTER] Rejected user HTTP connection from {} (not in allowed_user_cidrs)",
-            client_ip
+            "[IP FILTER] Rejected user HTTP connection from {} on port {} (not in allowed_user_cidrs)",
+            client_ip, worker.port
         );
         let err_json = r#"{"error":"forbidden: IP address not allowed by proxy filter"}"#;
         log_event(StatusCode::FORBIDDEN, err_json.len(), sanitize_for_log(err_json, 100));
@@ -943,7 +1186,12 @@ async fn handle_public_http_request(
     }
 
     // 4. Verify passkey_user using Basic Auth or Bearer Token in constant time
-    if !verify_http_headers_auth(&parts.headers, &state.user_verifier) {
+    let is_auth_valid = {
+        let verifier = worker.user_verifier.read().unwrap();
+        verify_http_headers_auth(&parts.headers, &verifier)
+    };
+
+    if !is_auth_valid {
         state.rate_limiter.record_failure(client_ip);
         let err_json = r#"{"error":"unauthorized: valid Basic Auth (username:passkey_user) or Bearer passkey_user required"}"#;
         log_event(StatusCode::UNAUTHORIZED, err_json.len(), sanitize_for_log(err_json, 100));

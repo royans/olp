@@ -12,7 +12,7 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
  |  PRIVATE NETWORK (Behind NAT)    |                   |  PUBLIC CLOUD SERVER / VPS       |
  |  [ollama-gpu-host]               |                   |  [olp-proxy]                     |
  |  [olp-server] -------------------+------------------>|    Control Port: :4443           |
- |    (Reverse TLS 1.3 Tunnel)      | (passkey_proxy)   |    Public Port:  :11434          |
+ |    (Reverse TLS 1.3 Tunnel)      | (olp_api_key)     |    Public Port:  :11434          |
  +----------------------------------+                   +------------------+---------------+
                                                                            |
                                                       (passkey_user)       | Basic / Bearer / API Key
@@ -25,22 +25,26 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
 
 ---
 
-## Simple Passkey & Security Model
+## Multi-User & Multi-Server Architecture
 
-`olp` uses a streamlined, two-passkey architecture with granular CIDR IP filtering:
+`olp` is designed for multi-tenancy where a single `olp-proxy` serves multiple users, and each user can host multiple `olp-server` instances:
 
-1. **`passkey_proxy`**:
-   - Shared between `olp-proxy` and `olp-server`.
-   - Authorizes `olp-server` to connect to `olp-proxy:4443` and register a reverse tunnel.
-   - Configured in `proxy.toml` and specified in `server.toml`.
-2. **`passkey_user`**:
-   - Shared between `olp-proxy` and end users / coding agents querying Ollama.
+1. **`olp_api_key`**:
+   - Alphanumeric user API key authorizing `olp-server` instances to register reverse tunnels.
+   - Listed in `proxy.toml` (`olp_api_keys = ["ABcd123"]`) or discovered via `~/.olp/config/<olp_api_key>.toml`.
+   - Server authenticates using a cryptographically bound BLAKE3 token over TLS 1.3 with session nonces.
+2. **`olp_server_id` & Dynamic Port Allocation**:
+   - Each `olp-server` generates or defines an alphanumeric server ID (e.g. `srv_8aBcD123`).
+   - The server may optionally recommend a public port; the proxy safely checks availability and assigns an unused port from `allowed_ports`.
+   - The proxy atomically saves the allocated port into `~/.olp/config/<olp_api_key>.toml` and returns the assigned port in the handshake.
+3. **`passkey_user` (Per-Server)**:
+   - Defined individually per server.
    - Accepted via **Bearer Token** (`Authorization: Bearer <passkey_user>`), **HTTP Basic Auth** (`username:passkey_user`), or **API Key headers** (`x-api-key`, `api-key`, `ollama-api-key`).
-   - Verified directly by `olp-proxy`.
-3. **CIDR IP Filtering**:
-   - **`allowed_server_cidrs`**: Restricts which IP addresses / subnets can connect to the tunnel control port (`:4443`).
-   - **`allowed_user_cidrs`**: Restricts which IP addresses / subnets can query the public Ollama HTTP port (`:11434`).
-   - Defaults to `["0.0.0.0/0", "::/0"]` (allow all), or configure specific subnets (e.g. `["67.180.155.0/24"]`).
+   - Verified directly by `olp-proxy` on that server's assigned public port in constant time.
+4. **CIDR IP Filtering**:
+   - **`allowed_server_cidrs`**: Restricts which IP addresses / subnets can connect to the tunnel control port (`:4443`) or specific server tunnels.
+   - **`allowed_user_cidrs`**: Restricts which IP addresses / subnets can query the public Ollama HTTP ports.
+   - Defaults to `["0.0.0.0/0", "::/0"]` (allow all), or configure specific subnets.
 
 ---
 
@@ -79,16 +83,16 @@ cd olp
 ./start-proxy.sh
 ```
 
-On first run, `olp-proxy` auto-generates two strong passkeys and displays:
+On first run, `olp-proxy` auto-generates your initial user API key and profile:
 ```text
 ================================================================================
   [olp-proxy] Configuration saved to ~/.olp/proxy.toml
   ----------------------------------------------------------------------------
-  passkey_proxy : <random-passkey-proxy>
-  passkey_user  : <random-passkey-user>
+  olp_api_key  : <random-user-api-key>
+  user profile : ~/.olp/config/<random-user-api-key>.toml
   ----------------------------------------------------------------------------
-  * passkey_proxy: Put this in your olp-server's server.toml
-  * passkey_user : Use this as the password for HTTP Basic Auth / Bearer token
+  * olp_api_key : Put this in your olp-server's server.toml
+  * You can create additional user keys at ~/.olp/config/<new_key>.toml
 ================================================================================
 ```
 
@@ -112,11 +116,12 @@ cd olp
 
 When prompted:
 1. Enter your proxy host (e.g. `proxy.example.com:4443`).
-2. Paste `passkey_proxy` from Step 1.
+2. Enter your `olp_api_key` from Step 1.
+3. Keep or customize your server's `passkey_user` for client HTTP queries.
 
-The tunnel connects immediately:
+The tunnel connects immediately and receives an assigned port:
 ```text
-Tunnel established! Exposing local Ollama (127.0.0.1:11434) on remote port :11434
+TLS 1.3 tunnel established! Exposing local Ollama (127.0.0.1:11434) on remote port :11434 (server_id: srv_aBcd1234)
 ```
 
 > **Lifecycle & Cron Commands**:
@@ -139,19 +144,13 @@ listener_grace_period_sec = 60
 access_log = "~/.olp/access.log" # Apache-style access log (set to "off" to disable)
 
 [auth]
-# Passkey required by olp-server to register a reverse tunnel
-passkey_proxy = "your-secret-proxy-passkey"
-
-# Passkey required by end users for HTTP Basic Auth / Bearer token
-passkey_user = "your-secret-user-passkey"
+# User API keys: accepts an array of strings or a comma-delimited string
+# Each key has its individual config at ~/.olp/config/<olp_api_key>.toml
+olp_api_keys = ["admin_key_abc123"]
 
 [security]
-# Allowed CIDR blocks for olp-server tunnel connections
 allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
-
-# Allowed CIDR blocks for user HTTP connections to Ollama
 allowed_user_cidrs = ["0.0.0.0/0", "::/0"]
-
 max_auth_failures_per_min = 60
 max_concurrent_streams = 128
 
@@ -161,49 +160,15 @@ mode = "off" # Set to "manual" when using Let's Encrypt / custom certs
 # key_path = "~/.olp/tls/privkey.pem"
 ```
 
----
-
-## Enabling Valid TLS / HTTPS with Let's Encrypt (`olp-proxy`)
-
-To enable native `https://` (e.g. `https://proxy.example.com:11434`) without certificate warnings, use the automated provisioning script **`renew-tls.sh`** on the proxy host:
-
-### 1. Provision Certificate (One-Time Setup)
-
-```bash
-# On your public proxy host:
-sudo ./renew-tls.sh proxy.example.com
-```
-
-The script:
-1. Verifies/installs `certbot`.
-2. Validates domain ownership via ACME HTTP-01 challenge (standalone or webroot).
-3. Safely exports the dereferenced certificate chain and private key to `~/.olp/tls/`.
-4. Enforces strict `0700`/`0600` permissions owned by your unprivileged proxy user (`$USER`).
-5. Updates `~/.olp/proxy.toml` to `mode = "manual"`.
-6. Gracefully restarts `olp-proxy` with active HTTPS.
-
-### 2. Automated Certificate Renewal via Root Cronjob
-
-Let's Encrypt certificates expire every 90 days. To automate renewal without interrupting the non-root proxy daemon, add this to root's crontab:
-
-```bash
-sudo crontab -e
-```
-
-Add the following entry (runs weekly on Monday at 3:00 AM):
-```cron
-0 3 * * 1 /path/to/olp/renew-tls.sh --cron >> /var/log/olp-tls.log 2>&1
-```
-
-When renewal occurs, the script automatically exports the refreshed certs to `~/.olp/tls/` and reloads `olp-proxy` cleanly.
-
 ### `~/.olp/server.toml`
 ```toml
 [server]
 proxy_addr = "proxy.example.com:4443"
 ollama_addr = "127.0.0.1:11434"
-remote_port = 11434
-passkey_proxy = "your-secret-proxy-passkey"
+olp_api_key = "your-user-api-key"
+olp_server_id = "srv_my_ollama_box"
+passkey_user = "your-client-passkey-for-this-server"
+# remote_port = 11434 # optional recommended port; proxy allocates dynamically if omitted
 
 # TLS CA Certificate Verification (optional, auto-detected)
 # Defaults to true for public domain names, false for localhost / 127.0.0.1.

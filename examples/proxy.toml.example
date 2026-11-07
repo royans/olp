@@ -19,23 +19,16 @@ listener_grace_period_sec = 60
 access_log = "~/.olp/access.log"
 
 [auth]
-# 1. passkey_proxy: Shared between olp-proxy and olp-server for tunnel registration.
-# The connecting olp-server must provide this exact passkey.
-passkey_proxy = "change-me-to-a-secure-proxy-passkey"
-
-# 2. passkey_user: Required by end users to query Ollama through olp-proxy.
-# Supports HTTP Basic Auth (any-username:passkey_user) or Bearer Token (Authorization: Bearer <passkey_user>).
-passkey_user = "change-me-to-a-secure-user-passkey"
+# Multi-tenant API keys: accepts an array of strings or a comma-delimited string.
+# Each user key automatically maps to its profile at ~/.olp/config/<olp_api_key>.toml
+olp_api_keys = ["admin_key_abc123"]
 
 [security]
-# Allowed CIDR blocks for tunnel connections from olp-server (defaults to all: ["0.0.0.0/0", "::/0"])
-# Example to restrict to a specific IP or subnet:
-# allowed_server_cidrs = ["67.180.155.189/32", "192.168.1.0/24"]
+# Default CIDR blocks for tunnel connections from olp-server (defaults to all: ["0.0.0.0/0", "::/0"])
+# Individual servers can also specify their own allowed_server_cidrs in ~/.olp/config/<olp_api_key>.toml
 allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
 
-# Allowed CIDR blocks for user HTTP connections to exposed Ollama endpoints
-# Example to restrict users to your office or VPN:
-# allowed_user_cidrs = ["203.0.113.0/24", "198.51.100.5/32"]
+# Default CIDR blocks for user HTTP connections to exposed Ollama endpoints
 allowed_user_cidrs = ["0.0.0.0/0", "::/0"]
 
 # Maximum failed HTTP authentication attempts per IP per minute before temporary lockout

@@ -3,6 +3,7 @@ use anyhow::{anyhow, Context, Result};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -38,10 +39,108 @@ fn default_access_log() -> Option<String> {
     Some("~/.olp/access.log".to_string())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxyAuthSection {
-    pub passkey_proxy: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_seq")]
+    pub olp_api_keys: Vec<String>,
+}
+
+/// Accepts either an array of strings `["key1", "key2"]` or a comma-delimited string `"key1, key2"`.
+fn deserialize_string_or_seq<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        Seq(Vec<String>),
+        Str(String),
+    }
+    match StringOrSeq::deserialize(deserializer)? {
+        StringOrSeq::Seq(list) => Ok(list),
+        StringOrSeq::Str(s) => Ok(s
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect()),
+    }
+}
+
+// ============================================================================
+// USER PROFILES & MULTI-SERVER MANAGEMENT (~/.olp/config/<olp_api_key>.toml)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserProfile {
+    pub user: UserSection,
+    #[serde(default)]
+    pub servers: HashMap<String, UserServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSection {
+    pub api_key: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_max_servers")]
+    pub max_servers: usize,
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+fn default_max_servers() -> usize {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserServerConfig {
+    pub port: u16,
+    #[serde(default)]
+    pub reserved: bool,
     pub passkey_user: String,
+    #[serde(default = "default_allowed_cidrs")]
+    pub allowed_user_cidrs: Vec<String>,
+    #[serde(default = "default_allowed_cidrs")]
+    pub allowed_server_cidrs: Vec<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+impl UserProfile {
+    pub fn new(api_key: &str) -> Self {
+        Self {
+            user: UserSection {
+                api_key: api_key.to_string(),
+                name: None,
+                max_servers: default_max_servers(),
+                disabled: false,
+            },
+            servers: HashMap::new(),
+        }
+    }
+
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read user profile at {}", path.display()))?;
+        let profile: UserProfile = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse user TOML at {}", path.display()))?;
+        enforce_private_file_permissions(path)?;
+        Ok(profile)
+    }
+
+    pub fn save_atomic(&self, path: &Path) -> Result<()> {
+        let content = toml::to_string_pretty(self)?;
+        if let Some(parent) = path.parent() {
+            ensure_secure_dir(parent)?;
+        }
+        let rand_suffix: u32 = rand::thread_rng().gen();
+        let tmp_path = path.with_extension(format!("tmp.{}", rand_suffix));
+        fs::write(&tmp_path, content.as_bytes())?;
+        enforce_private_file_permissions(&tmp_path)?;
+        fs::rename(&tmp_path, path)?;
+        enforce_private_file_permissions(path)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,8 +213,7 @@ impl ProxyConfig {
                 access_log: default_access_log(),
             },
             auth: ProxyAuthSection {
-                passkey_proxy: generate_random_passkey(),
-                passkey_user: generate_random_passkey(),
+                olp_api_keys: Vec::new(),
             },
             security: ProxySecuritySection::default(),
             tls: ProxyTlsSection::default(),
@@ -183,8 +281,12 @@ pub struct ServerConfig {
 pub struct ServerSection {
     pub proxy_addr: String,
     pub ollama_addr: String,
-    pub remote_port: u16,
-    pub passkey_proxy: String,
+    pub olp_api_key: String,
+    #[serde(default)]
+    pub olp_server_id: String,
+    pub passkey_user: String,
+    #[serde(default)]
+    pub remote_port: Option<u16>,
     #[serde(default)]
     pub tls_verify: Option<bool>,
 }
@@ -259,8 +361,10 @@ impl ServerConfig {
             server: ServerSection {
                 proxy_addr: "127.0.0.1:4443".to_string(),
                 ollama_addr: "127.0.0.1:11434".to_string(),
-                remote_port: 11434,
-                passkey_proxy: String::new(),
+                olp_api_key: String::new(),
+                olp_server_id: String::new(),
+                passkey_user: generate_random_passkey(),
+                remote_port: None,
                 tls_verify: None,
             },
             reconnect: ReconnectSection::default(),
@@ -375,6 +479,22 @@ pub fn expand_path(input: &str) -> Result<PathBuf> {
     }
 }
 
+pub fn olp_config_dir() -> Result<PathBuf> {
+    let base = olp_home_dir()?;
+    let config_dir = base.join("config");
+    ensure_secure_dir(&config_dir)?;
+    Ok(config_dir)
+}
+
+pub fn generate_random_server_id() -> String {
+    let rand_str: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(8)
+        .map(char::from)
+        .collect();
+    format!("srv_{}", rand_str)
+}
+
 pub fn generate_random_passkey() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -404,19 +524,22 @@ fn prompt_line(question: &str, default: &str) -> Result<String> {
     }
 }
 
-/// Ensures `~/.olp/proxy.toml` exists. If missing, initializes default settings with random passkeys.
+/// Ensures `~/.olp/proxy.toml` and `~/.olp/config/` exist.
+/// If missing, initializes default settings with a random admin API key and profile.
 pub fn ensure_proxy_initialized(
     config_path: &Path,
     non_interactive: bool,
 ) -> Result<ProxyConfig> {
     let base_dir = olp_home_dir()?;
     ensure_secure_dir(&base_dir)?;
+    let config_dir = olp_config_dir()?;
 
     if config_path.exists() {
         return ProxyConfig::load_from_path(config_path);
     }
 
     let mut cfg = ProxyConfig::default_config();
+    let mut initial_api_key = generate_random_passkey();
 
     if !non_interactive && io::stdin().is_terminal() {
         println!("\n================================================================================");
@@ -429,20 +552,16 @@ pub fn ensure_proxy_initialized(
             &cfg.proxy.allowed_ports,
         )?;
 
-        let custom_proxy_key = prompt_line(
-            "Passkey for server tunnel registration (press Enter to auto-generate)",
+        let custom_api_key = prompt_line(
+            &format!("Initial olp_api_key for first user (press Enter to auto-generate: {})", initial_api_key),
             "",
         )?;
-        if !custom_proxy_key.is_empty() {
-            cfg.auth.passkey_proxy = custom_proxy_key;
-        }
-
-        let custom_user_key = prompt_line(
-            "Passkey for user HTTP authentication (press Enter to auto-generate)",
-            "",
-        )?;
-        if !custom_user_key.is_empty() {
-            cfg.auth.passkey_user = custom_user_key;
+        if !custom_api_key.is_empty() {
+            if crate::protocol::is_safe_identifier(&custom_api_key) {
+                initial_api_key = custom_api_key;
+            } else {
+                println!("  [!] Invalid API key format; using generated key instead.");
+            }
         }
 
         let server_cidr_str = prompt_line(
@@ -466,16 +585,25 @@ pub fn ensure_proxy_initialized(
             .collect();
     }
 
+    cfg.auth.olp_api_keys = vec![initial_api_key.clone()];
     cfg.save_to_path(config_path)?;
+
+    // Create default user profile in ~/.olp/config/<initial_api_key>.toml
+    let mut initial_profile = UserProfile::new(&initial_api_key);
+    initial_profile.user.name = Some("admin".to_string());
+    let profile_path = config_dir.join(format!("{}.toml", initial_api_key));
+    if !profile_path.exists() {
+        initial_profile.save_atomic(&profile_path)?;
+    }
 
     println!("\n================================================================================");
     println!("  [olp-proxy] Configuration saved to {}", config_path.display());
     println!("  ----------------------------------------------------------------------------");
-    println!("  passkey_proxy : {}", cfg.auth.passkey_proxy);
-    println!("  passkey_user  : {}", cfg.auth.passkey_user);
+    println!("  olp_api_key  : {}", initial_api_key);
+    println!("  user profile : {}", profile_path.display());
     println!("  ----------------------------------------------------------------------------");
-    println!("  * passkey_proxy: Put this in your olp-server's server.toml");
-    println!("  * passkey_user : Use this as the password for HTTP Basic Auth / Bearer token");
+    println!("  * olp_api_key : Put this in your olp-server's server.toml");
+    println!("  * You can create additional user keys at ~/.olp/config/<new_key>.toml");
     println!("================================================================================\n");
 
     Ok(cfg)
@@ -490,10 +618,17 @@ pub fn ensure_server_initialized(
     ensure_secure_dir(&base_dir)?;
 
     if config_path.exists() {
-        return ServerConfig::load_from_path(config_path);
+        let mut cfg = ServerConfig::load_from_path(config_path)?;
+        if cfg.server.olp_server_id.is_empty() {
+            cfg.server.olp_server_id = generate_random_server_id();
+            cfg.save_to_path(config_path)?;
+        }
+        return Ok(cfg);
     }
 
     let mut cfg = ServerConfig::default_config();
+    cfg.server.olp_server_id = generate_random_server_id();
+    cfg.server.passkey_user = generate_random_passkey();
 
     if !non_interactive && io::stdin().is_terminal() {
         println!("\n================================================================================");
@@ -516,40 +651,55 @@ pub fn ensure_server_initialized(
         cfg.server.ollama_addr =
             prompt_line("Local Ollama address", &cfg.server.ollama_addr)?;
 
-        // 3. Port to serve the service on via the proxy
-        let port_str = prompt_line(
-            "Port on the proxy to serve Ollama on (public port)",
-            &cfg.server.remote_port.to_string(),
+        // 3. Recommended port on proxy (optional)
+        let rec_port_str = prompt_line(
+            "Recommended port on proxy (optional, press Enter for dynamic assignment)",
+            "",
         )?;
-        cfg.server.remote_port = port_str
-            .trim()
-            .parse::<u16>()
-            .context("Public port must be a valid port number (1024-65535)")?;
+        if !rec_port_str.is_empty() {
+            if let Ok(p) = rec_port_str.parse::<u16>() {
+                cfg.server.remote_port = Some(p);
+            }
+        }
 
-        // 4. Passkey for proxy
+        // 4. olp_api_key for proxy
         loop {
-            let key = prompt_line(
-                "Passkey for proxy (passkey_proxy from proxy.toml)",
-                "",
-            )?;
+            let key = prompt_line("User API key (olp_api_key from proxy)", "")?;
             let trimmed = key.trim();
             if !trimmed.is_empty() {
-                cfg.server.passkey_proxy = trimmed.to_string();
+                cfg.server.olp_api_key = trimmed.to_string();
                 break;
             } else {
-                println!("  [!] passkey_proxy is required to connect to the proxy. Please enter it:");
+                println!("  [!] olp_api_key is required to connect to the proxy. Please enter it:");
             }
+        }
+
+        // 5. passkey_user
+        let custom_passkey_user = prompt_line(
+            &format!(
+                "Passkey for client access to this server (press Enter to use generated: {})",
+                cfg.server.passkey_user
+            ),
+            "",
+        )?;
+        if !custom_passkey_user.is_empty() {
+            cfg.server.passkey_user = custom_passkey_user;
         }
     }
 
-    if cfg.server.passkey_proxy.is_empty() {
-        cfg.server.passkey_proxy = "change-me-to-match-proxy-toml".to_string();
+    if cfg.server.olp_api_key.is_empty() {
+        cfg.server.olp_api_key = "change-me-to-your-olp-api-key".to_string();
     }
 
     cfg.save_to_path(config_path)?;
 
     println!("\n================================================================================");
     println!("  [olp-server] Configuration saved to {}", config_path.display());
+    println!("  ----------------------------------------------------------------------------");
+    println!("  olp_server_id : {}", cfg.server.olp_server_id);
+    println!("  passkey_user  : {}", cfg.server.passkey_user);
+    println!("  ----------------------------------------------------------------------------");
+    println!("  * passkey_user : Use this as your Bearer token / password when querying Ollama");
     println!("================================================================================\n");
 
     Ok(cfg)
@@ -562,10 +712,59 @@ mod tests {
     #[test]
     fn maintenance_defaults_to_git_pull_when_missing() {
         let cfg: ServerConfig = toml::from_str(
-            "[server]\nproxy_addr = \"a:1\"\nollama_addr = \"b:2\"\nremote_port = 1\npasskey_proxy = \"x\"\n",
+            "[server]\nproxy_addr = \"a:1\"\nollama_addr = \"b:2\"\nolp_api_key = \"x\"\npasskey_user = \"y\"\n",
         )
         .unwrap();
         assert!(cfg.maintenance.auto_git_pull);
+    }
+
+    #[test]
+    fn test_olp_api_keys_deserialization() {
+        // String format
+        let toml_str = r#"
+            olp_api_keys = "key1, key2, key3"
+        "#;
+        let auth: ProxyAuthSection = toml::from_str(toml_str).unwrap();
+        assert_eq!(auth.olp_api_keys, vec!["key1", "key2", "key3"]);
+
+        // Array format
+        let toml_seq = r#"
+            olp_api_keys = ["alpha", "beta"]
+        "#;
+        let auth2: ProxyAuthSection = toml::from_str(toml_seq).unwrap();
+        assert_eq!(auth2.olp_api_keys, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn test_user_profile_atomic_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("olp_test_{}", rand::thread_rng().gen::<u64>()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test_user.toml");
+
+        let mut profile = UserProfile::new("test_user_key");
+        profile.user.name = Some("Alice".to_string());
+        profile.servers.insert(
+            "srv_abc".to_string(),
+            UserServerConfig {
+                port: 12345,
+                reserved: true,
+                passkey_user: "user-pass-123".to_string(),
+                allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
+                allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
+                created_at: Some("2026-11-06T12:00:00Z".to_string()),
+            },
+        );
+
+        profile.save_atomic(&path).unwrap();
+        let loaded = UserProfile::load_from_path(&path).unwrap();
+        assert_eq!(loaded.user.api_key, "test_user_key");
+        assert_eq!(loaded.user.name, Some("Alice".to_string()));
+        let srv = loaded.servers.get("srv_abc").unwrap();
+        assert_eq!(srv.port, 12345);
+        assert!(srv.reserved);
+        assert_eq!(srv.passkey_user, "user-pass-123");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

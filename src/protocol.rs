@@ -14,6 +14,14 @@ use tokio::net::TcpStream;
 
 pub const MAX_HANDSHAKE_FRAME_LEN: usize = 16 * 1024;
 
+/// Strict alphanumeric and safe symbol validation for identifiers (olp_api_key, olp_server_id).
+/// Prevents directory traversal attacks, illegal filenames, and control-character injections.
+pub fn is_safe_identifier(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Step 1 of Handshake: Sent from `olp-proxy` to `olp-server` immediately after TLS 1.3 handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyHelloChallenge {
@@ -34,18 +42,30 @@ impl Default for ProxyHelloChallenge {
     }
 }
 
-/// Step 2 of Handshake: Sent from `olp-server` to `olp-proxy` to register a tunnel with `passkey_proxy`.
+/// Step 2 of Handshake: Sent from `olp-server` to `olp-proxy` to register a tunnel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerAuthRegister {
-    pub remote_port: u16,
+    pub olp_api_key: String,
+    pub olp_server_id: String,
+    pub recommended_port: Option<u16>,
+    pub passkey_user: String,
     pub auth_token: [u8; 32],
 }
 
 impl ServerAuthRegister {
-    pub fn new(remote_port: u16, passkey_proxy: &str, proxy_nonce: &[u8; 32]) -> Self {
-        let auth_token = compute_proxy_auth_token(passkey_proxy, proxy_nonce);
+    pub fn new(
+        olp_api_key: &str,
+        olp_server_id: &str,
+        recommended_port: Option<u16>,
+        passkey_user: &str,
+        proxy_nonce: &[u8; 32],
+    ) -> Self {
+        let auth_token = compute_server_auth_token(proxy_nonce, olp_server_id, olp_api_key);
         Self {
-            remote_port,
+            olp_api_key: olp_api_key.to_string(),
+            olp_server_id: olp_server_id.to_string(),
+            recommended_port,
+            passkey_user: passkey_user.to_string(),
             auth_token,
         }
     }
@@ -55,25 +75,33 @@ impl ServerAuthRegister {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelEstablished {
     pub accepted: bool,
+    pub assigned_port: u16,
     pub message: String,
 }
 
-/// Computes a cryptographically secure token binding `passkey_proxy` to `proxy_nonce` using BLAKE3.
-pub fn compute_proxy_auth_token(passkey_proxy: &str, proxy_nonce: &[u8; 32]) -> [u8; 32] {
+/// Computes a cryptographically secure token binding `proxy_nonce` and `olp_server_id` to `olp_api_key` using BLAKE3.
+pub fn compute_server_auth_token(
+    proxy_nonce: &[u8; 32],
+    olp_server_id: &str,
+    olp_api_key: &str,
+) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"olp-tunnel-auth-v2:");
+    hasher.update(b"olp-tunnel-auth-v3:");
     hasher.update(proxy_nonce);
-    hasher.update(passkey_proxy.as_bytes());
+    hasher.update(olp_server_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(olp_api_key.as_bytes());
     *hasher.finalize().as_bytes()
 }
 
-/// Constant-time verification of `passkey_proxy` authentication token.
-pub fn verify_proxy_auth_token(
+/// Constant-time verification of `olp_api_key` authentication token.
+pub fn verify_server_auth_token(
     candidate_token: &[u8; 32],
-    passkey_proxy: &str,
     proxy_nonce: &[u8; 32],
+    olp_server_id: &str,
+    olp_api_key: &str,
 ) -> bool {
-    let expected = compute_proxy_auth_token(passkey_proxy, proxy_nonce);
+    let expected = compute_server_auth_token(proxy_nonce, olp_server_id, olp_api_key);
     candidate_token.ct_eq(&expected).into()
 }
 
@@ -161,7 +189,7 @@ pub fn extract_host(addr: &str) -> &str {
 /// When `verify_ca` is true (default when connecting to domain names), validates the proxy's TLS
 /// certificate using Mozilla's WebPKI root store (Let's Encrypt / CA roots), preventing MITM attacks.
 /// When `verify_ca` is false (e.g. 127.0.0.1 testing), establishes an encrypted TLS 1.3 channel
-/// authenticated via `passkey_proxy`.
+/// authenticated via `olp_api_key`.
 pub fn create_tunnel_tls_client_config(verify_ca: bool) -> Result<Arc<rustls::ClientConfig>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -241,13 +269,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_proxy_auth_token_constant_time() {
+    fn test_server_auth_token_constant_time() {
         let nonce = [42u8; 32];
-        let token = compute_proxy_auth_token("secret-passkey", &nonce);
-        assert!(verify_proxy_auth_token(&token, "secret-passkey", &nonce));
-        assert!(!verify_proxy_auth_token(&token, "wrong-passkey", &nonce));
+        let token = compute_server_auth_token(&nonce, "srv_123", "secret-key-1");
+        assert!(verify_server_auth_token(&token, &nonce, "srv_123", "secret-key-1"));
+        assert!(!verify_server_auth_token(&token, &nonce, "srv_123", "wrong-key"));
+        assert!(!verify_server_auth_token(&token, &nonce, "srv_456", "secret-key-1"));
 
         let diff_nonce = [43u8; 32];
-        assert!(!verify_proxy_auth_token(&token, "secret-passkey", &diff_nonce));
+        assert!(!verify_server_auth_token(&token, &diff_nonce, "srv_123", "secret-key-1"));
+    }
+
+    #[test]
+    fn test_is_safe_identifier() {
+        assert!(is_safe_identifier("srv_123"));
+        assert!(is_safe_identifier("ABcd123"));
+        assert!(is_safe_identifier("user-key_456"));
+        assert!(!is_safe_identifier(""));
+        assert!(!is_safe_identifier("../bad"));
+        assert!(!is_safe_identifier("bad/path"));
+        assert!(!is_safe_identifier("bad\\path"));
+        assert!(!is_safe_identifier("bad key with spaces"));
     }
 }
