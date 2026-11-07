@@ -62,7 +62,7 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
 - **CIDR Block IP Filtering**: IPv4 and IPv6 subnet filtering on both tunnel and user HTTP connections.
 - **Fibonacci Reconnect Backoff**: Smart reconnect sequence (`1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s...` capped at 300s) with $\pm 10\%$ jitter.
 - **Zero-Buffering Chunked Streaming**: Full support for real-time Server-Sent Events (SSE) and token streaming (`/api/generate`, `/api/chat`).
-- **Cron & Daemon Friendly**: Built-in PID tracking and auto-cleanup terminates previous instances cleanly upon re-execution; supports `--daemon` / `-d` for background crontab jobs.
+- **Cron & Daemon Friendly**: Built-in PID tracking and auto-cleanup terminates previous instances cleanly upon re-execution; supports `--daemon` / `-d` for background crontab jobs, plus a 15-minute watchdog and a randomized daily restart with optional `git pull`.
 - **Edge IP Brute-Force Rate Limiting**: Automatic sliding-window rate limiter returns `429 Too Many Requests` on repeated failed authentications.
 - **Single-Directory Isolation**: Configuration files live exclusively in `~/.olp/` with strict `0600`/`0700` permissions.
 
@@ -206,6 +206,11 @@ initial_delay_sec = 1
 max_delay_sec = 300
 heartbeat_interval_sec = 15
 heartbeat_timeout_sec = 5
+
+[maintenance]
+# Daily scheduled restart runs `git pull --ff-only` (+ rebuild) when installed from a git checkout.
+# Set to false (or "no") to pin the current version. Applies to proxy.toml as well.
+auto_git_pull = true
 ```
 
 ---
@@ -271,15 +276,22 @@ When multiple users query the same proxied Ollama instance:
 
 ### Running via Cron (`--daemon` mode)
 
-`start-proxy.sh` and `start-server.sh` include built-in PID tracking. If re-executed, they safely terminate the previous instance and start fresh. You can add them directly to `crontab -e`:
+`start-proxy.sh` and `start-server.sh` include built-in PID tracking. If re-executed, they safely terminate the previous instance and start fresh. On the first interactive run they offer to install three cronjobs (and they automatically upgrade a previously installed `@reboot`-only entry):
 
 ```cron
-# Automatically restart olp-proxy on system reboot
-@reboot cd /path/to/olp && ./start-proxy.sh --daemon
+# Start on boot
+@reboot cd "/path/to/olp" && ./start-proxy.sh --daemon >> "~/.olp/proxy.log" 2>&1 # olp-proxy-managed:/path/to/olp
 
-# Automatically restart olp-server on system reboot
-@reboot cd /path/to/olp && ./start-server.sh --daemon
+# Watchdog every 15 minutes: start it only if it is not running (no git pull)
+7,22,37,52 * * * * cd "/path/to/olp" && ./start-proxy.sh ensure >> "~/.olp/proxy.log" 2>&1 # olp-proxy-managed:/path/to/olp
+
+# Daily full restart (git pull + rebuild if auto_git_pull = true)
+41 3 * * * cd "/path/to/olp" && ./start-proxy.sh restart --daemon >> "~/.olp/proxy.log" 2>&1 # olp-proxy-managed:/path/to/olp
 ```
+
+The same set is installed for `start-server.sh`. The watchdog minute offset and the daily restart time (between 01:00 and 05:59 local time) are randomized per host at install time, so a fleet doesn't restart or pull all at once. The chosen times are kept on later runs. A lock file (`~/.olp/olp-<proxy|server>.lock`, requires `flock`) stops the watchdog from starting a second copy while a restart is pulling or compiling.
+
+To stop the daily restart from pulling new code, set `auto_git_pull = false` under `[maintenance]` in `~/.olp/proxy.toml` / `~/.olp/server.toml`. Running `./start-proxy.sh update` explicitly always pulls.
 
 Logs are written automatically to `~/.olp/proxy.log` and `~/.olp/server.log`.
 

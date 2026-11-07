@@ -12,15 +12,36 @@ cd "$SCRIPT_DIR"
 OLP_DATA_DIR="${OLP_HOME:-$HOME/.olp}"
 PID_FILE="$OLP_DATA_DIR/olp-proxy.pid"
 LOG_FILE="$OLP_DATA_DIR/proxy.log"
-NEED_RECOMPILE=0
+LOCK_FILE="$OLP_DATA_DIR/olp-proxy.lock"
+NEED_RECOMPILE="${OLP_FORCE_RECOMPILE:-0}"
 DAEMON_MODE=0
+ORIG_ARGS=("$@")
+CONFIG_FILE="${OLP_CONFIG:-$OLP_DATA_DIR/proxy.toml}"
 
-# Parse daemon flag from arguments
+# Parse daemon flag from arguments. Lifecycle verbs (restart/ensure) are consumed
+# by this script and never forwarded to the binary (its CLI rejects positionals).
 CLEAN_ARGS=()
+EXPECT_CONFIG_VALUE=0
 for arg in "$@"; do
+    if [ "$EXPECT_CONFIG_VALUE" -eq 1 ]; then
+        CONFIG_FILE="$arg"
+        EXPECT_CONFIG_VALUE=0
+        CLEAN_ARGS+=("$arg")
+        continue
+    fi
     case "$arg" in
         --daemon|-d)
             DAEMON_MODE=1
+            ;;
+        restart|ensure)
+            ;;
+        -c|--config)
+            EXPECT_CONFIG_VALUE=1
+            CLEAN_ARGS+=("$arg")
+            ;;
+        --config=*)
+            CONFIG_FILE="${arg#--config=}"
+            CLEAN_ARGS+=("$arg")
             ;;
         *)
             CLEAN_ARGS+=("$arg")
@@ -83,7 +104,32 @@ find_compiled_binary() {
 # ------------------------------------------------------------------------------
 # 2. Git Auto-Update Logic
 # ------------------------------------------------------------------------------
+# Reads `auto_git_pull` from the [maintenance] section of the config file.
+# Missing file/key => enabled (default). "false"/"no"/"off"/"0" => disabled.
+git_pull_enabled() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return 0
+    fi
+    local val
+    val=$(sed -n -E 's/^[[:space:]]*auto_git_pull[[:space:]]*=[[:space:]]*["'\'']?([A-Za-z0-9]+).*/\1/p' "$CONFIG_FILE" 2>/dev/null | tail -n 1 | tr '[:upper:]' '[:lower:]')
+    case "$val" in
+        false|no|n|off|0) return 1 ;;
+    esac
+    return 0
+}
+
+# Usage: auto_update_from_git [force]
+#   Without "force", honours OLP_SKIP_GIT_PULL=1 and auto_git_pull in the config.
 auto_update_from_git() {
+    if [ "${1:-}" != "force" ]; then
+        if [ "${OLP_SKIP_GIT_PULL:-0}" = "1" ]; then
+            return 0
+        fi
+        if [ -d ".git" ] && ! git_pull_enabled; then
+            echo "[olp-proxy] auto_git_pull is disabled in $CONFIG_FILE; skipping git pull."
+            return 0
+        fi
+    fi
     if [ -d ".git" ] && command -v git >/dev/null 2>&1; then
         if git remote get-url origin >/dev/null 2>&1; then
             echo "[olp-proxy] Checking for repository updates from git..."
@@ -149,7 +195,141 @@ stop_process() {
     fi
 }
 
+# ------------------------------------------------------------------------------
+# Serialise lifecycle operations (watchdog vs. daily restart vs. manual runs) so
+# the watchdog never launches a second copy while a restart is pulling/compiling.
+# The lock fd (9) is closed before the binary is launched, so it is held only
+# while this script is doing work.
+# ------------------------------------------------------------------------------
+acquire_lock() {
+    local mode="$1"   # "try" => give up immediately if busy, "wait" => wait up to 15 min
+    command -v flock >/dev/null 2>&1 || return 0
+    mkdir -p "$OLP_DATA_DIR"
+    exec 9>"$LOCK_FILE"
+    if [ "$mode" = "try" ]; then
+        flock -n 9
+    else
+        flock -w 900 9
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Cron management. Managed entries carry a marker comment so they can be found,
+# left alone (keeping their randomized times) or upgraded in place.
+#   @reboot              start on boot
+#   every 15 min         `ensure`: start only if not running (no git pull)
+#   once a day           `restart`: full restart, git pull if auto_git_pull=true
+# Minutes/hour are randomized per host at install time to spread load.
+# ------------------------------------------------------------------------------
+CRON_MARKER="# olp-proxy-managed:$SCRIPT_DIR"
+
+build_cron_entries() {
+    local base="cd \"$SCRIPT_DIR\" && ./start-proxy.sh"
+    local log=">> \"$LOG_FILE\" 2>&1"
+    local off=$((RANDOM % 15))
+    local daily_min=$((RANDOM % 60))
+    local daily_hour=$((1 + RANDOM % 5))   # 01:00-05:59 local time
+    printf '%s\n' \
+        "@reboot $base --daemon $log $CRON_MARKER" \
+        "$off,$((off + 15)),$((off + 30)),$((off + 45)) * * * * $base ensure $log $CRON_MARKER" \
+        "$daily_min $daily_hour * * * $base restart --daemon $log $CRON_MARKER"
+}
+
+write_crontab() {
+    # $1 = existing crontab with olp-proxy managed/legacy lines already removed
+    local kept="$1" entries
+    entries="$(build_cron_entries)"
+    if [ -n "$kept" ]; then
+        printf '%s\n%s\n' "$kept" "$entries" | crontab -
+    else
+        printf '%s\n' "$entries" | crontab -
+    fi
+    echo "$entries" | sed 's/^/    /'
+}
+
+manage_cronjob() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    local existing legacy managed kept
+    existing="$(crontab -l 2>/dev/null || true)"
+    legacy="@reboot cd $SCRIPT_DIR && ./start-proxy.sh --daemon"
+    managed="$(printf '%s\n' "$existing" | grep -F -- "$CRON_MARKER" || true)"
+
+    # Already fully installed: keep the existing randomized schedule.
+    if printf '%s\n' "$managed" | grep -q -- "start-proxy.sh ensure" &&
+       printf '%s\n' "$managed" | grep -q -- "start-proxy.sh restart" &&
+       printf '%s\n' "$managed" | grep -q -- "^@reboot"; then
+        return 0
+    fi
+
+    kept="$(printf '%s\n' "$existing" | grep -v -F -x -- "$legacy" | grep -v -F -- "$CRON_MARKER" || true)"
+
+    # Upgrade the previously auto-installed @reboot entry (or a partial managed set).
+    if [ -n "$managed" ] || printf '%s\n' "$existing" | grep -q -F -x -- "$legacy"; then
+        echo "[olp-proxy] Upgrading olp-proxy cronjobs (watchdog every 15 min + daily restart):"
+        write_crontab "$kept"
+        return 0
+    fi
+
+    # Some other hand-written entry references this script: don't touch it.
+    if printf '%s\n' "$existing" | grep -q -- "start-proxy.sh"; then
+        return 0
+    fi
+
+    # Nothing installed yet: offer to install (interactive runs only).
+    if [ "$DAEMON_MODE" -eq 0 ] && [ -t 0 ]; then
+        echo ""
+        echo "================================================================================"
+        echo "  [olp-proxy] Automated Cronjob Setup"
+        echo "================================================================================"
+        echo "  No crontab jobs were found for olp-proxy. Recommended schedule:"
+        echo "    - start on reboot"
+        echo "    - every 15 minutes: start it if it is not running"
+        echo "    - once a day (random time 01:00-05:59): full restart, incl. git pull"
+        echo "      (disable the pull with 'auto_git_pull = false' under [maintenance] in"
+        echo "       $CONFIG_FILE)"
+        echo ""
+        read -r -p "  Would you like to install these cronjobs now? [y/N]: " cron_choice
+        case "${cron_choice:-n}" in
+            y|Y|yes|YES)
+                write_crontab "$kept"
+                echo "  [✓] Cronjobs successfully installed into crontab!"
+                ;;
+            *)
+                echo "  Skipped. You can add them later via: crontab -e"
+                ;;
+        esac
+        echo "================================================================================"
+        echo ""
+    fi
+}
+
 ACTION="${1:-}"
+case "$ACTION" in
+    status|-h|--help|-V|--version)
+        ;;
+    ensure)
+        # Watchdog: if anything else holds the lock, a start/restart is in progress.
+        if ! acquire_lock try; then
+            exit 0
+        fi
+        ;;
+    *)
+        if ! acquire_lock wait; then
+            echo "[olp-proxy] Another start/restart is still in progress (lock: $LOCK_FILE). Giving up." >&2
+            exit 1
+        fi
+        ;;
+esac
+
+if [ "$ACTION" = "ensure" ]; then
+    if is_running >/dev/null; then
+        exit 0
+    fi
+    echo "[olp-proxy] $(date '+%Y-%m-%d %H:%M:%S') Watchdog: process not running; starting it..."
+    DAEMON_MODE=1
+    OLP_SKIP_GIT_PULL=1
+fi
+
 if [ "$ACTION" = "stop" ]; then
     stop_process
     exit 0
@@ -162,7 +342,7 @@ elif [ "$ACTION" = "status" ]; then
         exit 1
     fi
 elif [ "$ACTION" = "update" ]; then
-    auto_update_from_git
+    auto_update_from_git force
     if [ "$NEED_RECOMPILE" -eq 1 ] || [ ! -x "$SCRIPT_DIR/target/release/olp-proxy" ]; then
         echo "[olp-proxy] Compiling release binary..."
         cargo build --release --bin olp-proxy
@@ -187,8 +367,15 @@ case "${1:-}" in
         ;;
 esac
 
-# Auto-check git updates on launch
+# Auto-check git updates on launch (honours auto_git_pull in the config)
 auto_update_from_git
+if [ "$NEED_RECOMPILE" -eq 1 ] && [ "${OLP_SKIP_GIT_PULL:-0}" != "1" ] && [ "${OLP_REEXECED:-0}" != "1" ]; then
+    # The pull may have changed this script; restart it so the new version runs.
+    echo "[olp-proxy] Re-executing updated start-proxy.sh..."
+    exec 9>&-
+    exec env OLP_REEXECED=1 OLP_SKIP_GIT_PULL=1 OLP_FORCE_RECOMPILE=1 \
+        "$SCRIPT_DIR/start-proxy.sh" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+fi
 
 # ------------------------------------------------------------------------------
 # 4. Resolve Binary: Try User-Space First, Explain Root Needs & Fail Fast
@@ -285,7 +472,6 @@ mkdir -p "$OLP_DATA_DIR"
 chmod 0700 "$OLP_DATA_DIR" 2>/dev/null || true
 
 # If config does not exist yet, run first-time setup
-CONFIG_FILE="${OLP_CONFIG:-$OLP_DATA_DIR/proxy.toml}"
 if [ ! -f "$CONFIG_FILE" ]; then
     if [ "$DAEMON_MODE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
         "$BIN_PATH" --init-only --non-interactive
@@ -295,45 +481,13 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 6. Propose @reboot Cronjob if Missing
+# 6. Install / upgrade cronjobs (watchdog + daily restart)
 # ------------------------------------------------------------------------------
-if [ "$DAEMON_MODE" -eq 0 ] && command -v crontab >/dev/null 2>&1; then
-    EXISTING_CRON="$(crontab -l 2>/dev/null || true)"
-    if ! echo "$EXISTING_CRON" | grep -q "start-proxy.sh"; then
-        CRON_ENTRY="@reboot cd $SCRIPT_DIR && ./start-proxy.sh --daemon"
-        echo ""
-        echo "================================================================================"
-        echo "  [olp-proxy] Automated Cronjob Setup"
-        echo "================================================================================"
-        echo "  No @reboot crontab job was found for olp-proxy."
-        echo "  Recommended crontab entry to auto-start after server reboots:"
-        echo ""
-        echo "    $CRON_ENTRY"
-        echo ""
-        if [ -t 0 ]; then
-            read -r -p "  Would you like to install this @reboot cronjob now? [y/N]: " cron_choice
-            case "${cron_choice:-n}" in
-                y|Y|yes|YES)
-                    if [ -n "$EXISTING_CRON" ]; then
-                        printf "%s\n%s\n" "$EXISTING_CRON" "$CRON_ENTRY" | crontab -
-                    else
-                        printf "%s\n" "$CRON_ENTRY" | crontab -
-                    fi
-                    echo "  [✓] Cronjob successfully installed into crontab!"
-                    ;;
-                *)
-                    echo "  Skipped. You can add it later via: crontab -e"
-                    ;;
-            esac
-        fi
-        echo "================================================================================"
-        echo ""
-    fi
-fi
+manage_cronjob
 
 if [ "$DAEMON_MODE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
     # Run in background as daemon (ideal for cron jobs)
-    nohup "$BIN_PATH" "${CLEAN_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
+    nohup "$BIN_PATH" ${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"} >> "$LOG_FILE" 2>&1 9>&- &
     CHILD_PID=$!
     disown "$CHILD_PID" 2>/dev/null || true
     echo "$CHILD_PID" > "$PID_FILE"
@@ -342,5 +496,6 @@ if [ "$DAEMON_MODE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
 else
     # Run in foreground with full TTY control
     echo $$ > "$PID_FILE"
-    exec "$BIN_PATH" "${CLEAN_ARGS[@]}"
+    exec 9>&-
+    exec "$BIN_PATH" ${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"}
 fi

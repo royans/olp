@@ -152,6 +152,7 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             listen_addr: "127.0.0.1:0".to_string(),
             allowed_ports: "15000-19999".to_string(),
             listener_grace_period_sec: 60,
+            access_log: None,
         },
         auth: ProxyAuthSection {
             passkey_proxy: passkey_proxy.to_string(),
@@ -164,6 +165,7 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             max_concurrent_streams: 64,
         },
         tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
@@ -185,6 +187,7 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             heartbeat_interval_sec: 2,
             heartbeat_timeout_sec: 2,
         },
+        maintenance: Default::default(),
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -292,6 +295,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             listen_addr: "127.0.0.1:0".to_string(),
             allowed_ports: "15000-19999".to_string(),
             listener_grace_period_sec: 60,
+            access_log: None,
         },
         auth: ProxyAuthSection {
             passkey_proxy: "legit-proxy-passkey".to_string(),
@@ -304,6 +308,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             max_concurrent_streams: 64,
         },
         tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
@@ -320,6 +325,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -339,6 +345,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
     };
 
     let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
@@ -448,6 +455,7 @@ async fn test_model_auto_mapping_and_cors() {
             listen_addr: "127.0.0.1:0".to_string(),
             allowed_ports: "18500-18600".to_string(),
             listener_grace_period_sec: 10,
+            access_log: None,
         },
         auth: ProxyAuthSection {
             passkey_proxy: "test-proxy-passkey".to_string(),
@@ -460,6 +468,7 @@ async fn test_model_auto_mapping_and_cors() {
             max_concurrent_streams: 64,
         },
         tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
@@ -474,6 +483,7 @@ async fn test_model_auto_mapping_and_cors() {
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
     };
 
     let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);

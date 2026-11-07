@@ -272,6 +272,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             listen_addr: "127.0.0.1:0".to_string(),
             allowed_ports: "15000-16000".to_string(),
             listener_grace_period_sec: 60,
+            access_log: None,
         },
         auth: ProxyAuthSection {
             passkey_proxy: "legit-proxy-pass".to_string(),
@@ -279,6 +280,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
         },
         security: ProxySecuritySection::default(),
         tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
@@ -295,6 +297,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -315,6 +318,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
     };
 
     let (_tx, mut rx2) = watch::channel(false);
@@ -333,6 +337,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             listen_addr: "127.0.0.1:0".to_string(),
             allowed_ports: "17000-17999".to_string(),
             listener_grace_period_sec: 60,
+            access_log: None,
         },
         auth: ProxyAuthSection {
             passkey_proxy: "shared-proxy-pass".to_string(),
@@ -340,6 +345,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
         },
         security: ProxySecuritySection::default(),
         tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
@@ -355,6 +361,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
     };
 
     let server_cfg2 = ServerConfig {
@@ -366,6 +373,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             tls_verify: None,
         },
         reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
     };
 
     let (_tx1, rx1) = watch::channel(false);
@@ -404,6 +412,7 @@ async fn test_ca_verification_rejects_untrusted_certificates() {
             listen_addr: "127.0.0.1:0".to_string(),
             allowed_ports: "18000-18999".to_string(),
             listener_grace_period_sec: 60,
+            access_log: None,
         },
         auth: ProxyAuthSection {
             passkey_proxy: "ca-test-passkey".to_string(),
@@ -411,6 +420,7 @@ async fn test_ca_verification_rejects_untrusted_certificates() {
         },
         security: ProxySecuritySection::default(),
         tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
     };
 
     let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();

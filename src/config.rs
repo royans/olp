@@ -19,15 +19,23 @@ pub struct ProxyConfig {
     pub security: ProxySecuritySection,
     #[serde(default)]
     pub tls: ProxyTlsSection,
+    #[serde(default)]
+    pub maintenance: MaintenanceSection,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxySection {
     pub listen_addr: String,
     #[serde(default = "default_allowed_ports")]
     pub allowed_ports: String,
     #[serde(default = "default_grace_period")]
     pub listener_grace_period_sec: u64,
+    #[serde(default = "default_access_log")]
+    pub access_log: Option<String>,
+}
+
+fn default_access_log() -> Option<String> {
+    Some("~/.olp/access.log".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +111,7 @@ impl ProxyConfig {
                 listen_addr: "0.0.0.0:4443".to_string(),
                 allowed_ports: default_allowed_ports(),
                 listener_grace_period_sec: default_grace_period(),
+                access_log: default_access_log(),
             },
             auth: ProxyAuthSection {
                 passkey_proxy: generate_random_passkey(),
@@ -110,6 +119,7 @@ impl ProxyConfig {
             },
             security: ProxySecuritySection::default(),
             tls: ProxyTlsSection::default(),
+            maintenance: MaintenanceSection::default(),
         }
     }
 
@@ -165,6 +175,8 @@ pub struct ServerConfig {
     pub server: ServerSection,
     #[serde(default)]
     pub reconnect: ReconnectSection,
+    #[serde(default)]
+    pub maintenance: MaintenanceSection,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -252,6 +264,7 @@ impl ServerConfig {
                 tls_verify: None,
             },
             reconnect: ReconnectSection::default(),
+            maintenance: MaintenanceSection::default(),
         }
     }
 
@@ -274,6 +287,63 @@ impl ServerConfig {
             .with_context(|| format!("Failed to write server config to {}", path.display()))?;
         enforce_private_file_permissions(path)?;
         Ok(())
+    }
+}
+
+// ============================================================================
+// MAINTENANCE (shared by proxy & server)
+// ============================================================================
+
+/// Settings consumed by `start-proxy.sh` / `start-server.sh` and their cron jobs.
+///
+/// ```toml
+/// [maintenance]
+/// auto_git_pull = true   # set to false (or "no") to stop the daily restart from running `git pull`
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceSection {
+    /// When the install directory is a git checkout, run `git pull --ff-only` (and rebuild if
+    /// anything changed) on every scheduled/manual restart. Defaults to `true`.
+    #[serde(
+        default = "default_auto_git_pull",
+        deserialize_with = "deserialize_flexible_bool"
+    )]
+    pub auto_git_pull: bool,
+}
+
+impl Default for MaintenanceSection {
+    fn default() -> Self {
+        Self {
+            auto_git_pull: default_auto_git_pull(),
+        }
+    }
+}
+
+fn default_auto_git_pull() -> bool {
+    true
+}
+
+/// Accepts TOML booleans as well as the strings "yes"/"no", "true"/"false", "on"/"off", "1"/"0".
+fn deserialize_flexible_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        Str(String),
+    }
+    match BoolOrString::deserialize(deserializer)? {
+        BoolOrString::Bool(b) => Ok(b),
+        BoolOrString::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "yes" | "y" | "true" | "on" | "1" => Ok(true),
+            "no" | "n" | "false" | "off" | "0" => Ok(false),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid boolean '{}' (expected yes/no or true/false)",
+                other
+            ))),
+        },
     }
 }
 
@@ -483,4 +553,35 @@ pub fn ensure_server_initialized(
     println!("================================================================================\n");
 
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_defaults_to_git_pull_when_missing() {
+        let cfg: ServerConfig = toml::from_str(
+            "[server]\nproxy_addr = \"a:1\"\nollama_addr = \"b:2\"\nremote_port = 1\npasskey_proxy = \"x\"\n",
+        )
+        .unwrap();
+        assert!(cfg.maintenance.auto_git_pull);
+    }
+
+    #[test]
+    fn maintenance_accepts_yes_no_strings_and_bools() {
+        for (val, expected) in [("false", false), ("\"no\"", false), ("\"yes\"", true), ("true", true)] {
+            let m: MaintenanceSection = toml::from_str(&format!("auto_git_pull = {}", val)).unwrap();
+            assert_eq!(m.auto_git_pull, expected, "value {}", val);
+        }
+        assert!(toml::from_str::<MaintenanceSection>("auto_git_pull = \"maybe\"").is_err());
+    }
+
+    #[test]
+    fn new_configs_write_auto_git_pull_true() {
+        let s = toml::to_string_pretty(&ProxyConfig::default_config()).unwrap();
+        assert!(s.contains("[maintenance]") && s.contains("auto_git_pull = true"), "{}", s);
+        let s = toml::to_string_pretty(&ServerConfig::default_config()).unwrap();
+        assert!(s.contains("[maintenance]") && s.contains("auto_git_pull = true"), "{}", s);
+    }
 }
