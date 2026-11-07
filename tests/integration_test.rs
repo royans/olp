@@ -64,7 +64,9 @@ async fn start_mock_ollama() -> SocketAddr {
                             assert_eq!(host_hdr, expected_host);
 
                             let path = req.uri().path().to_string();
-                            if req.method() == Method::GET && (path == "/api/tags" || path == "/api/ps") {
+                            if req.method() == Method::GET
+                                && (path == "/api/tags" || path == "/api/ps")
+                            {
                                 let body = Full::new(Bytes::from_static(
                                     br#"{"models":[{"name":"llama3:latest"}]}"#,
                                 ))
@@ -74,7 +76,8 @@ async fn start_mock_ollama() -> SocketAddr {
                             }
 
                             if req.method() == Method::POST && path == "/api/generate" {
-                                let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(8);
+                                let (tx, rx) =
+                                    mpsc::channel::<Result<Frame<Bytes>, hyper::Error>>(8);
                                 tokio::spawn(async move {
                                     let chunks = [
                                         &b"{\"model\":\"llama3\",\"response\":\"Hello\",\"done\":false}\n"[..],
@@ -82,7 +85,8 @@ async fn start_mock_ollama() -> SocketAddr {
                                         &b"{\"model\":\"llama3\",\"response\":\"\",\"done\":true}\n"[..],
                                     ];
                                     for c in chunks {
-                                        let _ = tx.send(Ok(Frame::data(Bytes::from_static(c)))).await;
+                                        let _ =
+                                            tx.send(Ok(Frame::data(Bytes::from_static(c)))).await;
                                         tokio::time::sleep(Duration::from_millis(20)).await;
                                     }
                                 });
@@ -225,14 +229,8 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
 
     // 4. Test Bearer Token Auth with passkey_user -> 200 OK
     let bearer = format!("Bearer {}", passkey_user);
-    let (status, _headers, body) = send_http_request(
-        public_addr,
-        Method::GET,
-        "/api/tags",
-        Some(&bearer),
-        b"",
-    )
-    .await;
+    let (status, _headers, body) =
+        send_http_request(public_addr, Method::GET, "/api/tags", Some(&bearer), b"").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("llama3:latest"));
 
@@ -257,14 +255,8 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
     let _ = server_task.await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let (status_during_drop, _, _) = send_http_request(
-        public_addr,
-        Method::GET,
-        "/api/tags",
-        Some(&bearer),
-        b"",
-    )
-    .await;
+    let (status_during_drop, _, _) =
+        send_http_request(public_addr, Method::GET, "/api/tags", Some(&bearer), b"").await;
     assert_eq!(status_during_drop, StatusCode::SERVICE_UNAVAILABLE);
 
     // Reconnect new session
@@ -274,14 +266,8 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let (status_after_reconnect, _, body_after) = send_http_request(
-        public_addr,
-        Method::GET,
-        "/api/tags",
-        Some(&bearer),
-        b"",
-    )
-    .await;
+    let (status_after_reconnect, _, body_after) =
+        send_http_request(public_addr, Method::GET, "/api/tags", Some(&bearer), b"").await;
     assert_eq!(status_after_reconnect, StatusCode::OK);
     assert!(body_after.contains("llama3:latest"));
 
@@ -369,7 +355,12 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
 
     let (server_shutdown_tx, mut server_shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = run_single_tunnel_session(&mut correct_passkey_server, &connector, &mut server_shutdown_rx).await;
+        let _ = run_single_tunnel_session(
+            &mut correct_passkey_server,
+            &connector,
+            &mut server_shutdown_rx,
+        )
+        .await;
     });
 
     let public_addr: SocketAddr = "127.0.0.1:18451".parse().unwrap();
@@ -428,7 +419,8 @@ async fn test_model_auto_mapping_and_cors() {
 
                         if req.method() == Method::POST && path == "/api/generate" {
                             let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
-                            let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+                            let parsed: serde_json::Value =
+                                serde_json::from_slice(&body_bytes).unwrap();
                             // Assert that olp-server rewrote the requested model to target_loaded_model
                             assert_eq!(
                                 parsed["model"].as_str().unwrap(),
@@ -443,7 +435,8 @@ async fn test_model_auto_mapping_and_cors() {
 
                         if req.method() == Method::POST && path == "/api/show" {
                             let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
-                            let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+                            let parsed: serde_json::Value =
+                                serde_json::from_slice(&body_bytes).unwrap();
                             assert_eq!(
                                 parsed["name"].as_str().unwrap(),
                                 target_loaded_model,
@@ -523,9 +516,12 @@ async fn test_model_auto_mapping_and_cors() {
 
     // 1. Verify CORS preflight OPTIONS returns 204 No Content without auth
     let tcp = TcpStream::connect(public_addr).await.unwrap();
-    let (mut client_sender, conn) =
-        hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await.unwrap();
-    tokio::spawn(async move { let _ = conn.await; });
+    let (mut client_sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
     let opt_req = Request::builder()
         .method(Method::OPTIONS)
@@ -539,16 +535,22 @@ async fn test_model_auto_mapping_and_cors() {
     let opt_resp = client_sender.send_request(opt_req).await.unwrap();
     assert_eq!(opt_resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        opt_resp.headers().get("access-control-allow-origin").unwrap(),
+        opt_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
         "*"
     );
 
     // 2. Client sends request specifying "model": "llama3.1" (Cline default or typed by user)
     // with "x-api-key" auth header
     let tcp2 = TcpStream::connect(public_addr).await.unwrap();
-    let (mut client_sender2, conn2) =
-        hyper::client::conn::http1::handshake(TokioIo::new(tcp2)).await.unwrap();
-    tokio::spawn(async move { let _ = conn2.await; });
+    let (mut client_sender2, conn2) = hyper::client::conn::http1::handshake(TokioIo::new(tcp2))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn2.await;
+    });
 
     let post_req = Request::builder()
         .method(Method::POST)
@@ -566,9 +568,12 @@ async fn test_model_auto_mapping_and_cors() {
 
     // 3. Client checks /api/show with {"name": "some-random-model"}
     let tcp3 = TcpStream::connect(public_addr).await.unwrap();
-    let (mut client_sender3, conn3) =
-        hyper::client::conn::http1::handshake(TokioIo::new(tcp3)).await.unwrap();
-    tokio::spawn(async move { let _ = conn3.await; });
+    let (mut client_sender3, conn3) = hyper::client::conn::http1::handshake(TokioIo::new(tcp3))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn3.await;
+    });
 
     let show_req = Request::builder()
         .method(Method::POST)

@@ -175,16 +175,27 @@ fn test_olp_api_key_nonce_and_server_binding() {
     let srv_id = "srv_alpha";
 
     let token_a = compute_server_auth_token(&nonce_a, srv_id, api_key);
-    assert!(verify_server_auth_token(&token_a, &nonce_a, srv_id, api_key));
+    assert!(verify_server_auth_token(
+        &token_a, &nonce_a, srv_id, api_key
+    ));
 
     // Replay on different session nonce fails
-    assert!(!verify_server_auth_token(&token_a, &nonce_b, srv_id, api_key));
+    assert!(!verify_server_auth_token(
+        &token_a, &nonce_b, srv_id, api_key
+    ));
 
     // Wrong server_id fails
-    assert!(!verify_server_auth_token(&token_a, &nonce_a, "srv_beta", api_key));
+    assert!(!verify_server_auth_token(
+        &token_a, &nonce_a, "srv_beta", api_key
+    ));
 
     // Wrong passkey fails
-    assert!(!verify_server_auth_token(&token_a, &nonce_a, srv_id, "wrong-pass"));
+    assert!(!verify_server_auth_token(
+        &token_a,
+        &nonce_a,
+        srv_id,
+        "wrong-pass"
+    ));
 }
 
 // ============================================================================
@@ -202,12 +213,20 @@ fn test_filesystem_permissions_enforcement() {
     std::fs::write(&secret_file, "secret-data").unwrap();
     std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o666)).unwrap();
 
-    let mode_before = std::fs::metadata(&secret_file).unwrap().permissions().mode() & 0o777;
+    let mode_before = std::fs::metadata(&secret_file)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode_before, 0o666);
 
     enforce_private_file_permissions(&secret_file).unwrap();
 
-    let mode_after = std::fs::metadata(&secret_file).unwrap().permissions().mode() & 0o777;
+    let mode_after = std::fs::metadata(&secret_file)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode_after, 0o600);
 
     let _ = std::fs::remove_dir_all(&test_dir);
@@ -254,13 +273,19 @@ fn test_git_pre_commit_hook_blocks_sensitive_commits() {
     run("git add -f proxy.toml");
     let (commit_ok, commit_err) = run("git commit -m 'Add secret file'");
     assert!(!commit_ok);
-    assert!(commit_err.contains("COMMIT BLOCKED") || commit_err.contains("forbidden sensitive file"));
+    assert!(
+        commit_err.contains("COMMIT BLOCKED") || commit_err.contains("forbidden sensitive file")
+    );
     run("git reset -q proxy.toml");
     let _ = std::fs::remove_file(test_dir.join("proxy.toml"));
 
     // 3. Test private key content: Stage a file containing a private key header -> must be blocked
     let leaked_key_file = test_dir.join("leaked.txt");
-    std::fs::write(&leaked_key_file, "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjE...").unwrap();
+    std::fs::write(
+        &leaked_key_file,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjE...",
+    )
+    .unwrap();
     run("git add leaked.txt");
     let (commit_key_ok, commit_key_err) = run("git commit -m 'Commit private key'");
     assert!(!commit_key_ok);
@@ -273,7 +298,11 @@ fn test_git_pre_commit_hook_blocks_sensitive_commits() {
     std::fs::write(&clean_file, "This is safe documentation.\n").unwrap();
     run("git add clean.txt .gitignore");
     let (clean_ok, clean_out) = run("git commit -m 'Initial safe commit'");
-    assert!(clean_ok, "Clean commit should succeed. Output: {}", clean_out);
+    assert!(
+        clean_ok,
+        "Clean commit should succeed. Output: {}",
+        clean_out
+    );
 
     let _ = std::fs::remove_dir_all(&test_dir);
 }
@@ -329,8 +358,11 @@ async fn test_port_range_and_forbidden_port_rejection() {
     let _ = tx1.send(true);
     let s_priv = handle_priv.await.unwrap();
     let assigned_priv = s_priv.server.remote_port.unwrap();
-    assert_ne!(assigned_priv, 80, "Privileged port 80 must never be assigned");
-    assert!(assigned_priv >= 15000 && assigned_priv <= 16000);
+    assert_ne!(
+        assigned_priv, 80,
+        "Privileged port 80 must never be assigned"
+    );
+    assert!((15000..=16000).contains(&assigned_priv));
 
     // Case 2: Requesting port outside allowed range 15000-16000 (e.g. 25000) -> rejected or reassigned within allowed range
     let mut server_cfg_out = ServerConfig {
@@ -359,7 +391,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
     let _ = tx2.send(true);
     let s_out = handle.await.unwrap();
     let assigned_out = s_out.server.remote_port.unwrap();
-    assert!(assigned_out >= 15000 && assigned_out <= 16000);
+    assert!((15000..=16000).contains(&assigned_out));
 }
 
 #[tokio::test]
@@ -435,8 +467,12 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    assert!(tokio::net::TcpStream::connect("127.0.0.1:17101").await.is_ok());
-    assert!(tokio::net::TcpStream::connect("127.0.0.1:17102").await.is_ok());
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:17101")
+        .await
+        .is_ok());
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:17102")
+        .await
+        .is_ok());
 
     task1.abort();
     task2.abort();
@@ -470,20 +506,32 @@ async fn test_ca_verification_rejects_untrusted_certificates() {
     let tls_client_cfg = create_tunnel_tls_client_config(true).unwrap();
     let connector = TlsConnector::from(tls_client_cfg);
 
-    let tcp_stream = tokio::net::TcpStream::connect(proxy_control_addr).await.unwrap();
+    let tcp_stream = tokio::net::TcpStream::connect(proxy_control_addr)
+        .await
+        .unwrap();
     let server_name = rustls::pki_types::ServerName::try_from("olp-tunnel.internal").unwrap();
 
     // The proxy uses a self-signed certificate, which WebPKI root certificates MUST reject
     let tls_result = connector.connect(server_name, tcp_stream).await;
-    assert!(tls_result.is_err(), "WebPKI CA verification must reject self-signed proxy cert");
+    assert!(
+        tls_result.is_err(),
+        "WebPKI CA verification must reject self-signed proxy cert"
+    );
 
     // But with verify_ca = false, it succeeds:
     let tls_client_cfg_noverify = create_tunnel_tls_client_config(false).unwrap();
     let connector_noverify = TlsConnector::from(tls_client_cfg_noverify);
-    let tcp_stream_ok = tokio::net::TcpStream::connect(proxy_control_addr).await.unwrap();
+    let tcp_stream_ok = tokio::net::TcpStream::connect(proxy_control_addr)
+        .await
+        .unwrap();
     let server_name_ok = rustls::pki_types::ServerName::try_from("olp-tunnel.internal").unwrap();
-    let tls_ok = connector_noverify.connect(server_name_ok, tcp_stream_ok).await;
-    assert!(tls_ok.is_ok(), "Self-signed certificate is accepted when verify_ca is false");
+    let tls_ok = connector_noverify
+        .connect(server_name_ok, tcp_stream_ok)
+        .await;
+    assert!(
+        tls_ok.is_ok(),
+        "Self-signed certificate is accepted when verify_ca is false"
+    );
 }
 
 #[test]
@@ -557,15 +605,24 @@ fn test_apache_access_log_helpers() {
 
     // 4. Token sanitization / scheme extraction (no plaintext secrets logged!)
     let mut headers = HeaderMap::new();
-    headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer test-token-123"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer test-token-123"),
+    );
     assert_eq!(extract_auth_scheme(&headers), "auth=bearer");
 
     headers.clear();
-    headers.insert(hyper::header::HeaderName::from_static("x-api-key"), HeaderValue::from_static("custom-api-key"));
+    headers.insert(
+        hyper::header::HeaderName::from_static("x-api-key"),
+        HeaderValue::from_static("custom-api-key"),
+    );
     assert_eq!(extract_auth_scheme(&headers), "auth=api_key");
 
     headers.clear();
-    headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjpwYXNz"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+    );
     assert_eq!(extract_auth_scheme(&headers), "auth=basic");
 
     headers.clear();
@@ -620,29 +677,44 @@ async fn test_apache_access_log_file_logging() {
 
     // Wait for the public port to open
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:19150").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:19150")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // Send an unauthorized HTTP request (bad passkey_user)
-    let mut bad_req = tokio::net::TcpStream::connect("127.0.0.1:19150").await.unwrap();
+    let mut bad_req = tokio::net::TcpStream::connect("127.0.0.1:19150")
+        .await
+        .unwrap();
     let bad_payload = "POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1:19150\r\nAuthorization: Bearer bad-token\r\nContent-Length: 35\r\n\r\n{\"model\":\"llama3\",\"prompt\":\"hello\"}";
-    tokio::io::AsyncWriteExt::write_all(&mut bad_req, bad_payload.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut bad_req, bad_payload.as_bytes())
+        .await
+        .unwrap();
     let mut resp_buf = vec![0u8; 1024];
     let _ = tokio::io::AsyncReadExt::read(&mut bad_req, &mut resp_buf).await;
 
     // Send a CORS preflight OPTIONS request
-    let mut options_req = tokio::net::TcpStream::connect("127.0.0.1:19150").await.unwrap();
+    let mut options_req = tokio::net::TcpStream::connect("127.0.0.1:19150")
+        .await
+        .unwrap();
     let options_payload = "OPTIONS /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19150\r\n\r\n";
-    tokio::io::AsyncWriteExt::write_all(&mut options_req, options_payload.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut options_req, options_payload.as_bytes())
+        .await
+        .unwrap();
     let _ = tokio::io::AsyncReadExt::read(&mut options_req, &mut resp_buf).await;
 
     // Send an authorized request with model in query param
-    let mut auth_req = tokio::net::TcpStream::connect("127.0.0.1:19150").await.unwrap();
+    let mut auth_req = tokio::net::TcpStream::connect("127.0.0.1:19150")
+        .await
+        .unwrap();
     let auth_payload = "GET /api/tags?model=llama3 HTTP/1.1\r\nHost: 127.0.0.1:19150\r\nAuthorization: Bearer access-log-user-pass\r\n\r\n";
-    tokio::io::AsyncWriteExt::write_all(&mut auth_req, auth_payload.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut auth_req, auth_payload.as_bytes())
+        .await
+        .unwrap();
     let _ = tokio::io::AsyncReadExt::read(&mut auth_req, &mut resp_buf).await;
 
     // Allow background logger to flush to disk
@@ -655,10 +727,19 @@ async fn test_apache_access_log_file_logging() {
     assert!(content.contains("127.0.0.1"));
     assert!(content.contains("401"));
     assert!(content.contains("auth=bearer"));
-    assert!(!content.contains("bad-token"), "Passkeys and bearer tokens must never be logged in access.log");
+    assert!(
+        !content.contains("bad-token"),
+        "Passkeys and bearer tokens must never be logged in access.log"
+    );
     assert!(content.contains("model=\"llama3\""));
-    assert!(!content.contains("prompt"), "Query text snippets must never be logged in access.log");
-    assert!(!content.contains("hello"), "Query text snippets must never be logged in access.log");
+    assert!(
+        !content.contains("prompt"),
+        "Query text snippets must never be logged in access.log"
+    );
+    assert!(
+        !content.contains("hello"),
+        "Query text snippets must never be logged in access.log"
+    );
     assert!(content.contains("OPTIONS /api/tags HTTP/1.1"));
     assert!(content.contains("204"));
 }
@@ -719,23 +800,38 @@ async fn test_plain_http_to_https_port_returns_helpful_bad_request() {
     });
 
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:19350").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:19350")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // Connect with plain HTTP (unencrypted) to this HTTPS port
-    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19350").await.unwrap();
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19350")
+        .await
+        .unwrap();
     let req = "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19350\r\n\r\n";
-    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes())
+        .await
+        .unwrap();
 
     let mut resp = vec![0u8; 512];
-    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp)
+        .await
+        .unwrap();
     let resp_str = String::from_utf8_lossy(&resp[..n]);
 
-    assert!(resp_str.contains("400 Bad Request"), "Should return HTTP 400 Bad Request");
-    assert!(resp_str.contains("The plain HTTP request was sent to HTTPS port"), "Should explain HTTPS required");
+    assert!(
+        resp_str.contains("400 Bad Request"),
+        "Should return HTTP 400 Bad Request"
+    );
+    assert!(
+        resp_str.contains("The plain HTTP request was sent to HTTPS port"),
+        "Should explain HTTPS required"
+    );
 }
 
 #[test]
@@ -746,7 +842,10 @@ fn test_proxy_cli_overrides_and_scripting() {
     let overrides = olp::config::ProxyCliOverrides {
         listen_addr: Some("0.0.0.0:4545".to_string()),
         allowed_ports: Some("20000-25000".to_string()),
-        olp_api_keys: Some(vec!["scripted-api-key-1".to_string(), "scripted-api-key-2".to_string()]),
+        olp_api_keys: Some(vec![
+            "scripted-api-key-1".to_string(),
+            "scripted-api-key-2".to_string(),
+        ]),
         allowed_server_cidrs: Some(vec!["10.0.0.0/8".to_string()]),
         allowed_user_cidrs: Some(vec!["192.168.1.0/24".to_string()]),
         tls_mode: Some("self-signed".to_string()),
@@ -760,7 +859,10 @@ fn test_proxy_cli_overrides_and_scripting() {
     let cfg = olp::config::ensure_proxy_initialized(&cfg_path, true, overrides).unwrap();
     assert_eq!(cfg.proxy.listen_addr, "0.0.0.0:4545");
     assert_eq!(cfg.proxy.allowed_ports, "20000-25000");
-    assert_eq!(cfg.auth.olp_api_keys, vec!["scripted-api-key-1", "scripted-api-key-2"]);
+    assert_eq!(
+        cfg.auth.olp_api_keys,
+        vec!["scripted-api-key-1", "scripted-api-key-2"]
+    );
     assert_eq!(cfg.security.allowed_server_cidrs, vec!["10.0.0.0/8"]);
     assert_eq!(cfg.security.allowed_user_cidrs, vec!["192.168.1.0/24"]);
     assert_eq!(cfg.tls.mode, "self-signed");
@@ -780,7 +882,10 @@ fn test_proxy_cli_overrides_and_scripting() {
     };
     let updated = olp::config::ensure_proxy_initialized(&cfg_path, true, update_overrides).unwrap();
     assert_eq!(updated.proxy.listen_addr, "127.0.0.1:4646");
-    assert_eq!(updated.auth.olp_api_keys, vec!["scripted-api-key-1", "scripted-api-key-2"]);
+    assert_eq!(
+        updated.auth.olp_api_keys,
+        vec!["scripted-api-key-1", "scripted-api-key-2"]
+    );
 }
 
 #[test]
@@ -821,7 +926,8 @@ fn test_server_cli_overrides_and_scripting() {
         remote_port: Some(10600),
         ..Default::default()
     };
-    let updated = olp::config::ensure_server_initialized(&cfg_path, true, update_overrides).unwrap();
+    let updated =
+        olp::config::ensure_server_initialized(&cfg_path, true, update_overrides).unwrap();
     assert_eq!(updated.server.remote_port, Some(10600));
     assert_eq!(updated.server.proxy_addr, "proxy.domain.com:4443");
 }
@@ -871,7 +977,11 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
     let res1 = run_single_tunnel_session(&mut server_traversal_key, &connector, &mut rx1).await;
     assert!(res1.is_err());
     let err1 = res1.unwrap_err().to_string();
-    assert!(err1.contains("ERR_INVALID_IDENTIFIER"), "Expected ERR_INVALID_IDENTIFIER, got: {}", err1);
+    assert!(
+        err1.contains("ERR_INVALID_IDENTIFIER"),
+        "Expected ERR_INVALID_IDENTIFIER, got: {}",
+        err1
+    );
 
     // Case B: Traversal in olp_server_id
     let mut server_traversal_id = ServerConfig {
@@ -893,7 +1003,11 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
     let res2 = run_single_tunnel_session(&mut server_traversal_id, &connector, &mut rx2).await;
     assert!(res2.is_err());
     let err2 = res2.unwrap_err().to_string();
-    assert!(err2.contains("ERR_INVALID_IDENTIFIER"), "Expected ERR_INVALID_IDENTIFIER, got: {}", err2);
+    assert!(
+        err2.contains("ERR_INVALID_IDENTIFIER"),
+        "Expected ERR_INVALID_IDENTIFIER, got: {}",
+        err2
+    );
 }
 
 #[tokio::test]
@@ -944,7 +1058,11 @@ async fn test_user_disabled_account_rejection() {
     let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
     assert!(res.is_err());
     let err = res.unwrap_err().to_string();
-    assert!(err.contains("ERR_USER_DISABLED"), "Expected ERR_USER_DISABLED, got: {}", err);
+    assert!(
+        err.contains("ERR_USER_DISABLED"),
+        "Expected ERR_USER_DISABLED, got: {}",
+        err
+    );
 
     let _ = std::fs::remove_file(&profile_path);
 }
@@ -1022,13 +1140,16 @@ async fn test_user_max_servers_limit_enforcement() {
     let res2 = run_single_tunnel_session(&mut server2, &connector, &mut rx2).await;
     assert!(res2.is_err());
     let err2 = res2.unwrap_err().to_string();
-    assert!(err2.contains("ERR_MAX_SERVERS_EXCEEDED"), "Expected ERR_MAX_SERVERS_EXCEEDED, got: {}", err2);
+    assert!(
+        err2.contains("ERR_MAX_SERVERS_EXCEEDED"),
+        "Expected ERR_MAX_SERVERS_EXCEEDED, got: {}",
+        err2
+    );
 
     let _ = tx1.send(true);
     let _ = handle1.await;
     let _ = std::fs::remove_file(&profile_path);
 }
-
 
 #[tokio::test]
 async fn test_cross_user_port_stealing_prevention() {
@@ -1101,14 +1222,16 @@ async fn test_cross_user_port_stealing_prevention() {
 
     // Verify Bob was assigned a free port that is NOT Alice's port (17500)
     let assigned = res_bob.server.remote_port.unwrap();
-    assert_ne!(assigned, 17500, "Proxy must NOT assign another user's assigned port");
-    assert!(assigned >= 17500 && assigned <= 17600);
+    assert_ne!(
+        assigned, 17500,
+        "Proxy must NOT assign another user's assigned port"
+    );
+    assert!((17500..=17600).contains(&assigned));
 
     let _ = std::fs::remove_file(&alice_profile_path);
     let bob_profile_path = config_dir.join(format!("{}.toml", bob_key));
     let _ = std::fs::remove_file(&bob_profile_path);
 }
-
 
 #[tokio::test]
 async fn test_port_exhaustion_returns_clean_error() {
@@ -1195,7 +1318,11 @@ async fn test_port_exhaustion_returns_clean_error() {
     let res3 = run_single_tunnel_session(&mut srv3, &connector, &mut rx3).await;
     assert!(res3.is_err());
     let err3 = res3.unwrap_err().to_string();
-    assert!(err3.contains("ERR_NO_PORTS_AVAILABLE"), "Expected ERR_NO_PORTS_AVAILABLE, got: {}", err3);
+    assert!(
+        err3.contains("ERR_NO_PORTS_AVAILABLE"),
+        "Expected ERR_NO_PORTS_AVAILABLE, got: {}",
+        err3
+    );
 
     let _ = tx1.send(true);
     let _ = tx2.send(true);
@@ -1206,7 +1333,6 @@ async fn test_port_exhaustion_returns_clean_error() {
     let profile_path = config_dir.join(format!("{}.toml", user_key));
     let _ = std::fs::remove_file(&profile_path);
 }
-
 
 #[tokio::test]
 async fn test_server_specific_cidr_restrictions() {
@@ -1277,8 +1403,6 @@ async fn test_server_specific_cidr_restrictions() {
     let _ = std::fs::remove_file(&profile_path);
 }
 
-
-
 // ============================================================================
 // 7. SENSITIVE OPERATIONS POLICY, MUTUAL EXCLUSION & STRICT TLS TESTS
 // ============================================================================
@@ -1345,25 +1469,39 @@ async fn test_sensitive_operations_blocked_by_default_on_proxy() {
     });
 
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:18150").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:18150")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let auth_header = format!("Bearer ro_user_pass");
+    let auth_header = "Bearer ro_user_pass".to_string();
 
     // 1. Safe / RO request (GET /api/tags) -> 200 OK
-    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:18150").await.unwrap();
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:18150")
+        .await
+        .unwrap();
     let req = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:18150\r\nAuthorization: {}\r\nConnection: close\r\n\r\n", auth_header);
-    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes())
+        .await
+        .unwrap();
     let mut resp_buf = vec![0u8; 1024];
-    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf)
+        .await
+        .unwrap();
     let resp = String::from_utf8_lossy(&resp_buf[..n]);
-    assert!(resp.contains("200 OK"), "GET /api/tags must be permitted in read-only mode");
+    assert!(
+        resp.contains("200 OK"),
+        "GET /api/tags must be permitted in read-only mode"
+    );
 
     // 2. Sensitive request (POST /api/pull) -> 403 Forbidden
-    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:18150").await.unwrap();
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:18150")
+        .await
+        .unwrap();
     let body = "{\"name\":\"evil\"}";
     let req2 = format!(
         "POST /api/pull HTTP/1.1\r\nHost: 127.0.0.1:18150\r\nAuthorization: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
@@ -1371,19 +1509,35 @@ async fn test_sensitive_operations_blocked_by_default_on_proxy() {
         body.len(),
         body
     );
-    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes()).await.unwrap();
-    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut resp_buf).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes())
+        .await
+        .unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut resp_buf)
+        .await
+        .unwrap();
     let resp2 = String::from_utf8_lossy(&resp_buf[..n2]);
-    assert!(resp2.contains("403 Forbidden"), "POST /api/pull must be blocked with 403 Forbidden");
+    assert!(
+        resp2.contains("403 Forbidden"),
+        "POST /api/pull must be blocked with 403 Forbidden"
+    );
     assert!(resp2.contains("sensitive Ollama operations are disabled"));
 
     // 3. Sensitive request (DELETE /api/delete) -> 403 Forbidden
-    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:18150").await.unwrap();
+    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:18150")
+        .await
+        .unwrap();
     let req3 = format!("DELETE /api/delete HTTP/1.1\r\nHost: 127.0.0.1:18150\r\nAuthorization: {}\r\nConnection: close\r\n\r\n", auth_header);
-    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req3.as_bytes()).await.unwrap();
-    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut resp_buf).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req3.as_bytes())
+        .await
+        .unwrap();
+    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut resp_buf)
+        .await
+        .unwrap();
     let resp3 = String::from_utf8_lossy(&resp_buf[..n3]);
-    assert!(resp3.contains("403 Forbidden"), "DELETE /api/delete must be blocked with 403 Forbidden");
+    assert!(
+        resp3.contains("403 Forbidden"),
+        "DELETE /api/delete must be blocked with 403 Forbidden"
+    );
 }
 
 #[tokio::test]
@@ -1430,7 +1584,10 @@ async fn test_policy_coexistence_conflict_fails_tunnel() {
 
     let (_tx, mut rx) = watch::channel(false);
     let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
-    assert!(res.is_err(), "Tunnel registration must fail due to policy coexistence conflict");
+    assert!(
+        res.is_err(),
+        "Tunnel registration must fail due to policy coexistence conflict"
+    );
     let err_msg = res.unwrap_err().to_string();
     assert!(
         err_msg.contains("CRITICAL CONFIG CONFLICT"),
@@ -1466,9 +1623,16 @@ async fn test_missing_tls_certs_fails_proxy_without_allow_broken_certs() {
     };
 
     let res = start_proxy_server(proxy_cfg).await;
-    assert!(res.is_err(), "Proxy must fail startup when TLS certs are missing and allow_broken_certs is false");
+    assert!(
+        res.is_err(),
+        "Proxy must fail startup when TLS certs are missing and allow_broken_certs is false"
+    );
     let err = res.err().unwrap().to_string();
-    assert!(err.contains("CRITICAL TLS ERROR"), "Expected CRITICAL TLS ERROR, got: {}", err);
+    assert!(
+        err.contains("CRITICAL TLS ERROR"),
+        "Expected CRITICAL TLS ERROR, got: {}",
+        err
+    );
 }
 
 // ============================================================================
@@ -1522,23 +1686,36 @@ async fn test_unauthenticated_request_rejects_without_buffering_large_body() {
     });
 
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:19250").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:19250")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // Send request with wrong passkey and massive Content-Length (50 MB)
-    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19250").await.unwrap();
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19250")
+        .await
+        .unwrap();
     let req = "POST /api/chat HTTP/1.1\r\nHost: 127.0.0.1:19250\r\nAuthorization: Bearer wrong-pass\r\nContent-Length: 52428800\r\nConnection: close\r\n\r\npartial";
-    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes())
+        .await
+        .unwrap();
 
     let mut resp_buf = vec![0u8; 1024];
-    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf)
+        .await
+        .unwrap();
     let resp = String::from_utf8_lossy(&resp_buf[..n]);
 
     // Must be rejected with 401 Unauthorized immediately before body is consumed
-    assert!(resp.contains("401 Unauthorized"), "Must reject before buffering body: {}", resp);
+    assert!(
+        resp.contains("401 Unauthorized"),
+        "Must reject before buffering body: {}",
+        resp
+    );
 }
 
 #[tokio::test]
@@ -1594,22 +1771,35 @@ async fn test_max_request_body_size_rejection() {
     });
 
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:19850").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:19850")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // Authenticated request with Content-Length: 2 MB (> 1 MB limit)
-    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19850").await.unwrap();
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19850")
+        .await
+        .unwrap();
     let req = "POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1:19850\r\nAuthorization: Bearer my_pass\r\nContent-Length: 2097152\r\nConnection: close\r\n\r\n";
-    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes())
+        .await
+        .unwrap();
 
     let mut resp_buf = vec![0u8; 1024];
-    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf)
+        .await
+        .unwrap();
     let resp = String::from_utf8_lossy(&resp_buf[..n]);
 
-    assert!(resp.contains("413 Payload Too Large"), "Must reject oversized request with 413: {}", resp);
+    assert!(
+        resp.contains("413 Payload Too Large"),
+        "Must reject oversized request with 413: {}",
+        resp
+    );
     assert!(resp.contains("payload too large"));
 
     let _ = std::fs::remove_file(&profile_path);
@@ -1679,7 +1869,10 @@ async fn test_backend_concurrency_throttling_returns_429() {
     });
 
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:19450").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:19450")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1687,11 +1880,17 @@ async fn test_backend_concurrency_throttling_returns_429() {
 
     // Client 1 sends request that takes 400ms
     let h1 = tokio::spawn(async move {
-        let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19450").await.unwrap();
+        let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19450")
+            .await
+            .unwrap();
         let req1 = "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19450\r\nAuthorization: Bearer cc_pass\r\nConnection: close\r\n\r\n";
-        tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes()).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes())
+            .await
+            .unwrap();
         let mut buf = vec![0u8; 1024];
-        let n = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf).await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf)
+            .await
+            .unwrap();
         String::from_utf8_lossy(&buf[..n]).to_string()
     });
 
@@ -1699,14 +1898,24 @@ async fn test_backend_concurrency_throttling_returns_429() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Client 2 sends concurrent request while client 1 is in-flight -> must receive 429
-    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19450").await.unwrap();
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19450")
+        .await
+        .unwrap();
     let req2 = "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19450\r\nAuthorization: Bearer cc_pass\r\nConnection: close\r\n\r\n";
-    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes())
+        .await
+        .unwrap();
     let mut buf2 = vec![0u8; 1024];
-    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf2).await.unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf2)
+        .await
+        .unwrap();
     let resp2 = String::from_utf8_lossy(&buf2[..n2]);
 
-    assert!(resp2.contains("429 Too Many Requests"), "Concurrent request must receive 429: {}", resp2);
+    assert!(
+        resp2.contains("429 Too Many Requests"),
+        "Concurrent request must receive 429: {}",
+        resp2
+    );
     assert!(resp2.contains("server busy: maximum concurrent requests reached"));
 
     let resp1 = h1.await.unwrap();
@@ -1775,34 +1984,59 @@ async fn test_authenticated_request_rate_limiting() {
     });
 
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:19550").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:19550")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     // Request 1 -> 200 OK
-    let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19550").await.unwrap();
+    let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19550")
+        .await
+        .unwrap();
     let req1 = "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19550\r\nAuthorization: Bearer rl_pass\r\nConnection: close\r\n\r\n";
-    tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes())
+        .await
+        .unwrap();
     let mut buf = vec![0u8; 1024];
-    let n1 = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf).await.unwrap();
+    let n1 = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf)
+        .await
+        .unwrap();
     let resp1 = String::from_utf8_lossy(&buf[..n1]);
     assert!(resp1.contains("200 OK"));
 
     // Request 2 -> 200 OK
-    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19550").await.unwrap();
-    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req1.as_bytes()).await.unwrap();
-    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf).await.unwrap();
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19550")
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req1.as_bytes())
+        .await
+        .unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf)
+        .await
+        .unwrap();
     let resp2 = String::from_utf8_lossy(&buf[..n2]);
     assert!(resp2.contains("200 OK"));
 
     // Request 3 -> Rate limit exceeded! (429 Too Many Requests)
-    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:19550").await.unwrap();
-    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req1.as_bytes()).await.unwrap();
-    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut buf).await.unwrap();
+    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:19550")
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req1.as_bytes())
+        .await
+        .unwrap();
+    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut buf)
+        .await
+        .unwrap();
     let resp3 = String::from_utf8_lossy(&buf[..n3]);
-    assert!(resp3.contains("429 Too Many Requests"), "3rd request must receive 429: {}", resp3);
+    assert!(
+        resp3.contains("429 Too Many Requests"),
+        "3rd request must receive 429: {}",
+        resp3
+    );
     assert!(resp3.contains("rate limit exceeded"));
 }
 
@@ -1873,7 +2107,10 @@ async fn test_user_profile_salted_hash_passkey_verification() {
     });
 
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:19650").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:19650")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1884,17 +2121,29 @@ async fn test_user_profile_salted_hash_passkey_verification() {
     let profile_content = std::fs::read_to_string(&profile_path).unwrap();
 
     // Verify plaintext passkey is NOT stored on disk when hash_passkeys = true!
-    assert!(!profile_content.contains(raw_passkey), "Plaintext passkey must not be saved on disk!");
+    assert!(
+        !profile_content.contains(raw_passkey),
+        "Plaintext passkey must not be saved on disk!"
+    );
     assert!(profile_content.contains("passkey_user_hash = \"$blake3$"));
 
     // Verify user can authenticate using the raw passkey
-    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19650").await.unwrap();
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19650")
+        .await
+        .unwrap();
     let req = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19650\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", raw_passkey);
-    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes())
+        .await
+        .unwrap();
     let mut buf = vec![0u8; 1024];
-    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut buf).await.unwrap();
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut buf)
+        .await
+        .unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp.contains("200 OK"), "Authentication must succeed with passkey against stored hash");
+    assert!(
+        resp.contains("200 OK"),
+        "Authentication must succeed with passkey against stored hash"
+    );
 
     let _ = std::fs::remove_file(&profile_path);
 }
@@ -1962,7 +2211,10 @@ async fn test_user_profile_default_plaintext_passkey_manual_editing() {
     });
 
     for _ in 0..40 {
-        if tokio::net::TcpStream::connect("127.0.0.1:19750").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:19750")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1981,13 +2233,22 @@ async fn test_user_profile_default_plaintext_passkey_manual_editing() {
     );
 
     // 2. Verify initial passkey works
-    let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19750").await.unwrap();
+    let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19750")
+        .await
+        .unwrap();
     let req1 = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19750\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", initial_passkey);
-    tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes()).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes())
+        .await
+        .unwrap();
     let mut buf = vec![0u8; 1024];
-    let n1 = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf).await.unwrap();
+    let n1 = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf)
+        .await
+        .unwrap();
     let resp1 = String::from_utf8_lossy(&buf[..n1]);
-    assert!(resp1.contains("200 OK"), "Authentication must succeed with initial passkey");
+    assert!(
+        resp1.contains("200 OK"),
+        "Authentication must succeed with initial passkey"
+    );
 
     // 3. User manually modifies ~/.olp/config/<api_key>.toml in their text editor!
     let edited_passkey = "my_hand_edited_custom_password_456!";
@@ -1995,21 +2256,40 @@ async fn test_user_profile_default_plaintext_passkey_manual_editing() {
     std::fs::write(&profile_path, modified_content).unwrap();
 
     // 4. Verify the newly edited passkey is immediately accepted by the proxy!
-    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19750").await.unwrap();
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19750")
+        .await
+        .unwrap();
     let req2 = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19750\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", edited_passkey);
-    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes()).await.unwrap();
-    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes())
+        .await
+        .unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf)
+        .await
+        .unwrap();
     let resp2 = String::from_utf8_lossy(&buf[..n2]);
-    assert!(resp2.contains("200 OK"), "Authentication must succeed with user's manually edited passkey: {}", resp2);
+    assert!(
+        resp2.contains("200 OK"),
+        "Authentication must succeed with user's manually edited passkey: {}",
+        resp2
+    );
 
     // 5. Old passkey must now be rejected
-    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:19750").await.unwrap();
+    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:19750")
+        .await
+        .unwrap();
     let req3 = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19750\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", initial_passkey);
-    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req3.as_bytes()).await.unwrap();
-    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut buf).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req3.as_bytes())
+        .await
+        .unwrap();
+    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut buf)
+        .await
+        .unwrap();
     let resp3 = String::from_utf8_lossy(&buf[..n3]);
-    assert!(resp3.contains("401 Unauthorized"), "Old passkey must be rejected: {}", resp3);
+    assert!(
+        resp3.contains("401 Unauthorized"),
+        "Old passkey must be rejected: {}",
+        resp3
+    );
 
     let _ = std::fs::remove_file(&profile_path);
 }
-

@@ -27,9 +27,7 @@ use yamux::Mode;
 type BoxHttpBody = BoxBody<Bytes, hyper::Error>;
 
 fn full_body<T: Into<Bytes>>(chunk: T) -> BoxHttpBody {
-    Full::new(chunk.into())
-        .map_err(|e| match e {})
-        .boxed()
+    Full::new(chunk.into()).map_err(|e| match e {}).boxed()
 }
 
 /// Main entry point for `olp-server`. Maintains a persistent Yamux reverse tunnel
@@ -94,7 +92,9 @@ pub async fn run_server_with_shutdown(
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("CRITICAL CONFIG CONFLICT") || err_str.contains("CRITICAL CONFIG ERROR") {
+                if err_str.contains("CRITICAL CONFIG CONFLICT")
+                    || err_str.contains("CRITICAL CONFIG ERROR")
+                {
                     error!(
                         "\n================================================================================\n\
                          [CRITICAL CONFIG CONFLICT] Tunnel registration rejected!\n\
@@ -103,33 +103,35 @@ pub async fn run_server_with_shutdown(
                         err_str
                     );
                     return Err(e);
-                } else if err_str.contains("ERR_UNAUTHORIZED_KEY") || err_str.contains("ERR_INVALID_AUTH_TOKEN") {
-                    if backoff.attempt() == 1 || backoff.attempt() % 5 == 0 {
-                        error!(
-                            "\n================================================================================\n\
-                             [AUTH ERROR] Proxy rejected your olp_api_key!\n\
-                             Please check that [server].olp_api_key in ~/.olp/server.toml is a valid\n\
-                             user API key recognized by the proxy.\n\
-                             ================================================================================"
-                        );
-                    }
-                } else if err_str.contains("TLS 1.3 handshake failed") || err_str.contains("certificate") {
-                    if backoff.attempt() == 1 || backoff.attempt() % 5 == 0 {
-                        error!(
-                            "\n================================================================================\n\
-                             [TLS ERROR] TLS 1.3 handshake failed connecting to {}!\n\
-                             CA verification: {}\n\
-                             Broken, missing, or self-signed TLS certificates on the proxy are rejected by\n\
-                             Mozilla WebPKI CA roots to prevent MITM attacks.\n\
-                             Solutions:\n\
-                             1. On olp-proxy: Generate a valid Let's Encrypt certificate (run ./renew-tls.sh).\n\
-                             2. For testing/internal environments: Add `tls_verify = false` under [server] in\n\
-                                ~/.olp/server.toml to bypass CA verification.\n\
-                             ================================================================================",
-                            config.server.proxy_addr,
-                            if verify_ca { "ENABLED (enforced for domain names)" } else { "DISABLED" }
-                        );
-                    }
+                } else if (err_str.contains("ERR_UNAUTHORIZED_KEY")
+                    || err_str.contains("ERR_INVALID_AUTH_TOKEN"))
+                    && (backoff.attempt() == 1 || backoff.attempt().is_multiple_of(5))
+                {
+                    error!(
+                        "\n================================================================================\n\
+                         [AUTH ERROR] Proxy rejected your olp_api_key!\n\
+                         Please check that [server].olp_api_key in ~/.olp/server.toml is a valid\n\
+                         user API key recognized by the proxy.\n\
+                         ================================================================================"
+                    );
+                } else if (err_str.contains("TLS 1.3 handshake failed")
+                    || err_str.contains("certificate"))
+                    && (backoff.attempt() == 1 || backoff.attempt().is_multiple_of(5))
+                {
+                    error!(
+                        "\n================================================================================\n\
+                         [TLS ERROR] TLS 1.3 handshake failed connecting to {}!\n\
+                         CA verification: {}\n\
+                         Broken, missing, or self-signed TLS certificates on the proxy are rejected by\n\
+                         Mozilla WebPKI CA roots to prevent MITM attacks.\n\
+                         Solutions:\n\
+                         1. On olp-proxy: Generate a valid Let's Encrypt certificate (run ./renew-tls.sh).\n\
+                         2. For testing/internal environments: Add `tls_verify = false` under [server] in\n\
+                            ~/.olp/server.toml to bypass CA verification.\n\
+                         ================================================================================",
+                        config.server.proxy_addr,
+                        if verify_ca { "ENABLED (enforced for domain names)" } else { "DISABLED" }
+                    );
                 }
                 warn!(
                     "Tunnel error ({}); retrying in {:.1}s (Fibonacci attempt #{})",
@@ -157,7 +159,10 @@ pub async fn run_single_tunnel_session(
     connector: &TlsConnector,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    info!("Connecting to olp-proxy at {} (TLS 1.3)...", config.server.proxy_addr);
+    info!(
+        "Connecting to olp-proxy at {} (TLS 1.3)...",
+        config.server.proxy_addr
+    );
 
     let tcp_stream = tokio::time::timeout(
         Duration::from_secs(10),
@@ -181,12 +186,10 @@ pub async fn run_single_tunnel_session(
     .context("TLS 1.3 handshake failed")?;
 
     // Step 1: Read ProxyHelloChallenge
-    let challenge: ProxyHelloChallenge = tokio::time::timeout(
-        Duration::from_secs(10),
-        read_frame(&mut tls_stream),
-    )
-    .await
-    .context("Timed out waiting for ProxyHelloChallenge")??;
+    let challenge: ProxyHelloChallenge =
+        tokio::time::timeout(Duration::from_secs(10), read_frame(&mut tls_stream))
+            .await
+            .context("Timed out waiting for ProxyHelloChallenge")??;
 
     // Step 2: Send ServerAuthRegister with auth token computed from olp_api_key and optional policy override
     let register = ServerAuthRegister::with_policy(
@@ -206,12 +209,10 @@ pub async fn run_single_tunnel_session(
     .context("Timed out sending ServerAuthRegister")??;
 
     // Step 3: Read TunnelEstablished confirmation
-    let established: TunnelEstablished = tokio::time::timeout(
-        Duration::from_secs(10),
-        read_frame(&mut tls_stream),
-    )
-    .await
-    .context("Timed out waiting for TunnelEstablished")??;
+    let established: TunnelEstablished =
+        tokio::time::timeout(Duration::from_secs(10), read_frame(&mut tls_stream))
+            .await
+            .context("Timed out waiting for TunnelEstablished")??;
 
     if !established.accepted {
         return Err(anyhow!(
@@ -236,7 +237,11 @@ pub async fn run_single_tunnel_session(
             },
         };
         if let Err(e) = config.save_to_path(&cfg_path) {
-            warn!("Failed to persist assigned port to {}: {}", cfg_path.display(), e);
+            warn!(
+                "Failed to persist assigned port to {}: {}",
+                cfg_path.display(),
+                e
+            );
         }
     }
 
@@ -303,13 +308,15 @@ pub async fn run_single_tunnel_session(
     }
 }
 
+type ModelCache = Arc<tokio::sync::RwLock<Option<(Option<String>, Instant)>>>;
+
 /// Tracks the active loaded model on local Ollama with a short TTL cache.
 /// When any client sends a request specifying any model name (e.g. `llama3.1`, `auto`, etc.),
 /// olp-server rewrites the JSON model field to whatever is currently loaded in Ollama.
 #[derive(Clone)]
 pub struct ActiveModelTracker {
     pub ollama_addr: String,
-    cache: Arc<tokio::sync::RwLock<Option<(Option<String>, Instant)>>>,
+    cache: ModelCache,
     ttl: Duration,
 }
 
@@ -386,13 +393,11 @@ impl ActiveModelTracker {
 }
 
 async fn query_ollama_json(ollama_addr: &str, path: &str) -> Result<serde_json::Value> {
-    let connect_res = tokio::time::timeout(
-        Duration::from_millis(800),
-        TcpStream::connect(ollama_addr),
-    )
-    .await
-    .context("Connection timed out")?
-    .context("Failed to connect to local Ollama")?;
+    let connect_res =
+        tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(ollama_addr))
+            .await
+            .context("Connection timed out")?
+            .context("Failed to connect to local Ollama")?;
 
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(connect_res))
         .await
@@ -420,8 +425,8 @@ async fn query_ollama_json(ollama_addr: &str, path: &str) -> Result<serde_json::
         .context("Failed to read response body")?
         .to_bytes();
 
-    let json: serde_json::Value = serde_json::from_slice(&body_bytes)
-        .context("Failed to parse JSON response from Ollama")?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).context("Failed to parse JSON response from Ollama")?;
 
     Ok(json)
 }
@@ -467,7 +472,8 @@ async fn forward_to_local_ollama(
     if server_read_only && is_sensitive_ollama_op(req.method(), &path_and_query) {
         warn!(
             "[POLICY] Blocked sensitive Ollama operation '{} {}' on server (read-only mode active)",
-            req.method(), path_and_query
+            req.method(),
+            path_and_query
         );
         let mut resp = Response::new(full_body(
             r#"{"error":"operation forbidden: sensitive Ollama operations are disabled on server (read-only mode active)"}"#,
@@ -488,7 +494,8 @@ async fn forward_to_local_ollama(
     }
 
     // Determine outgoing request body. For POST/PUT with JSON, auto-map the requested model to active loaded model.
-    let outgoing_body: BoxHttpBody = if parts.method == Method::GET || parts.method == Method::HEAD {
+    let outgoing_body: BoxHttpBody = if parts.method == Method::GET || parts.method == Method::HEAD
+    {
         full_body(Bytes::new())
     } else {
         let body_bytes = match incoming_body.collect().await {
@@ -565,23 +572,19 @@ async fn forward_to_local_ollama(
 
     let outgoing_req = Request::from_parts(parts, outgoing_body);
 
-    let upstream_tcp = match tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(ollama_addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        _ => {
-            let msg = format!(
-                r#"{{"error":"local ollama service unreachable at {}"}}"#,
-                ollama_addr
-            );
-            let mut resp = Response::new(full_body(msg));
-            *resp.status_mut() = StatusCode::BAD_GATEWAY;
-            return Ok(resp);
-        }
-    };
+    let upstream_tcp =
+        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(ollama_addr)).await {
+            Ok(Ok(s)) => s,
+            _ => {
+                let msg = format!(
+                    r#"{{"error":"local ollama service unreachable at {}"}}"#,
+                    ollama_addr
+                );
+                let mut resp = Response::new(full_body(msg));
+                *resp.status_mut() = StatusCode::BAD_GATEWAY;
+                return Ok(resp);
+            }
+        };
 
     let (mut client_sender, conn) =
         match hyper::client::conn::http1::handshake(TokioIo::new(upstream_tcp)).await {

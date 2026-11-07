@@ -52,8 +52,7 @@ where
     let compat_io = io.compat();
     let mut conn = Connection::new(compat_io, cfg, mode);
 
-    let (open_tx, mut open_rx) =
-        mpsc::channel::<oneshot::Sender<Result<CompatYamuxStream>>>(128);
+    let (open_tx, mut open_rx) = mpsc::channel::<oneshot::Sender<Result<CompatYamuxStream>>>(128);
     let (inbound_tx, inbound_rx) = mpsc::channel::<CompatYamuxStream>(128);
 
     tokio::spawn(async move {

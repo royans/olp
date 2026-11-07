@@ -85,9 +85,8 @@ mod tests {
             let dur = fb.next_backoff();
             let millis = dur.as_millis();
             // 10s base with +/- 10% jitter -> 9000ms ..= 11000ms
-            assert!(millis >= 8900 && millis <= 11100, "millis was {}", millis);
+            assert!((8900..=11100).contains(&millis), "millis was {}", millis);
             fb.reset();
         }
     }
 }
-

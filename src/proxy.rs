@@ -4,8 +4,8 @@ use crate::keys::{enforce_private_file_permissions, IpRateLimiter, PasskeyVerifi
 use crate::mux::{spawn_mux_session, MuxHandle};
 use crate::protocol::{
     configure_tunnel_socket, create_tunnel_tls_server_config, is_safe_identifier,
-    is_sensitive_ollama_op, read_frame, verify_server_auth_token, write_frame,
-    ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished,
+    is_sensitive_ollama_op, read_frame, verify_server_auth_token, write_frame, ProxyHelloChallenge,
+    ServerAuthRegister, TunnelEstablished,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -37,9 +37,7 @@ use yamux::Mode;
 pub type BoxHttpBody = BoxBody<Bytes, hyper::Error>;
 
 fn full_body<T: Into<Bytes>>(chunk: T) -> BoxHttpBody {
-    Full::new(chunk.into())
-        .map_err(|e| match e {})
-        .boxed()
+    Full::new(chunk.into()).map_err(|e| match e {}).boxed()
 }
 
 pub fn build_public_tls_acceptor(config: &ProxyConfig) -> Result<Option<TlsAcceptor>> {
@@ -75,8 +73,16 @@ pub fn build_public_tls_acceptor(config: &ProxyConfig) -> Result<Option<TlsAccep
             Ok(Some(TlsAcceptor::from(Arc::new(server_cfg))))
         }
         "manual" => {
-            let cert_path_str = config.tls.cert_path.as_deref().unwrap_or("~/.olp/tls/cert.pem");
-            let key_path_str = config.tls.key_path.as_deref().unwrap_or("~/.olp/tls/key.pem");
+            let cert_path_str = config
+                .tls
+                .cert_path
+                .as_deref()
+                .unwrap_or("~/.olp/tls/cert.pem");
+            let key_path_str = config
+                .tls
+                .key_path
+                .as_deref()
+                .unwrap_or("~/.olp/tls/key.pem");
             let cert_path = expand_path(cert_path_str)?;
             let key_path = expand_path(key_path_str)?;
 
@@ -336,10 +342,7 @@ pub struct LoggingBody<B> {
 }
 
 impl<B> LoggingBody<B> {
-    pub fn new(
-        inner: B,
-        on_complete: impl FnOnce(usize) + Send + Sync + 'static,
-    ) -> Self {
+    pub fn new(inner: B, on_complete: impl FnOnce(usize) + Send + Sync + 'static) -> Self {
         Self {
             inner,
             on_complete: Some(Box::new(on_complete)),
@@ -439,7 +442,9 @@ impl ProxyState {
     }
 
     pub fn save_user_profile(&self, profile: &UserProfile) -> Result<()> {
-        let profile_path = self.config_dir.join(format!("{}.toml", profile.user.api_key));
+        let profile_path = self
+            .config_dir
+            .join(format!("{}.toml", profile.user.api_key));
         profile.save_atomic(&profile_path)
     }
 
@@ -520,15 +525,8 @@ impl ProxyState {
         }
 
         // 4. Try recommended_port if available
-        let assigned_port = if let Some(rec) = recommended_port {
-            if rec >= min_port && rec <= max_port && !used_ports.contains(&rec) {
-                Some(rec)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let assigned_port = recommended_port
+            .filter(|&rec| rec >= min_port && rec <= max_port && !used_ports.contains(&rec));
 
         // 5. Otherwise allocate first free port in range
         let port = match assigned_port {
@@ -554,7 +552,10 @@ impl ProxyState {
         // 6. Persist into user profile (plaintext by default for easy manual editing; salted hash if hash_passkeys is enabled)
         let existing = profile.servers.get(server_id).cloned();
         let (passkey_user_val, passkey_user_hash_val) = if self.config.security.hash_passkeys {
-            ("".to_string(), Some(PasskeyVerifier::from_passkey(passkey_user).to_encoded_hash()))
+            (
+                "".to_string(),
+                Some(PasskeyVerifier::from_passkey(passkey_user).to_encoded_hash()),
+            )
         } else {
             (passkey_user.to_string(), None)
         };
@@ -586,10 +587,7 @@ impl ProxyState {
     }
 }
 
-pub fn verify_http_headers_auth(
-    headers: &hyper::HeaderMap,
-    verifier: &PasskeyVerifier,
-) -> bool {
+pub fn verify_http_headers_auth(headers: &hyper::HeaderMap, verifier: &PasskeyVerifier) -> bool {
     // 1. Standard Authorization header (Bearer token or Basic auth)
     if let Some(auth_header) = headers.get(AUTHORIZATION).and_then(|h| h.to_str().ok()) {
         let auth_header = auth_header.trim();
@@ -632,10 +630,7 @@ pub fn verify_http_headers_auth(
     false
 }
 
-pub fn verify_http_request_auth(
-    req: &Request<Incoming>,
-    verifier: &PasskeyVerifier,
-) -> bool {
+pub fn verify_http_request_auth(req: &Request<Incoming>, verifier: &PasskeyVerifier) -> bool {
     verify_http_headers_auth(req.headers(), verifier)
 }
 
@@ -660,8 +655,10 @@ pub async fn start_proxy_server(
     let public_tls_acceptor = build_public_tls_acceptor(&config)?;
     let config_dir = olp_config_dir()?;
 
-    let server_ip_filter =
-        Arc::new(IpFilter::new(&config.security.allowed_server_cidrs).context("Invalid allowed_server_cidrs")?);
+    let server_ip_filter = Arc::new(
+        IpFilter::new(&config.security.allowed_server_cidrs)
+            .context("Invalid allowed_server_cidrs")?,
+    );
 
     let listen_sock_addr: SocketAddr = config
         .proxy
@@ -673,8 +670,16 @@ pub async fn start_proxy_server(
     let local_addr = listener.local_addr()?;
 
     let tunnel_tls_acceptor = if config.tls.mode == "manual" {
-        let cert_path_str = config.tls.cert_path.as_deref().unwrap_or("~/.olp/tls/cert.pem");
-        let key_path_str = config.tls.key_path.as_deref().unwrap_or("~/.olp/tls/key.pem");
+        let cert_path_str = config
+            .tls
+            .cert_path
+            .as_deref()
+            .unwrap_or("~/.olp/tls/cert.pem");
+        let key_path_str = config
+            .tls
+            .key_path
+            .as_deref()
+            .unwrap_or("~/.olp/tls/key.pem");
         let cert_path = expand_path(cert_path_str)?;
         let key_path = expand_path(key_path_str)?;
         if cert_path.exists() && key_path.exists() {
@@ -781,7 +786,10 @@ pub async fn start_proxy_server(
                                 .await
                         {
                             let err_msg = format!("{:#}", e);
-                            if err_msg.contains("TLS handshake failed") || err_msg.contains("Handshake") || err_msg.contains("AlertReceived") {
+                            if err_msg.contains("TLS handshake failed")
+                                || err_msg.contains("Handshake")
+                                || err_msg.contains("AlertReceived")
+                            {
                                 warn!(
                                     "Tunnel connection from {} ended: {}. (Note: If connecting via domain name, client requires valid CA/Let's Encrypt certificates on proxy. Run ./renew-tls.sh if certificates are missing or expired).",
                                     peer_addr, err_msg
@@ -811,13 +819,10 @@ async fn handle_incoming_tunnel(
 ) -> Result<()> {
     configure_tunnel_socket(&tcp_stream)?;
 
-    let mut tls_stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        acceptor.accept(tcp_stream),
-    )
-    .await
-    .context("TLS handshake timed out")?
-    .context("TLS handshake failed")?;
+    let mut tls_stream = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp_stream))
+        .await
+        .context("TLS handshake timed out")?
+        .context("TLS handshake failed")?;
 
     // Step 1: Send ProxyHelloChallenge with fresh CSPRNG nonce
     let challenge = ProxyHelloChallenge::new();
@@ -829,12 +834,10 @@ async fn handle_incoming_tunnel(
     .context("Timed out sending ProxyHelloChallenge")??;
 
     // Step 2: Receive ServerAuthRegister
-    let register: ServerAuthRegister = tokio::time::timeout(
-        Duration::from_secs(10),
-        read_frame(&mut tls_stream),
-    )
-    .await
-    .context("Timed out waiting for ServerAuthRegister")??;
+    let register: ServerAuthRegister =
+        tokio::time::timeout(Duration::from_secs(10), read_frame(&mut tls_stream))
+            .await
+            .context("Timed out waiting for ServerAuthRegister")??;
 
     // Step 3: Validate safe alphanumeric identifiers
     if !is_safe_identifier(&register.olp_api_key) || !is_safe_identifier(&register.olp_server_id) {
@@ -848,7 +851,10 @@ async fn handle_incoming_tunnel(
             },
         )
         .await;
-        warn!("[SECURITY] Rejected tunnel with invalid identifier chars from {}", peer_addr);
+        warn!(
+            "[SECURITY] Rejected tunnel with invalid identifier chars from {}",
+            peer_addr
+        );
         return Err(anyhow!(msg));
     }
 
@@ -864,7 +870,10 @@ async fn handle_incoming_tunnel(
             },
         )
         .await;
-        error!("[AUTH ERROR] Tunnel connection from {} rejected: unknown olp_api_key", peer_addr);
+        error!(
+            "[AUTH ERROR] Tunnel connection from {} rejected: unknown olp_api_key",
+            peer_addr
+        );
         return Err(anyhow!(msg));
     }
 
@@ -931,7 +940,8 @@ async fn handle_incoming_tunnel(
 
     let srv_filter = IpFilter::new(&server_cfg.allowed_server_cidrs)?;
     if !srv_filter.is_allowed(&peer_addr.ip()) {
-        let msg = "ERR_SERVER_IP_FORBIDDEN: your IP is not in allowed_server_cidrs for this server".to_string();
+        let msg = "ERR_SERVER_IP_FORBIDDEN: your IP is not in allowed_server_cidrs for this server"
+            .to_string();
         let _ = write_frame(
             &mut tls_stream,
             &TunnelEstablished {
@@ -968,7 +978,8 @@ async fn handle_incoming_tunnel(
     // Configure worker credentials & ACL specifically for this server
     {
         *worker.user_verifier.write().unwrap() = server_cfg.get_verifier();
-        *worker.user_ip_filter.write().unwrap() = Arc::new(IpFilter::new(&server_cfg.allowed_user_cidrs)?);
+        *worker.user_ip_filter.write().unwrap() =
+            Arc::new(IpFilter::new(&server_cfg.allowed_user_cidrs)?);
         *worker.assigned_server_id.write().unwrap() = Some(register.olp_server_id.clone());
         *worker.assigned_api_key.write().unwrap() = Some(register.olp_api_key.clone());
     }
@@ -998,7 +1009,9 @@ async fn handle_incoming_tunnel(
         }
 
         // Proxy controls policy (default: read_only = true)
-        let is_ro = server_cfg.read_only.unwrap_or(state.config.security.read_only);
+        let is_ro = server_cfg
+            .read_only
+            .unwrap_or(state.config.security.read_only);
         info!(
             "[POLICY] Proxy controls policy for server '{}': read_only = {} (sensitive Ollama operations {})",
             register.olp_server_id,
@@ -1091,10 +1104,7 @@ async fn handle_incoming_tunnel(
     Ok(())
 }
 
-fn get_or_create_port_worker(
-    state: &Arc<ProxyState>,
-    port: u16,
-) -> Result<Arc<PortWorker>> {
+fn get_or_create_port_worker(state: &Arc<ProxyState>, port: u16) -> Result<Arc<PortWorker>> {
     let mut guard = state.workers.lock().unwrap();
     if let Some(existing) = guard.get(&port) {
         return Ok(existing.clone());
@@ -1142,7 +1152,10 @@ async fn run_public_port_listener(
     worker: Arc<PortWorker>,
     state: Arc<ProxyState>,
 ) {
-    info!("Public Ollama endpoint listening on 0.0.0.0:{}", worker.port);
+    info!(
+        "Public Ollama endpoint listening on 0.0.0.0:{}",
+        worker.port
+    );
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
@@ -1154,38 +1167,33 @@ async fn run_public_port_listener(
                         // Detect plaintext HTTP requests sent to an HTTPS port
                         let mut peek_buf = [0u8; 4];
                         if let Ok(n) = stream.peek(&mut peek_buf).await {
-                            if n >= 3 && peek_buf[0] != 0x16 {
-                                if &peek_buf[..3] == b"GET"
+                            if n >= 3
+                                && peek_buf[0] != 0x16
+                                && (&peek_buf[..3] == b"GET"
                                     || &peek_buf[..4] == b"POST"
                                     || &peek_buf[..4] == b"HEAD"
                                     || &peek_buf[..4] == b"OPTI"
                                     || &peek_buf[..3] == b"PUT"
-                                    || &peek_buf[..4] == b"DELE"
-                                {
-                                    let err_resp = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"error\":\"The plain HTTP request was sent to HTTPS port. Please use https:// instead of http://\"}\r\n";
-                                    let mut s = stream;
-                                    let _ = tokio::io::AsyncWriteExt::write_all(&mut s, err_resp).await;
-                                    return;
-                                }
+                                    || &peek_buf[..4] == b"DELE")
+                            {
+                                let err_resp = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"error\":\"The plain HTTP request was sent to HTTPS port. Please use https:// instead of http://\"}\r\n";
+                                let mut s = stream;
+                                let _ = tokio::io::AsyncWriteExt::write_all(&mut s, err_resp).await;
+                                return;
                             }
                         }
 
-                        match tokio::time::timeout(
-                            Duration::from_secs(10),
-                            acceptor.accept(stream),
-                        )
-                        .await
+                        if let Ok(Ok(tls_stream)) =
+                            tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
+                                .await
                         {
-                            Ok(Ok(tls_stream)) => {
-                                serve_public_http_connection(
-                                    tls_stream,
-                                    client_addr.ip(),
-                                    worker_ref,
-                                    state_ref,
-                                )
-                                .await;
-                            }
-                            _ => {}
+                            serve_public_http_connection(
+                                tls_stream,
+                                client_addr.ip(),
+                                worker_ref,
+                                state_ref,
+                            )
+                            .await;
                         }
                     } else {
                         serve_public_http_connection(
@@ -1368,7 +1376,8 @@ async fn handle_public_http_request(
                     let fresh_verifier = fresh_server_cfg.get_verifier();
                     if verify_http_headers_auth(req.headers(), &fresh_verifier) {
                         *worker.user_verifier.write().unwrap() = fresh_verifier;
-                        if let Ok(new_filter) = IpFilter::new(&fresh_server_cfg.allowed_user_cidrs) {
+                        if let Ok(new_filter) = IpFilter::new(&fresh_server_cfg.allowed_user_cidrs)
+                        {
                             *worker.user_ip_filter.write().unwrap() = Arc::new(new_filter);
                         }
                         is_auth_valid = true;
@@ -1407,7 +1416,8 @@ async fn handle_public_http_request(
         log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-");
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-        resp.headers_mut().insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("10"));
+        resp.headers_mut()
+            .insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("10"));
         resp.headers_mut().insert(
             hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
             hyper::header::HeaderValue::from_static("*"),
@@ -1467,11 +1477,13 @@ async fn handle_public_http_request(
                 "[CONCURRENCY] Max active concurrent requests ({}) reached for worker port {}",
                 state.config.security.max_active_requests_per_server, worker.port
             );
-            let err_json = r#"{"error":"server busy: maximum concurrent requests reached for this backend"}"#;
+            let err_json =
+                r#"{"error":"server busy: maximum concurrent requests reached for this backend"}"#;
             log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-");
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            resp.headers_mut().insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("5"));
+            resp.headers_mut()
+                .insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("5"));
             resp.headers_mut().insert(
                 hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
                 hyper::header::HeaderValue::from_static("*"),
@@ -1508,8 +1520,14 @@ async fn handle_public_http_request(
     }
 
     if overflow {
-        let err_json = r#"{"error":"payload too large: request body exceeds maximum allowed size"}"#;
-        log_event(StatusCode::PAYLOAD_TOO_LARGE, err_json.len(), collected.len(), "-");
+        let err_json =
+            r#"{"error":"payload too large: request body exceeds maximum allowed size"}"#;
+        log_event(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            err_json.len(),
+            collected.len(),
+            "-",
+        );
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
         resp.headers_mut().insert(
@@ -1532,8 +1550,14 @@ async fn handle_public_http_request(
     let mux = match mux {
         Some(m) if !m.is_closed() => m,
         _ => {
-            let err_json = r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#;
-            log_event(StatusCode::SERVICE_UNAVAILABLE, err_json.len(), req_size, &model);
+            let err_json =
+                r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#;
+            log_event(
+                StatusCode::SERVICE_UNAVAILABLE,
+                err_json.len(),
+                req_size,
+                &model,
+            );
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
             resp.headers_mut().insert(

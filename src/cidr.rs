@@ -33,7 +33,10 @@ impl CidrBlock {
 
             if let Ok(ipv4) = ip_str.parse::<Ipv4Addr>() {
                 if prefix > 32 {
-                    return Err(anyhow!("IPv4 CIDR prefix must be between 0 and 32: '{}'", s));
+                    return Err(anyhow!(
+                        "IPv4 CIDR prefix must be between 0 and 32: '{}'",
+                        s
+                    ));
                 }
                 let mask = if prefix == 0 {
                     0u32
@@ -215,11 +218,8 @@ mod tests {
 
     #[test]
     fn test_ip_filter_restricted() {
-        let filter = IpFilter::new(&[
-            "192.168.1.0/24".to_string(),
-            "10.0.0.1".to_string(),
-        ])
-        .unwrap();
+        let filter =
+            IpFilter::new(&["192.168.1.0/24".to_string(), "10.0.0.1".to_string()]).unwrap();
 
         assert!(filter.is_allowed(&"192.168.1.50".parse().unwrap()));
         assert!(filter.is_allowed(&"10.0.0.1".parse().unwrap()));
@@ -227,4 +227,3 @@ mod tests {
         assert!(!filter.is_allowed(&"172.16.0.1".parse().unwrap()));
     }
 }
-

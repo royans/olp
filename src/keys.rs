@@ -52,8 +52,7 @@ pub fn write_private_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_secure_dir(parent)?;
     }
-    fs::write(path, content)
-        .with_context(|| format!("Failed to write file {}", path.display()))?;
+    fs::write(path, content).with_context(|| format!("Failed to write file {}", path.display()))?;
     enforce_private_file_permissions(path)?;
     Ok(())
 }
@@ -227,7 +226,8 @@ mod tests {
         let encoded = verifier.to_encoded_hash();
         assert!(encoded.starts_with("$blake3$"));
 
-        let restored = PasskeyVerifier::from_encoded_hash(&encoded).expect("must parse encoded hash");
+        let restored =
+            PasskeyVerifier::from_encoded_hash(&encoded).expect("must parse encoded hash");
         assert_eq!(verifier.salt, restored.salt);
         assert_eq!(verifier.hash, restored.hash);
         assert!(restored.verify("my_secure_passkey_123"));

@@ -138,7 +138,11 @@ async fn main() -> Result<()> {
         tls_mode: args.tls_mode,
         tls_cert_path: args.tls_cert,
         tls_key_path: args.tls_key,
-        allow_broken_certs: if args.allow_broken_certs { Some(true) } else { None },
+        allow_broken_certs: if args.allow_broken_certs {
+            Some(true)
+        } else {
+            None
+        },
         insecure_no_tls: args.insecure_no_tls,
         access_log: args.access_log,
         auto_git_pull: args.auto_git_pull,
@@ -162,10 +166,19 @@ async fn main() -> Result<()> {
     println!("\n================================================================================");
     println!("  olp-proxy starting");
     println!("  Config               : {}", config_path.display());
-    println!("  Listen Addr (Tunnel) : {} (TLS 1.3 encrypted)", cfg.proxy.listen_addr);
+    println!(
+        "  Listen Addr (Tunnel) : {} (TLS 1.3 encrypted)",
+        cfg.proxy.listen_addr
+    );
     println!("  Public TLS Mode      : {}", cfg.tls.mode);
-    println!("  Allowed Server CIDRs : {:?}", cfg.security.allowed_server_cidrs);
-    println!("  Allowed User CIDRs   : {:?}", cfg.security.allowed_user_cidrs);
+    println!(
+        "  Allowed Server CIDRs : {:?}",
+        cfg.security.allowed_server_cidrs
+    );
+    println!(
+        "  Allowed User CIDRs   : {:?}",
+        cfg.security.allowed_user_cidrs
+    );
     println!("================================================================================\n");
 
     let pid_file = olp_home_dir()?.join("olp-proxy.pid");

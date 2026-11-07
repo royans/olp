@@ -19,7 +19,9 @@ pub const MAX_HANDSHAKE_FRAME_LEN: usize = 16 * 1024;
 pub fn is_safe_identifier(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Step 1 of Handshake: Sent from `olp-proxy` to `olp-server` immediately after TLS 1.3 handshake.
@@ -102,7 +104,10 @@ pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
     match (method, normalized_path) {
         (&hyper::Method::GET, "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps") => false,
         (&hyper::Method::HEAD, "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps") => false,
-        (&hyper::Method::POST, "/api/generate" | "/api/chat" | "/api/embeddings" | "/api/embed" | "/api/show") => false,
+        (
+            &hyper::Method::POST,
+            "/api/generate" | "/api/chat" | "/api/embeddings" | "/api/embed" | "/api/show",
+        ) => false,
         // All mutating operations (e.g. POST /api/pull, DELETE /api/delete, POST /api/push,
         // POST /api/create, POST /api/copy, /api/blobs/*, etc.) or unknown verbs are sensitive.
         _ => true,
@@ -310,12 +315,32 @@ mod tests {
     fn test_server_auth_token_constant_time() {
         let nonce = [42u8; 32];
         let token = compute_server_auth_token(&nonce, "srv_123", "secret-key-1");
-        assert!(verify_server_auth_token(&token, &nonce, "srv_123", "secret-key-1"));
-        assert!(!verify_server_auth_token(&token, &nonce, "srv_123", "wrong-key"));
-        assert!(!verify_server_auth_token(&token, &nonce, "srv_456", "secret-key-1"));
+        assert!(verify_server_auth_token(
+            &token,
+            &nonce,
+            "srv_123",
+            "secret-key-1"
+        ));
+        assert!(!verify_server_auth_token(
+            &token,
+            &nonce,
+            "srv_123",
+            "wrong-key"
+        ));
+        assert!(!verify_server_auth_token(
+            &token,
+            &nonce,
+            "srv_456",
+            "secret-key-1"
+        ));
 
         let diff_nonce = [43u8; 32];
-        assert!(!verify_server_auth_token(&token, &diff_nonce, "srv_123", "secret-key-1"));
+        assert!(!verify_server_auth_token(
+            &token,
+            &diff_nonce,
+            "srv_123",
+            "secret-key-1"
+        ));
     }
 
     #[test]
@@ -339,7 +364,10 @@ mod tests {
         assert!(!is_sensitive_ollama_op(&Method::GET, "/api"));
         assert!(!is_sensitive_ollama_op(&Method::GET, "/api/version"));
         assert!(!is_sensitive_ollama_op(&Method::GET, "/api/tags"));
-        assert!(!is_sensitive_ollama_op(&Method::GET, "/api/tags?verbose=true"));
+        assert!(!is_sensitive_ollama_op(
+            &Method::GET,
+            "/api/tags?verbose=true"
+        ));
         assert!(!is_sensitive_ollama_op(&Method::GET, "/api/ps"));
         assert!(!is_sensitive_ollama_op(&Method::POST, "/api/generate"));
         assert!(!is_sensitive_ollama_op(&Method::POST, "/api/chat"));
@@ -353,9 +381,18 @@ mod tests {
         assert!(is_sensitive_ollama_op(&Method::DELETE, "/api/delete"));
         assert!(is_sensitive_ollama_op(&Method::POST, "/api/create"));
         assert!(is_sensitive_ollama_op(&Method::POST, "/api/copy"));
-        assert!(is_sensitive_ollama_op(&Method::POST, "/api/blobs/sha256:1234"));
-        assert!(is_sensitive_ollama_op(&Method::PUT, "/api/blobs/sha256:1234"));
-        assert!(is_sensitive_ollama_op(&Method::DELETE, "/api/blobs/sha256:1234"));
+        assert!(is_sensitive_ollama_op(
+            &Method::POST,
+            "/api/blobs/sha256:1234"
+        ));
+        assert!(is_sensitive_ollama_op(
+            &Method::PUT,
+            "/api/blobs/sha256:1234"
+        ));
+        assert!(is_sensitive_ollama_op(
+            &Method::DELETE,
+            "/api/blobs/sha256:1234"
+        ));
         assert!(is_sensitive_ollama_op(&Method::POST, "/unknown/endpoint"));
     }
 }

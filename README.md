@@ -1,15 +1,15 @@
 # Ollama Proxy (`olp-proxy` & `olp-server`)
 
-[![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-54%20passing-brightgreen.svg)]()
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
 [![Memory Footprint](https://img.shields.io/badge/memory-%3C5MB%20RAM-success.svg)]()
 
-A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in **Rust** designed to expose a private Ollama server (`olp-server` running behind NAT or restrictive firewalls) through a public gateway (`olp-proxy`).
+A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in **Rust** designed to expose a private Ollama server (`olp-server` running behind NAT or restrictive firewalls) through a publicly accessible gateway (`olp-proxy`).
 
 ```
  +----------------------------------+                   +----------------------------------+
- |  PRIVATE NETWORK (Behind NAT)    |                   |  PUBLIC CLOUD SERVER / VPS       |
+ |  PRIVATE NETWORK (Behind NAT)    |                   |  PUBLICLY ACCESSIBLE SERVER / VPS|
  |  [ollama-gpu-host]               |                   |  [olp-proxy]                     |
  |  [olp-server] -------------------+------------------>|    Control Port: :4443           |
  |    (Reverse TLS 1.3 Tunnel)      | (olp_api_key)     |    Public Port:  :11434          |
@@ -25,56 +25,9 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
 
 ---
 
-## Multi-User & Multi-Server Architecture
-
-`olp` is designed for multi-tenancy where a single `olp-proxy` serves multiple users, and each user can host multiple `olp-server` instances:
-
-1. **`olp_api_key`**:
-   - Alphanumeric user API key authorizing `olp-server` instances to register reverse tunnels.
-   - Listed in `proxy.toml` (`olp_api_keys = ["ABcd123"]`) or discovered via `~/.olp/config/<olp_api_key>.toml`.
-   - Server authenticates using a cryptographically bound BLAKE3 token over TLS 1.3 with session nonces.
-2. **`olp_server_id` & Dynamic Port Allocation**:
-   - Each `olp-server` generates or defines an alphanumeric server ID (e.g. `srv_8aBcD123`).
-   - The server may optionally recommend a public port; the proxy safely checks availability and assigns an unused port from `allowed_ports`.
-   - The proxy atomically saves the allocated port into `~/.olp/config/<olp_api_key>.toml` and returns the assigned port in the handshake.
-3. **`passkey_user` (Per-Server)**:
-   - Defined individually per server.
-   - Accepted via **Bearer Token** (`Authorization: Bearer <passkey_user>`), **HTTP Basic Auth** (`username:passkey_user`), or **API Key headers** (`x-api-key`, `api-key`, `ollama-api-key`).
-   - Verified directly by `olp-proxy` on that server's assigned public port in constant time.
-4. **CIDR IP Filtering**:
-   - **`allowed_server_cidrs`**: Restricts which IP addresses / subnets can connect to the tunnel control port (`:4443`) or specific server tunnels.
-   - **`allowed_user_cidrs`**: Restricts which IP addresses / subnets can query the public Ollama HTTP ports.
-   - Defaults to `["0.0.0.0/0", "::/0"]` (allow all), or configure specific subnets.
-
----
-
-## Key Features
-
-- **Automatic Model Dynamic Mapping ("Serve Whatever is Loaded")**:
-  - `olp-server` automatically detects whichever model is actively running in Ollama's memory (`/api/ps`) or installed on disk (`/api/tags`).
-  - **The model name requested by the client does not matter.** Whether Cline, Open WebUI, or curl requests `llama3.1`, `auto`, `default`, or anything else, `olp-server` transparently rewrites the request to whatever model is loaded (e.g., `hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M`).
-  - Automatically rewrites model parameters in `/api/show` so agent context windows, capabilities, and templates work out of the box without manual configuration.
-- **Zero Inbound Port Forwarding on NAT**: `olp-server` initiates an *outbound* connection to `olp-proxy` over a single TLS 1.3 port (`:4443`).
-- **Encrypted TLS 1.3 Reverse Tunnel**: All multiplexed traffic is end-to-end encrypted with forward secrecy over TLS 1.3 using Yamux.
-- **Strict Multi-User Session Isolation & PII Safety**:
-  - Independent Yamux substreams and ephemeral local TCP connections per request guarantee zero session bleed or data mixing between concurrent users.
-  - Completely stateless architecture: no prompt logging, disk caching, or cross-request memory.
-  - Compatible with Ollama's isolated parallel slots (`OLLAMA_NUM_PARALLEL`).
-- **Built-in CORS & Webview Compatibility**: Full CORS preflight (`OPTIONS`) handling without authentication, enabling seamless integration with VS Code extensions (Cline, Roo Code) and browser web interfaces (Open WebUI).
-- **Flexible Client Authentication**: Supports Bearer tokens, HTTP Basic Auth, and custom `x-api-key` / `ollama-api-key` headers.
-- **Constant-Time Verification**: Plaintext passkeys are never verified with naive string equality; verification uses constant-time comparisons (`subtle::ConstantTimeEq`) and salted BLAKE3 hashing.
-- **CIDR Block IP Filtering**: IPv4 and IPv6 subnet filtering on both tunnel and user HTTP connections.
-- **Fibonacci Reconnect Backoff**: Smart reconnect sequence (`1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s...` capped at 300s) with $\pm 10\%$ jitter.
-- **Zero-Buffering Chunked Streaming**: Full support for real-time Server-Sent Events (SSE) and token streaming (`/api/generate`, `/api/chat`).
-- **Cron & Daemon Friendly**: Built-in PID tracking and auto-cleanup terminates previous instances cleanly upon re-execution; supports `--daemon` / `-d` for background crontab jobs, plus a 15-minute watchdog and a randomized daily restart with optional `git pull`.
-- **Edge IP Brute-Force Rate Limiting**: Automatic sliding-window rate limiter returns `429 Too Many Requests` on repeated failed authentications.
-- **Single-Directory Isolation**: Configuration files live exclusively in `~/.olp/` with strict `0600`/`0700` permissions.
-
----
-
 ## Quick Start (2 Steps)
 
-### Step 1: On the Public Server (`olp-proxy`)
+### Step 1: On the Publicly Accessible Server (`olp-proxy`)
 
 Clone and launch `olp-proxy`:
 ```bash
@@ -151,6 +104,53 @@ Brand new instances can be completely scripted via CLI without interactive promp
   --remote-port 10000 \
   --non-interactive
 ```
+
+---
+
+## Multi-User & Multi-Server Architecture
+
+`olp` is designed for multi-tenancy where a single `olp-proxy` serves multiple users, and each user can host multiple `olp-server` instances:
+
+1. **`olp_api_key`**:
+   - Alphanumeric user API key authorizing `olp-server` instances to register reverse tunnels.
+   - Listed in `proxy.toml` (`olp_api_keys = ["ABcd123"]`) or discovered via `~/.olp/config/<olp_api_key>.toml`.
+   - Server authenticates using a cryptographically bound BLAKE3 token over TLS 1.3 with session nonces.
+2. **`olp_server_id` & Dynamic Port Allocation**:
+   - Each `olp-server` generates or defines an alphanumeric server ID (e.g. `srv_8aBcD123`).
+   - The server may optionally recommend a public port; the proxy safely checks availability and assigns an unused port from `allowed_ports`.
+   - The proxy atomically saves the allocated port into `~/.olp/config/<olp_api_key>.toml` and returns the assigned port in the handshake.
+3. **`passkey_user` (Per-Server)**:
+   - Defined individually per server.
+   - Accepted via **Bearer Token** (`Authorization: Bearer <passkey_user>`), **HTTP Basic Auth** (`username:passkey_user`), or **API Key headers** (`x-api-key`, `api-key`, `ollama-api-key`).
+   - Verified directly by `olp-proxy` on that server's assigned public port in constant time.
+4. **CIDR IP Filtering**:
+   - **`allowed_server_cidrs`**: Restricts which IP addresses / subnets can connect to the tunnel control port (`:4443`) or specific server tunnels.
+   - **`allowed_user_cidrs`**: Restricts which IP addresses / subnets can query the public Ollama HTTP ports.
+   - Defaults to `["0.0.0.0/0", "::/0"]` (allow all), or configure specific subnets.
+
+---
+
+## Key Features
+
+- **Automatic Model Dynamic Mapping ("Serve Whatever is Loaded")**:
+  - `olp-server` automatically detects whichever model is actively running in Ollama's memory (`/api/ps`) or installed on disk (`/api/tags`).
+  - **The model name requested by the client does not matter.** Whether Cline, Open WebUI, or curl requests `llama3.1`, `auto`, `default`, or anything else, `olp-server` transparently rewrites the request to whatever model is loaded (e.g., `hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M`).
+  - Automatically rewrites model parameters in `/api/show` so agent context windows, capabilities, and templates work out of the box without manual configuration.
+- **Zero Inbound Port Forwarding on NAT**: `olp-server` initiates an *outbound* connection to `olp-proxy` over a single TLS 1.3 port (`:4443`).
+- **Encrypted TLS 1.3 Reverse Tunnel**: All multiplexed traffic is end-to-end encrypted with forward secrecy over TLS 1.3 using Yamux.
+- **Strict Multi-User Session Isolation & PII Safety**:
+  - Independent Yamux substreams and ephemeral local TCP connections per request guarantee zero session bleed or data mixing between concurrent users.
+  - Completely stateless architecture: no prompt logging, disk caching, or cross-request memory.
+  - Compatible with Ollama's isolated parallel slots (`OLLAMA_NUM_PARALLEL`).
+- **Built-in CORS & Webview Compatibility**: Full CORS preflight (`OPTIONS`) handling without authentication, enabling seamless integration with VS Code extensions (Cline, Roo Code) and browser web interfaces (Open WebUI).
+- **Flexible Client Authentication**: Supports Bearer tokens, HTTP Basic Auth, and custom `x-api-key` / `ollama-api-key` headers.
+- **Constant-Time Verification**: Plaintext passkeys are never verified with naive string equality; verification uses constant-time comparisons (`subtle::ConstantTimeEq`) and salted BLAKE3 hashing.
+- **CIDR Block IP Filtering**: IPv4 and IPv6 subnet filtering on both tunnel and user HTTP connections.
+- **Fibonacci Reconnect Backoff**: Smart reconnect sequence (`1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s...` capped at 300s) with $\pm 10\%$ jitter.
+- **Zero-Buffering Chunked Streaming**: Full support for real-time Server-Sent Events (SSE) and token streaming (`/api/generate`, `/api/chat`).
+- **Cron & Daemon Friendly**: Built-in PID tracking and auto-cleanup terminates previous instances cleanly upon re-execution; supports `--daemon` / `-d` for background crontab jobs, plus a 15-minute watchdog and a randomized daily restart with optional `git pull`.
+- **Edge IP Brute-Force Rate Limiting**: Automatic sliding-window rate limiter returns `429 Too Many Requests` on repeated failed authentications.
+- **Single-Directory Isolation**: Configuration files live exclusively in `~/.olp/` with strict `0600`/`0700` permissions.
 
 ---
 

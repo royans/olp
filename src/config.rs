@@ -311,7 +311,9 @@ impl ProxyConfig {
             .parse()
             .context("Invalid end port in allowed_ports")?;
         if start > end {
-            return Err(anyhow!("Start port cannot exceed end port in allowed_ports"));
+            return Err(anyhow!(
+                "Start port cannot exceed end port in allowed_ports"
+            ));
         }
         Ok((start, end))
     }
@@ -326,7 +328,8 @@ impl ProxyConfig {
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
-        let serialized = toml::to_string_pretty(self).context("Failed to serialize proxy config")?;
+        let serialized =
+            toml::to_string_pretty(self).context("Failed to serialize proxy config")?;
         if let Some(parent) = path.parent() {
             ensure_secure_dir(parent)?;
         }
@@ -467,7 +470,7 @@ impl ServerConfig {
 /// [maintenance]
 /// auto_git_pull = true   # set to false (or "no") to stop the daily restart from running `git pull`
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MaintenanceSection {
     /// When the install directory is a git checkout, run `git pull --ff-only` (and rebuild if
     /// anything changed) on every scheduled/manual restart. Defaults to `true`.
@@ -476,14 +479,6 @@ pub struct MaintenanceSection {
         deserialize_with = "deserialize_flexible_bool"
     )]
     pub auto_git_pull: bool,
-}
-
-impl Default for MaintenanceSection {
-    fn default() -> Self {
-        Self {
-            auto_git_pull: false,
-        }
-    }
 }
 
 fn default_auto_git_pull() -> bool {
@@ -530,7 +525,8 @@ pub fn olp_home_dir() -> Result<PathBuf> {
         ensure_secure_dir(&p)?;
         return Ok(p);
     }
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine user home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow!("Could not determine user home directory"))?;
     let olp_dir = home.join(".olp");
     ensure_secure_dir(&olp_dir)?;
     Ok(olp_dir)
@@ -728,9 +724,13 @@ pub fn ensure_proxy_initialized(
         || overrides.tls_mode.is_some();
 
     if !non_interactive && !has_overrides && io::stdin().is_terminal() {
-        println!("\n================================================================================");
+        println!(
+            "\n================================================================================"
+        );
         println!("  [olp-proxy] First-Time Configuration Setup");
-        println!("================================================================================\n");
+        println!(
+            "================================================================================\n"
+        );
 
         cfg.proxy.listen_addr = prompt_line("Tunnel listen address", &cfg.proxy.listen_addr)?;
         cfg.proxy.allowed_ports = prompt_line(
@@ -739,7 +739,10 @@ pub fn ensure_proxy_initialized(
         )?;
 
         let custom_api_key = prompt_line(
-            &format!("Initial olp_api_key for first user (press Enter to auto-generate: {})", initial_api_key),
+            &format!(
+                "Initial olp_api_key for first user (press Enter to auto-generate: {})",
+                initial_api_key
+            ),
             "",
         )?;
         if !custom_api_key.is_empty() {
@@ -832,7 +835,10 @@ pub fn ensure_proxy_initialized(
     let first_profile = config_dir.join(format!("{}.toml", first_key));
 
     println!("\n================================================================================");
-    println!("  [olp-proxy] Configuration saved to {}", config_path.display());
+    println!(
+        "  [olp-proxy] Configuration saved to {}",
+        config_path.display()
+    );
     println!("  ----------------------------------------------------------------------------");
     println!("  olp_api_key  : {}", first_key);
     println!("  user profile : {}", first_profile.display());
@@ -922,9 +928,13 @@ pub fn ensure_server_initialized(
         || overrides.remote_port.is_some();
 
     if !non_interactive && !has_overrides && io::stdin().is_terminal() {
-        println!("\n================================================================================");
+        println!(
+            "\n================================================================================"
+        );
         println!("  [olp-server] First-Time Configuration Setup");
-        println!("================================================================================\n");
+        println!(
+            "================================================================================\n"
+        );
 
         // 1. Proxy Host & Port
         let proxy_host_input = prompt_line("Proxy server address/host", "proxy.example.com")?;
@@ -939,8 +949,7 @@ pub fn ensure_server_initialized(
         cfg.server.proxy_addr = format!("{}:{}", host.trim(), proxy_port.trim());
 
         // 2. Local Ollama address
-        cfg.server.ollama_addr =
-            prompt_line("Local Ollama address", &cfg.server.ollama_addr)?;
+        cfg.server.ollama_addr = prompt_line("Local Ollama address", &cfg.server.ollama_addr)?;
 
         // 3. Recommended port on proxy (optional)
         let rec_port_str = prompt_line(
@@ -1010,7 +1019,10 @@ pub fn ensure_server_initialized(
     cfg.save_to_path(config_path)?;
 
     println!("\n================================================================================");
-    println!("  [olp-server] Configuration saved to {}", config_path.display());
+    println!(
+        "  [olp-server] Configuration saved to {}",
+        config_path.display()
+    );
     println!("  ----------------------------------------------------------------------------");
     println!("  olp_server_id : {}", cfg.server.olp_server_id);
     println!("  passkey_user  : {}", cfg.server.passkey_user);
@@ -1053,7 +1065,8 @@ mod tests {
 
     #[test]
     fn test_user_profile_atomic_save_and_load() {
-        let dir = std::env::temp_dir().join(format!("olp_test_{}", rand::thread_rng().gen::<u64>()));
+        let dir =
+            std::env::temp_dir().join(format!("olp_test_{}", rand::thread_rng().gen::<u64>()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("test_user.toml");
 
@@ -1087,8 +1100,14 @@ mod tests {
 
     #[test]
     fn maintenance_accepts_yes_no_strings_and_bools() {
-        for (val, expected) in [("false", false), ("\"no\"", false), ("\"yes\"", true), ("true", true)] {
-            let m: MaintenanceSection = toml::from_str(&format!("auto_git_pull = {}", val)).unwrap();
+        for (val, expected) in [
+            ("false", false),
+            ("\"no\"", false),
+            ("\"yes\"", true),
+            ("true", true),
+        ] {
+            let m: MaintenanceSection =
+                toml::from_str(&format!("auto_git_pull = {}", val)).unwrap();
             assert_eq!(m.auto_git_pull, expected, "value {}", val);
         }
         assert!(toml::from_str::<MaintenanceSection>("auto_git_pull = \"maybe\"").is_err());
@@ -1097,8 +1116,16 @@ mod tests {
     #[test]
     fn new_configs_write_auto_git_pull_false() {
         let s = toml::to_string_pretty(&ProxyConfig::default_config()).unwrap();
-        assert!(s.contains("[maintenance]") && s.contains("auto_git_pull = false"), "{}", s);
+        assert!(
+            s.contains("[maintenance]") && s.contains("auto_git_pull = false"),
+            "{}",
+            s
+        );
         let s = toml::to_string_pretty(&ServerConfig::default_config()).unwrap();
-        assert!(s.contains("[maintenance]") && s.contains("auto_git_pull = false"), "{}", s);
+        assert!(
+            s.contains("[maintenance]") && s.contains("auto_git_pull = false"),
+            "{}",
+            s
+        );
     }
 }
