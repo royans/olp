@@ -1,6 +1,6 @@
 # Ollama Proxy (`olp-proxy` & `olp-server`)
 
-[![Tests](https://img.shields.io/badge/tests-54%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg)]()
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
 [![Memory Footprint](https://img.shields.io/badge/memory-%3C5MB%20RAM-success.svg)]()
@@ -172,13 +172,17 @@ olp_api_keys = ["admin_key_abc123"]
 [security]
 # Read-only mode disallows sensitive mutating Ollama operations:
 # (POST /api/pull, DELETE /api/delete, POST /api/create, POST /api/push, POST /api/copy, raw blobs)
-# Safe inference and read operations are permitted (generate, chat, embeddings, embed, tags, version, show, ps).
-# Enabled by default (read_only = true) to prevent public or untrusted clients from modifying models.
-read_only = true
+# Safe inference and read operations are permitted (native /api/generate, /api/chat, /api/tags, /api/show,
+# and OpenAI-compatible /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models).
+# Defaults to false (not enforced as RO by default). Set to true to enforce read-only from proxy.
+read_only = false
 
-# Policy Authority determines whether proxy or server controls sensitive operation permissions:
-# - "proxy" (default): olp-proxy dictates read-only policy. olp-servers are prohibited from specifying read_only.
-# - "server": olp-proxy delegates policy enforcement to individual connecting olp-servers.
+# Policy Authority and Stricter-Setting-Wins Resolution:
+# - "proxy" (default): olp-proxy policy applies by default.
+#   * Both sides can set policy as long as they are aligned.
+#   * A server can always restrict itself further (if proxy has read_only = false, server can set read_only = true; stricter wins).
+#   * Only an attempt by a server to loosen a proxy's stricter policy (proxy RO=true, server RO=false) is rejected.
+# - "server": olp-proxy delegates full policy control to individual connecting olp-servers.
 policy_authority = "proxy"
 
 allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
@@ -344,11 +348,10 @@ When multiple users query the same proxied Ollama instance:
 ## Security Architecture & Policy Enforcement
 
 ### 1. Read-Only Mode & Sensitive Operations Filter
-By default, `olp-proxy` enforces strict **read-only mode** (`read_only = true`), permitting only safe inference and inspection endpoints:
+When read-only mode is active, only safe inference and inspection endpoints are permitted:
 - **Permitted Safe Operations**:
-  - `POST /api/generate`, `POST /api/chat`
-  - `POST /api/embeddings`, `POST /api/embed`
-  - `GET /api/tags`, `GET /api/version`, `GET /api/ps`, `POST /api/show`
+  - Native Ollama: `POST /api/generate`, `POST /api/chat`, `POST /api/embeddings`, `POST /api/embed`, `GET /api/tags`, `GET /api/version`, `GET /api/ps`, `POST /api/show`
+  - OpenAI-Compatible: `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `GET /v1/models` (and `GET /v1/models/*`)
 - **Blocked Sensitive Mutating Operations** (rejected with `403 Forbidden`):
   - Model pulling: `POST /api/pull`
   - Model deletion: `DELETE /api/delete`
@@ -357,14 +360,13 @@ By default, `olp-proxy` enforces strict **read-only mode** (`read_only = true`),
   - Model copying: `POST /api/copy`
   - Raw blob uploads / inspections: `POST /api/blobs/*`, `HEAD /api/blobs/*`
 
-To allow sensitive operations in controlled environments:
-- On `olp-proxy`: launch with `--allow-sensitive-ops` or set `read_only = false` in `proxy.toml`.
-
-### 2. Control Hierarchy & Mutual Exclusion
-To eliminate split-brain security policies across distributed clusters, security policy is governed by a **strict mutual exclusion rule**:
-- **Proxy Authority (Default)**: `policy_authority = "proxy"` in `proxy.toml`. The proxy is the single source of truth. Connecting `olp-server` instances are **strictly prohibited** from specifying `read_only` policy. If an `olp-server` attempts to override policy, tunnel registration fails immediately with `CRITICAL CONFIG CONFLICT`, and the server process halts.
-- **Server Authority**: If `policy_authority = "server"` is configured in `proxy.toml`, the proxy delegates policy to individual connecting servers. In this mode, `olp-server` instances control policy via `--read-only` / `--allow-sensitive-ops` or `read_only` in `server.toml`.
-- Both controls **cannot coexist**. Startup will abort with critical warnings if conflicting configurations are detected.
+### 2. Policy Alignment & Stricter-Setting-Wins Resolution
+To protect both the public proxy and private GPU owners without split-brain security policies:
+- **Default (Not Enforced as RO by Default)**: By default, `read_only = false` in `proxy.toml`.
+- **Policy Alignment**: Both proxy and server are permitted to set policy as long as they are aligned (e.g., both set `read_only = true` or both set `read_only = false`).
+- **GPU Owners Can Restrict Themselves (Stricter Setting Wins)**: A connecting `olp-server` is **always** allowed to restrict itself further. If `olp-proxy` has `read_only = false`, an `olp-server` setting `read_only = true` in `server.toml` is accepted immediately, and the proxy enforces `read_only = true` on that server's port. The GPU owner remains protected even when connecting to a public or hosted proxy.
+- **Loosening Restrictions Prohibited**: A connecting `olp-server` cannot loosen the proxy's stricter policy. If `olp-proxy` is configured with `read_only = true` and a server attempts to connect with `read_only = false`, registration is rejected with `CRITICAL CONFIG CONFLICT`.
+- **Server Delegation Authority**: If `policy_authority = "server"` is configured in `proxy.toml`, the proxy explicitly delegates policy to individual connecting servers.
 
 ### 3. Strict TLS & Broken Certificate Defense
 - **TLS by Default**: Unencrypted plain HTTP public endpoints are disabled by default (`tls.mode = "manual"`).

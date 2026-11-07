@@ -174,7 +174,7 @@ pub struct ProxySecuritySection {
     pub max_auth_failures_per_min: u32,
     #[serde(default = "default_max_concurrent_streams")]
     pub max_concurrent_streams: usize,
-    #[serde(default = "default_read_only_true")]
+    #[serde(default = "default_read_only_false")]
     pub read_only: bool,
     #[serde(default = "default_policy_authority")]
     pub policy_authority: String,
@@ -190,8 +190,8 @@ pub struct ProxySecuritySection {
     pub hash_passkeys: bool,
 }
 
-fn default_read_only_true() -> bool {
-    true
+fn default_read_only_false() -> bool {
+    false
 }
 
 fn default_hash_passkeys_false() -> bool {
@@ -225,7 +225,7 @@ impl Default for ProxySecuritySection {
             allowed_user_cidrs: default_allowed_cidrs(),
             max_auth_failures_per_min: default_max_auth_failures(),
             max_concurrent_streams: default_max_concurrent_streams(),
-            read_only: true,
+            read_only: false,
             policy_authority: "proxy".to_string(),
             max_request_body_size_mb: default_max_request_body_size_mb(),
             max_active_requests_per_server: default_max_active_requests_per_server(),

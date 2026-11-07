@@ -985,49 +985,81 @@ async fn handle_incoming_tunnel(
     }
 
     // Step 8b: Policy enforcement and conflict checking
-    // Rule: "The two controls cannot coexist... you cannot control the behavior both on server and proxy. Only one can be used."
-    if state.config.security.policy_authority == "proxy" {
-        if register.policy_override.is_some() {
-            let conflict_msg = format!(
-                "CRITICAL CONFIG CONFLICT: Sensitive operation controls cannot coexist on both proxy and server!\n\
-                 olp-proxy is currently configured as policy authority (read_only = {}). Server '{}' also attempted to specify policy.\n\
-                 Only one side can control policy. Remove `read_only` from server.toml, or configure `policy_authority = \"server\"` in proxy.toml.",
-                state.config.security.read_only,
-                register.olp_server_id
-            );
-            error!("\n================================================================================\n{}\n================================================================================", conflict_msg);
-            let _ = write_frame(
-                &mut tls_stream,
-                &TunnelEstablished {
-                    accepted: false,
-                    assigned_port: 0,
-                    message: conflict_msg.clone(),
-                },
-            )
-            .await;
-            return Err(anyhow!(conflict_msg));
-        }
+    // Rule:
+    // 1. Both proxy and server can configure policy as long as they are aligned.
+    // 2. The stricter setting wins (a server can always restrict itself further to read_only = true).
+    // 3. Only an attempt by a server to loosen the proxy's stricter policy (proxy RO=true, server RO=false) is rejected.
+    let proxy_ro = server_cfg
+        .read_only
+        .unwrap_or(state.config.security.read_only);
+    let server_ro = register.policy_override;
 
-        // Proxy controls policy (default: read_only = true)
-        let is_ro = server_cfg
-            .read_only
-            .unwrap_or(state.config.security.read_only);
-        info!(
-            "[POLICY] Proxy controls policy for server '{}': read_only = {} (sensitive Ollama operations {})",
-            register.olp_server_id,
-            is_ro,
-            if is_ro { "BLOCKED" } else { "ALLOWED" }
-        );
-        worker.read_only.store(is_ro, Ordering::Relaxed);
+    let effective_ro = if state.config.security.policy_authority == "proxy" {
+        match (proxy_ro, server_ro) {
+            // Case 1: Proxy enforces read_only = true, but server attempts to loosen it with read_only = false -> CONFLICT!
+            (true, Some(false)) => {
+                let conflict_msg = format!(
+                    "CRITICAL CONFIG CONFLICT: Server '{}' attempted to loosen security policy!\n\
+                     olp-proxy enforces stricter policy (read_only = true), but server requested read_only = false.\n\
+                     A server can restrict itself further or align with proxy policy, but cannot loosen proxy restrictions.",
+                    register.olp_server_id
+                );
+                error!("\n================================================================================\n{}\n================================================================================", conflict_msg);
+                let _ = write_frame(
+                    &mut tls_stream,
+                    &TunnelEstablished {
+                        accepted: false,
+                        assigned_port: 0,
+                        message: conflict_msg.clone(),
+                    },
+                )
+                .await;
+                return Err(anyhow!(conflict_msg));
+            }
+            // Case 2: Proxy has read_only = false, but server restricts itself with read_only = true -> Stricter wins!
+            (false, Some(true)) => {
+                info!(
+                    "[POLICY] Server '{}' restricted policy to read_only = true (stricter setting wins over proxy read_only = false)",
+                    register.olp_server_id
+                );
+                true
+            }
+            // Case 3: Both proxy and server are aligned on read_only = true
+            (true, Some(true)) => {
+                info!(
+                    "[POLICY] Server '{}' and proxy are aligned on read_only = true (sensitive Ollama operations BLOCKED)",
+                    register.olp_server_id
+                );
+                true
+            }
+            // Case 4: Both proxy and server are aligned on read_only = false
+            (false, Some(false)) => {
+                info!(
+                    "[POLICY] Server '{}' and proxy are aligned on read_only = false (sensitive Ollama operations ALLOWED)",
+                    register.olp_server_id
+                );
+                false
+            }
+            // Case 5: Server did not specify policy (None) -> proxy setting applies
+            (proxy_val, None) => {
+                info!(
+                    "[POLICY] Proxy controls policy for server '{}': read_only = {} (sensitive Ollama operations {})",
+                    register.olp_server_id,
+                    proxy_val,
+                    if proxy_val { "BLOCKED" } else { "ALLOWED" }
+                );
+                proxy_val
+            }
+        }
     } else if state.config.security.policy_authority == "server" {
-        if let Some(server_ro) = register.policy_override {
+        if let Some(s_ro) = server_ro {
             info!(
-                "[POLICY] Server '{}' controls policy: read_only = {} (sensitive Ollama operations {})",
+                "[POLICY] Server '{}' controls policy (delegated by proxy): read_only = {} (sensitive Ollama operations {})",
                 register.olp_server_id,
-                server_ro,
-                if server_ro { "BLOCKED" } else { "ALLOWED" }
+                s_ro,
+                if s_ro { "BLOCKED" } else { "ALLOWED" }
             );
-            worker.read_only.store(server_ro, Ordering::Relaxed);
+            s_ro
         } else {
             let conflict_msg = format!(
                 "CRITICAL CONFIG ERROR: Proxy is configured with `policy_authority = \"server\"`, but server '{}' did not specify policy (read_only is unset in server.toml).\n\
@@ -1051,7 +1083,9 @@ async fn handle_incoming_tunnel(
             "Invalid security.policy_authority '{}' in proxy.toml (must be 'proxy' or 'server')",
             state.config.security.policy_authority
         ));
-    }
+    };
+
+    worker.read_only.store(effective_ro, Ordering::Relaxed);
 
     // Step 9: Acknowledge tunnel registration before upgrading stream to Yamux
     write_frame(

@@ -26,14 +26,17 @@ olp_api_keys = ["admin_key_abc123"]
 [security]
 # Read-only mode disallows sensitive mutating Ollama operations:
 # (POST /api/pull, DELETE /api/delete, POST /api/create, POST /api/push, POST /api/copy, raw blobs)
-# Safe inference and read operations are permitted (generate, chat, embeddings, embed, tags, version, show, ps).
-# Enabled by default (read_only = true) to prevent public or untrusted clients from pulling or deleting models.
-read_only = true
+# Safe inference and read operations are permitted (native /api/generate, /api/chat, /api/tags, /api/show,
+# and OpenAI-compatible /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models).
+# Defaults to false (not enforced as RO by default). Set to true to enforce read-only from proxy.
+read_only = false
 
-# Policy Authority determines whether proxy or server controls sensitive operation permissions:
-# - "proxy" (default): olp-proxy dictates read-only policy. olp-servers are prohibited from specifying read_only
-#                      (handshake will abort with CRITICAL CONFIG CONFLICT if both attempt control).
-# - "server": olp-proxy delegates policy enforcement to individual connecting olp-servers.
+# Policy Authority and Stricter-Setting-Wins Resolution:
+# - "proxy" (default): olp-proxy policy applies by default.
+#   * Both sides can specify policy as long as they are aligned.
+#   * A server can always restrict itself further (if proxy has read_only = false, server can set read_only = true; stricter wins).
+#   * Only an attempt by a server to loosen a proxy's stricter policy (proxy RO=true, server RO=false) is rejected.
+# - "server": olp-proxy delegates full policy control to individual connecting olp-servers.
 policy_authority = "proxy"
 
 # Default CIDR blocks for tunnel connections from olp-server (defaults to all: ["0.0.0.0/0", "::/0"])

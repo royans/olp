@@ -96,17 +96,29 @@ impl ServerAuthRegister {
 
 /// Returns true if the HTTP method and path target a sensitive or mutating Ollama operation
 /// (such as downloading/pulling models, deleting models, creating custom models, copying, or pushing).
-/// Read-only inference and status endpoints (generate, chat, embeddings, embed, tags, version, show, ps) return false.
+/// Read-only inference and status endpoints return false:
+/// - Native Ollama: generate, chat, embeddings, embed, tags, version, show, ps
+/// - OpenAI-compatible: /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/models (and /v1/models/*)
 pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
     let raw_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
     let normalized_path = if raw_path.is_empty() { "/" } else { raw_path };
 
     match (method, normalized_path) {
-        (&hyper::Method::GET, "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps") => false,
-        (&hyper::Method::HEAD, "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps") => false,
+        (
+            &hyper::Method::GET | &hyper::Method::HEAD,
+            "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps" | "/v1/models",
+        ) => false,
+        (&hyper::Method::GET | &hyper::Method::HEAD, p) if p.starts_with("/v1/models/") => false,
         (
             &hyper::Method::POST,
-            "/api/generate" | "/api/chat" | "/api/embeddings" | "/api/embed" | "/api/show",
+            "/api/generate"
+            | "/api/chat"
+            | "/api/embeddings"
+            | "/api/embed"
+            | "/api/show"
+            | "/v1/chat/completions"
+            | "/v1/completions"
+            | "/v1/embeddings",
         ) => false,
         // All mutating operations (e.g. POST /api/pull, DELETE /api/delete, POST /api/push,
         // POST /api/create, POST /api/copy, /api/blobs/*, etc.) or unknown verbs are sensitive.
@@ -374,6 +386,17 @@ mod tests {
         assert!(!is_sensitive_ollama_op(&Method::POST, "/api/embeddings"));
         assert!(!is_sensitive_ollama_op(&Method::POST, "/api/embed"));
         assert!(!is_sensitive_ollama_op(&Method::POST, "/api/show"));
+
+        // OpenAI-Compatible Safe / Read-Only endpoints
+        assert!(!is_sensitive_ollama_op(&Method::GET, "/v1/models"));
+        assert!(!is_sensitive_ollama_op(&Method::HEAD, "/v1/models"));
+        assert!(!is_sensitive_ollama_op(&Method::GET, "/v1/models/llama3"));
+        assert!(!is_sensitive_ollama_op(
+            &Method::POST,
+            "/v1/chat/completions"
+        ));
+        assert!(!is_sensitive_ollama_op(&Method::POST, "/v1/completions"));
+        assert!(!is_sensitive_ollama_op(&Method::POST, "/v1/embeddings"));
 
         // Sensitive / Mutating endpoints
         assert!(is_sensitive_ollama_op(&Method::POST, "/api/pull"));
