@@ -72,6 +72,10 @@ struct Args {
     #[arg(long)]
     insecure_no_tls: bool,
 
+    /// Store passkeys in TOML profiles as salted BLAKE3 one-way hashes instead of editable plaintext
+    #[arg(long)]
+    hash_passkeys: bool,
+
     /// Initialize ~/.olp/proxy.toml with passkeys and settings, then exit without starting listener
     #[arg(long)]
     init_only: bool,
@@ -145,6 +149,7 @@ async fn main() -> Result<()> {
         } else {
             None
         },
+        hash_passkeys: if args.hash_passkeys { Some(true) } else { None },
     };
 
     let cfg = ensure_proxy_initialized(&config_path, args.non_interactive, overrides)?;

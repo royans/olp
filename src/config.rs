@@ -99,7 +99,7 @@ pub struct UserServerConfig {
     pub reserved: bool,
     #[serde(default)]
     pub passkey_user: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passkey_user_hash: Option<String>,
     #[serde(default = "default_allowed_cidrs")]
     pub allowed_user_cidrs: Vec<String>,
@@ -113,6 +113,11 @@ pub struct UserServerConfig {
 
 impl UserServerConfig {
     pub fn get_verifier(&self) -> crate::keys::PasskeyVerifier {
+        // If passkey_user is set (user-editable plaintext mode), use it directly.
+        // If passkey_user is empty and passkey_user_hash is present (salted hash mode), use the hash.
+        if !self.passkey_user.is_empty() {
+            return crate::keys::PasskeyVerifier::from_passkey(&self.passkey_user);
+        }
         if let Some(ref h) = self.passkey_user_hash {
             if let Some(v) = crate::keys::PasskeyVerifier::from_encoded_hash(h) {
                 return v;
@@ -181,10 +186,16 @@ pub struct ProxySecuritySection {
     pub max_requests_per_min: u32,
     #[serde(default = "default_connection_timeout_sec")]
     pub connection_timeout_sec: u64,
+    #[serde(default = "default_hash_passkeys_false")]
+    pub hash_passkeys: bool,
 }
 
 fn default_read_only_true() -> bool {
     true
+}
+
+fn default_hash_passkeys_false() -> bool {
+    false
 }
 
 fn default_policy_authority() -> String {
@@ -220,6 +231,7 @@ impl Default for ProxySecuritySection {
             max_active_requests_per_server: default_max_active_requests_per_server(),
             max_requests_per_min: default_max_requests_per_min(),
             connection_timeout_sec: default_connection_timeout_sec(),
+            hash_passkeys: false,
         }
     }
 }
@@ -596,6 +608,7 @@ pub struct ProxyCliOverrides {
     pub access_log: Option<String>,
     pub auto_git_pull: Option<bool>,
     pub read_only: Option<bool>,
+    pub hash_passkeys: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -679,6 +692,10 @@ pub fn ensure_proxy_initialized(
         }
         if let Some(val) = overrides.read_only {
             cfg.security.read_only = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.hash_passkeys {
+            cfg.security.hash_passkeys = val;
             modified = true;
         }
         if let Some(val) = overrides.allow_broken_certs {
@@ -783,6 +800,9 @@ pub fn ensure_proxy_initialized(
     }
     if let Some(val) = overrides.read_only {
         cfg.security.read_only = val;
+    }
+    if let Some(val) = overrides.hash_passkeys {
+        cfg.security.hash_passkeys = val;
     }
     if let Some(val) = overrides.allow_broken_certs {
         cfg.tls.allow_broken_certs = val;

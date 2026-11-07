@@ -143,6 +143,7 @@ pub struct PortWorker {
     pub user_verifier: RwLock<PasskeyVerifier>,
     pub user_ip_filter: RwLock<Arc<IpFilter>>,
     pub assigned_server_id: RwLock<Option<String>>,
+    pub assigned_api_key: RwLock<Option<String>>,
     pub read_only: AtomicBool,
     pub concurrency_semaphore: Arc<tokio::sync::Semaphore>,
     pub request_rate_limiter: Arc<crate::keys::RequestRateLimiter>,
@@ -550,16 +551,20 @@ impl ProxyState {
             }
         };
 
-        // 6. Persist into user profile with salted one-way hash
+        // 6. Persist into user profile (plaintext by default for easy manual editing; salted hash if hash_passkeys is enabled)
         let existing = profile.servers.get(server_id).cloned();
-        let passkey_hash = PasskeyVerifier::from_passkey(passkey_user).to_encoded_hash();
+        let (passkey_user_val, passkey_user_hash_val) = if self.config.security.hash_passkeys {
+            ("".to_string(), Some(PasskeyVerifier::from_passkey(passkey_user).to_encoded_hash()))
+        } else {
+            (passkey_user.to_string(), None)
+        };
         profile.servers.insert(
             server_id.to_string(),
             UserServerConfig {
                 port,
                 reserved: existing.as_ref().map(|s| s.reserved).unwrap_or(false),
-                passkey_user: "".to_string(), // Omit plaintext from disk
-                passkey_user_hash: Some(passkey_hash),
+                passkey_user: passkey_user_val,
+                passkey_user_hash: passkey_user_hash_val,
                 allowed_user_cidrs: existing
                     .as_ref()
                     .map(|s| s.allowed_user_cidrs.clone())
@@ -965,6 +970,7 @@ async fn handle_incoming_tunnel(
         *worker.user_verifier.write().unwrap() = server_cfg.get_verifier();
         *worker.user_ip_filter.write().unwrap() = Arc::new(IpFilter::new(&server_cfg.allowed_user_cidrs)?);
         *worker.assigned_server_id.write().unwrap() = Some(register.olp_server_id.clone());
+        *worker.assigned_api_key.write().unwrap() = Some(register.olp_api_key.clone());
     }
 
     // Step 8b: Policy enforcement and conflict checking
@@ -1112,6 +1118,7 @@ fn get_or_create_port_worker(
         user_verifier: RwLock::new(PasskeyVerifier::from_passkey("")),
         user_ip_filter: RwLock::new(default_user_filter),
         assigned_server_id: RwLock::new(None),
+        assigned_api_key: RwLock::new(None),
         read_only: AtomicBool::new(state.config.security.read_only),
         concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(max_active)),
         request_rate_limiter: Arc::new(crate::keys::RequestRateLimiter::new(
@@ -1339,10 +1346,37 @@ async fn handle_public_http_request(
     }
 
     // 4. Verify passkey_user using Basic Auth or Bearer Token in constant time BEFORE body collection
-    let is_auth_valid = {
+    let mut is_auth_valid = {
         let verifier = worker.user_verifier.read().unwrap();
         verify_http_headers_auth(req.headers(), &verifier)
     };
+
+    // If initial verification failed against in-memory cache, reload profile from disk
+    // in case the user manually edited ~/.olp/config/<api_key>.toml
+    if !is_auth_valid {
+        let ids = {
+            let s_id = worker.assigned_server_id.read().unwrap().clone();
+            let a_key = worker.assigned_api_key.read().unwrap().clone();
+            match (s_id, a_key) {
+                (Some(s), Some(k)) => Some((s, k)),
+                _ => None,
+            }
+        };
+        if let Some((server_id, api_key)) = ids {
+            if let Ok(profile) = state.load_user_profile(&api_key) {
+                if let Some(fresh_server_cfg) = profile.servers.get(&server_id) {
+                    let fresh_verifier = fresh_server_cfg.get_verifier();
+                    if verify_http_headers_auth(req.headers(), &fresh_verifier) {
+                        *worker.user_verifier.write().unwrap() = fresh_verifier;
+                        if let Ok(new_filter) = IpFilter::new(&fresh_server_cfg.allowed_user_cidrs) {
+                            *worker.user_ip_filter.write().unwrap() = Arc::new(new_filter);
+                        }
+                        is_auth_valid = true;
+                    }
+                }
+            }
+        }
+    }
 
     if !is_auth_valid {
         state.rate_limiter.record_failure(client_ip);

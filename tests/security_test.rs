@@ -1824,6 +1824,10 @@ async fn test_user_profile_salted_hash_passkey_verification() {
     });
 
     let user_key = "hash_storage_user";
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    let _ = std::fs::remove_file(&profile_path);
+
     let proxy_cfg = ProxyConfig {
         proxy: ProxySection {
             listen_addr: "127.0.0.1:0".to_string(),
@@ -1834,7 +1838,10 @@ async fn test_user_profile_salted_hash_passkey_verification() {
         auth: ProxyAuthSection {
             olp_api_keys: vec![user_key.to_string()],
         },
-        security: ProxySecuritySection::default(),
+        security: ProxySecuritySection {
+            hash_passkeys: true,
+            ..Default::default()
+        },
         tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
@@ -1873,12 +1880,10 @@ async fn test_user_profile_salted_hash_passkey_verification() {
     }
 
     // Inspect user profile file on disk
-    let config_dir = olp_config_dir().unwrap();
-    let profile_path = config_dir.join(format!("{}.toml", user_key));
     assert!(profile_path.exists());
     let profile_content = std::fs::read_to_string(&profile_path).unwrap();
 
-    // Verify plaintext passkey is NOT stored on disk!
+    // Verify plaintext passkey is NOT stored on disk when hash_passkeys = true!
     assert!(!profile_content.contains(raw_passkey), "Plaintext passkey must not be saved on disk!");
     assert!(profile_content.contains("passkey_user_hash = \"$blake3$"));
 
@@ -1890,6 +1895,120 @@ async fn test_user_profile_salted_hash_passkey_verification() {
     let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(resp.contains("200 OK"), "Authentication must succeed with passkey against stored hash");
+
+    let _ = std::fs::remove_file(&profile_path);
+}
+
+#[tokio::test]
+async fn test_user_profile_default_plaintext_passkey_manual_editing() {
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = mock_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await;
+                });
+            }
+        }
+    });
+
+    let user_key = "plain_storage_user";
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    let _ = std::fs::remove_file(&profile_path);
+
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19700-19800".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection::default(), // default has hash_passkeys: false
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let initial_passkey = "initial_plain_user_pass!";
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_plain_test".to_string(),
+            passkey_user: initial_passkey.to_string(),
+            remote_port: Some(19750),
+            tls_verify: Some(false),
+            read_only: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:19750").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 1. Inspect user profile file on disk: verify default plaintext storage for manual editing
+    assert!(profile_path.exists());
+    let profile_content = std::fs::read_to_string(&profile_path).unwrap();
+    assert!(
+        profile_content.contains(&format!("passkey_user = \"{}\"", initial_passkey)),
+        "Profile TOML must contain plaintext passkey by default for user editing"
+    );
+    assert!(
+        !profile_content.contains("passkey_user_hash"),
+        "passkey_user_hash should not be present when default hash_passkeys is false"
+    );
+
+    // 2. Verify initial passkey works
+    let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19750").await.unwrap();
+    let req1 = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19750\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", initial_passkey);
+    tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n1 = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf).await.unwrap();
+    let resp1 = String::from_utf8_lossy(&buf[..n1]);
+    assert!(resp1.contains("200 OK"), "Authentication must succeed with initial passkey");
+
+    // 3. User manually modifies ~/.olp/config/<api_key>.toml in their text editor!
+    let edited_passkey = "my_hand_edited_custom_password_456!";
+    let modified_content = profile_content.replace(initial_passkey, edited_passkey);
+    std::fs::write(&profile_path, modified_content).unwrap();
+
+    // 4. Verify the newly edited passkey is immediately accepted by the proxy!
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19750").await.unwrap();
+    let req2 = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19750\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", edited_passkey);
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes()).await.unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf).await.unwrap();
+    let resp2 = String::from_utf8_lossy(&buf[..n2]);
+    assert!(resp2.contains("200 OK"), "Authentication must succeed with user's manually edited passkey: {}", resp2);
+
+    // 5. Old passkey must now be rejected
+    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:19750").await.unwrap();
+    let req3 = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19750\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", initial_passkey);
+    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req3.as_bytes()).await.unwrap();
+    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut buf).await.unwrap();
+    let resp3 = String::from_utf8_lossy(&buf[..n3]);
+    assert!(resp3.contains("401 Unauthorized"), "Old passkey must be rejected: {}", resp3);
 
     let _ = std::fs::remove_file(&profile_path);
 }

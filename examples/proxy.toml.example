@@ -65,6 +65,12 @@ max_requests_per_min = 300
 # Connection idle timeout in seconds (default: 120). Stalled or slowloris connections are closed after this duration.
 connection_timeout_sec = 120
 
+# Passkey storage format in ~/.olp/config/<api_key>.toml (default: false).
+# By default (false), passkeys are stored in plaintext (protected by 0600 private permissions)
+# so users and administrators can easily view, inspect, and modify them in any text editor.
+# Set to true to store passkeys as salted BLAKE3 one-way hashes (passkey_user_hash) instead.
+# hash_passkeys = false
+
 [tls]
 # Public Ollama endpoint TLS mode: "manual" (Let's Encrypt / custom PEM), "self-signed", or "off"
 # NOTE: Non-TLS connections are disabled by default ("manual").

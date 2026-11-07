@@ -214,7 +214,11 @@ disabled = false
 [servers.srv_Bc9bOUPj]
 port = 10000
 reserved = false
-passkey_user_hash = "$blake3$zl77O1CIXmtaaXJ9X200Blf6A258Fe467ZSYgyCPFyk=$6YWrxHckT0ezytY2DpD0Q+ETerdIWSbDx8PAgP055FE="
+# By default, passkey_user is stored in plaintext (protected by 0600 file permissions)
+# so users and admins can easily view and modify passwords manually in any text editor.
+passkey_user = "your-client-passkey"
+# When hash_passkeys = true is enabled in proxy.toml, salted BLAKE3 one-way hashes are stored instead:
+# passkey_user_hash = "$blake3$zl77O1CIXmtaaXJ9X200Blf6A258Fe467ZSYgyCPFyk=$6YWrxHckT0ezytY2DpD0Q+ETerdIWSbDx8PAgP055FE="
 allowed_user_cidrs = ["0.0.0.0/0", "::/0"]
 allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
 created_at = "07/Nov/2026:04:25:24 +0000"
@@ -385,8 +389,9 @@ Access logs strictly omit sensitive data:
 - **Authenticated Request Rate Limiting (`max_requests_per_min`)**: Limits inference requests from authorized clients (default: 300 req/min) to prevent accidental loops or resource hogging.
 - **Connection Timeout (`connection_timeout_sec`)**: Idle and slowloris connections are closed after 120 seconds.
 
-### 7. Salted One-Way Hash Storage on Disk
-- In `~/.olp/config/<olp_api_key>.toml`, client credentials are saved as salted BLAKE3 one-way hashes (`passkey_user_hash = "$blake3$<salt>$<hash>"`). Plaintext passkeys are **never** persisted to disk on `olp-proxy`.
+### 7. User Profile Storage & Optional Salted Passkey Hashing
+- **Default User-Editable Storage**: In `~/.olp/config/<olp_api_key>.toml`, passkeys are stored as `passkey_user = "..."` with strict `0600` private file permissions. This allows users and administrators to easily inspect, hand-edit, and update client passkeys in any text editor. Changes take effect dynamically without restarting `olp-proxy`.
+- **Opt-In Salted One-Way Hashing (`hash_passkeys = true`)**: For environments requiring zero-plaintext credential persistence, administrators can enable `hash_passkeys = true` in `proxy.toml` under `[security]` (or pass `--hash-passkeys` CLI flag). When enabled, passkeys are saved exclusively as salted BLAKE3 one-way hashes (`passkey_user_hash = "$blake3$<salt>$<hash>"`).
 
 ---
 
