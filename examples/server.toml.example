@@ -38,3 +38,8 @@ initial_delay_sec = 1
 max_delay_sec = 300
 heartbeat_interval_sec = 15
 heartbeat_timeout_sec = 5
+
+[maintenance]
+# Daily scheduled restart runs `git pull --ff-only` (+ rebuild) when installed from a git checkout.
+# Set to false (or "no") to pin the current version.
+auto_git_pull = true

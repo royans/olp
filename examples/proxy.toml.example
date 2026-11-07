@@ -40,8 +40,15 @@ max_concurrent_streams = 128
 [tls]
 # Public Ollama endpoint TLS mode: "off" (plain HTTP), "manual" (Let's Encrypt / custom PEM), or "self-signed"
 # NOTE: The reverse tunnel connection between olp-server and olp-proxy (:4443) is ALWAYS encrypted with TLS 1.3.
-# This [tls] section only controls the public user-facing port (e.g. :11434).
+# When mode is set to "manual" with valid cert_path and key_path (e.g. provisioned via ./renew-tls.sh),
+# the trusted CA certificate is also bound to control port :4443, enabling connecting olp-servers to verify
+# the proxy against Mozilla WebPKI CA roots (preventing MITM attacks).
 mode = "off"
 # If mode = "manual":
-# cert_path = "~/.olp/tls/fullchain.pem"
-# key_path = "~/.olp/tls/privkey.pem"
+# cert_path = "~/.olp/tls/cert.pem"
+# key_path = "~/.olp/tls/key.pem"
+
+[maintenance]
+# Daily scheduled restart runs `git pull --ff-only` (+ rebuild) when installed from a git checkout.
+# Set to false (or "no") to pin the current version.
+auto_git_pull = true

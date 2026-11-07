@@ -1,6 +1,6 @@
 # Ollama Proxy (`olp-proxy` & `olp-server`)
 
-[![Tests](https://img.shields.io/badge/tests-21%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen.svg)]()
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
 [![Memory Footprint](https://img.shields.io/badge/memory-%3C5MB%20RAM-success.svg)]()
@@ -165,7 +165,7 @@ listener_grace_period_sec = 60
 access_log = "~/.olp/access.log" # Apache-style access log (set to "off" to disable)
 
 [auth]
-# User API keys: accepts an array of strings or a comma-delimited string
+# Multi-tenant API keys: accepts an array of strings or a comma-delimited string
 # Each key has its individual config at ~/.olp/config/<olp_api_key>.toml
 olp_api_keys = ["admin_key_abc123"]
 
@@ -176,9 +176,29 @@ max_auth_failures_per_min = 60
 max_concurrent_streams = 128
 
 [tls]
-mode = "off" # Set to "manual" when using Let's Encrypt / custom certs
-# cert_path = "~/.olp/tls/fullchain.pem"
-# key_path = "~/.olp/tls/privkey.pem"
+mode = "manual" # "off" (plain HTTP), "manual" (Let's Encrypt / custom PEM), or "self-signed"
+cert_path = "~/.olp/tls/cert.pem"
+key_path = "~/.olp/tls/key.pem"
+
+[maintenance]
+auto_git_pull = true
+```
+
+### `~/.olp/config/<olp_api_key>.toml` (Per-User Profile)
+```toml
+[user]
+api_key = "TXEVKeIG11rFUhekNvK64qBn"
+name = "admin"
+max_servers = 10
+disabled = false
+
+[servers.srv_Bc9bOUPj]
+port = 10000
+reserved = false
+passkey_user = "bobiscrazy!!"
+allowed_user_cidrs = ["0.0.0.0/0", "::/0"]
+allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
+created_at = "07/Nov/2026:04:25:24 +0000"
 ```
 
 ### `~/.olp/server.toml`
@@ -189,7 +209,7 @@ ollama_addr = "127.0.0.1:11434"
 olp_api_key = "your-user-api-key"
 olp_server_id = "srv_my_ollama_box"
 passkey_user = "your-client-passkey-for-this-server"
-# remote_port = 11434 # optional recommended port; proxy allocates dynamically if omitted
+# remote_port = 10000 # optional recommended port; proxy allocates dynamically if omitted
 
 # TLS CA Certificate Verification (optional, auto-detected)
 # Defaults to true for public domain names, false for localhost / 127.0.0.1.
@@ -217,37 +237,62 @@ Cline connects cleanly through `olp-proxy`:
 
 1. In Cline Settings, select **API Provider**: `Ollama`.
 2. Check **Use custom base URL**:
-   - `http://proxy.example.com:11434`
-3. Enter **Ollama API Key**: `<passkey_user>` (your `passkey_user` from `proxy.toml`).
+   - When TLS is enabled on proxy (`tls.mode = "manual"` or `"self-signed"`):
+     **`https://proxy.example.com:10000`** *(must use `https://`)*
+   - When TLS is disabled (`tls.mode = "off"`):
+     **`http://proxy.example.com:10000`**
+3. Enter **Ollama API Key**: `<passkey_user>` (your server's `passkey_user`).
 4. In **Model**, enter **any model name** (or `default`, `llama3.1`, etc.).
    - `olp-server` automatically routes to whatever model is loaded in Ollama (e.g. `hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M`).
 5. Click **Done** and start chatting!
+
+> **Plaintext HTTP on HTTPS Port Protection**: If a client accidentally sends an unencrypted `http://` request to an HTTPS-secured port, `olp-proxy` automatically intercepts the request and responds with a friendly JSON HTTP 400 error: `{"error":"The plain HTTP request was sent to HTTPS port. Please use https:// instead of http://"}`.
+
+---
+
+## Apache-Style Access Logging (`~/.olp/access.log`)
+
+`olp-proxy` features built-in high-performance asynchronous HTTP access logging for auditability and abuse analysis.
+
+### Log Format
+Each HTTP inference request appends a single structured entry to `~/.olp/access.log`:
+```text
+<Client_IP> - <Token_Preview> [<Timestamp>] "<Method> <Path> <Proto>" <Status> <Resp_Bytes> <Duration_ms>ms model="<Model>" req_bytes=<Req_Size> req="<Req_Snippet>" resp="<Resp_Snippet>"
+```
+
+### Example Log Lines
+```text
+127.0.0.1 - Bearer:bobiscrazy!! [07/Nov/2026:04:43:23 +0000] "GET /api/version HTTP/1.1" 200 20 4ms model="-" req_bytes=0 req="-" resp="{\"version\":\"0.32.6\"}"
+67.180.155.189 - Bearer:bobiscrazy!! [07/Nov/2026:04:45:10 +0000] "POST /api/chat HTTP/1.1" 200 3421 842ms model="qwen3.5" req_bytes=128 req="{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}" resp="{\"message\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}"
+```
+
+Set `access_log = "off"` under `[proxy]` in `proxy.toml` if you wish to disable request logging.
 
 ---
 
 ## Querying the Proxied Ollama
 
-### Using curl with Bearer Token (or custom API Key)
+### Using curl with Bearer Token (HTTPS or HTTP)
 ```bash
 # Model name can be anything: olp-server automatically rewrites it to whatever is loaded!
-curl -X POST http://proxy.example.com:11434/api/generate \
+curl -X POST https://proxy.example.com:10000/api/generate \
   -H "Authorization: Bearer <passkey_user>" \
   -d '{"model": "auto", "prompt": "Why is the sky blue?"}'
 
 # Or using x-api-key header:
-curl -X POST http://proxy.example.com:11434/api/generate \
+curl -X POST https://proxy.example.com:10000/api/generate \
   -H "x-api-key: <passkey_user>" \
   -d '{"model": "default", "prompt": "Hello!"}'
 ```
 
 ### Using curl with HTTP Basic Auth
 ```bash
-curl -u "user:<passkey_user>" http://proxy.example.com:11434/api/tags
+curl -u "user:<passkey_user>" https://proxy.example.com:10000/api/tags
 ```
 
 ### Using Official Ollama CLI
 ```bash
-export OLLAMA_HOST="http://user:<passkey_user>@proxy.example.com:11434"
+export OLLAMA_HOST="https://user:<passkey_user>@proxy.example.com:10000"
 ollama list
 ollama run default
 ```
