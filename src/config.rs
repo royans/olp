@@ -524,24 +524,119 @@ fn prompt_line(question: &str, default: &str) -> Result<String> {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ProxyCliOverrides {
+    pub listen_addr: Option<String>,
+    pub allowed_ports: Option<String>,
+    pub olp_api_keys: Option<Vec<String>>,
+    pub allowed_server_cidrs: Option<Vec<String>>,
+    pub allowed_user_cidrs: Option<Vec<String>>,
+    pub tls_mode: Option<String>,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
+    pub access_log: Option<String>,
+    pub auto_git_pull: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ServerCliOverrides {
+    pub proxy_addr: Option<String>,
+    pub ollama_addr: Option<String>,
+    pub remote_port: Option<u16>,
+    pub olp_api_key: Option<String>,
+    pub olp_server_id: Option<String>,
+    pub passkey_user: Option<String>,
+    pub tls_verify: Option<bool>,
+    pub auto_git_pull: Option<bool>,
+}
+
 /// Ensures `~/.olp/proxy.toml` and `~/.olp/config/` exist.
 /// If missing, initializes default settings with a random admin API key and profile.
 pub fn ensure_proxy_initialized(
     config_path: &Path,
     non_interactive: bool,
+    overrides: ProxyCliOverrides,
 ) -> Result<ProxyConfig> {
     let base_dir = olp_home_dir()?;
     ensure_secure_dir(&base_dir)?;
     let config_dir = olp_config_dir()?;
 
     if config_path.exists() {
-        return ProxyConfig::load_from_path(config_path);
+        let mut cfg = ProxyConfig::load_from_path(config_path)?;
+        let mut modified = false;
+
+        if let Some(val) = overrides.listen_addr {
+            cfg.proxy.listen_addr = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.allowed_ports {
+            cfg.proxy.allowed_ports = val;
+            modified = true;
+        }
+        if let Some(keys) = overrides.olp_api_keys {
+            for k in keys {
+                if !cfg.auth.olp_api_keys.contains(&k) {
+                    cfg.auth.olp_api_keys.push(k.clone());
+                    let profile_path = config_dir.join(format!("{}.toml", k));
+                    if !profile_path.exists() {
+                        let mut prof = UserProfile::new(&k);
+                        prof.user.name = Some("admin".to_string());
+                        let _ = prof.save_atomic(&profile_path);
+                    }
+                }
+            }
+            modified = true;
+        }
+        if let Some(cidrs) = overrides.allowed_server_cidrs {
+            cfg.security.allowed_server_cidrs = cidrs;
+            modified = true;
+        }
+        if let Some(cidrs) = overrides.allowed_user_cidrs {
+            cfg.security.allowed_user_cidrs = cidrs;
+            modified = true;
+        }
+        if let Some(val) = overrides.tls_mode {
+            cfg.tls.mode = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.tls_cert_path {
+            cfg.tls.cert_path = Some(val);
+            modified = true;
+        }
+        if let Some(val) = overrides.tls_key_path {
+            cfg.tls.key_path = Some(val);
+            modified = true;
+        }
+        if let Some(val) = overrides.access_log {
+            cfg.proxy.access_log = if val == "off" { None } else { Some(val) };
+            modified = true;
+        }
+        if let Some(val) = overrides.auto_git_pull {
+            cfg.maintenance.auto_git_pull = val;
+            modified = true;
+        }
+
+        if modified {
+            cfg.save_to_path(config_path)?;
+        }
+        return Ok(cfg);
     }
 
     let mut cfg = ProxyConfig::default_config();
-    let mut initial_api_key = generate_random_passkey();
+    let mut initial_api_key = overrides
+        .olp_api_keys
+        .as_ref()
+        .and_then(|keys| keys.first().cloned())
+        .unwrap_or_else(generate_random_passkey);
 
-    if !non_interactive && io::stdin().is_terminal() {
+    let has_overrides = overrides.listen_addr.is_some()
+        || overrides.allowed_ports.is_some()
+        || overrides.olp_api_keys.is_some()
+        || overrides.allowed_server_cidrs.is_some()
+        || overrides.allowed_user_cidrs.is_some()
+        || overrides.tls_mode.is_some();
+
+    if !non_interactive && !has_overrides && io::stdin().is_terminal() {
         println!("\n================================================================================");
         println!("  [olp-proxy] First-Time Configuration Setup");
         println!("================================================================================\n");
@@ -585,22 +680,59 @@ pub fn ensure_proxy_initialized(
             .collect();
     }
 
-    cfg.auth.olp_api_keys = vec![initial_api_key.clone()];
+    if let Some(val) = overrides.listen_addr {
+        cfg.proxy.listen_addr = val;
+    }
+    if let Some(val) = overrides.allowed_ports {
+        cfg.proxy.allowed_ports = val;
+    }
+    if let Some(cidrs) = overrides.allowed_server_cidrs {
+        cfg.security.allowed_server_cidrs = cidrs;
+    }
+    if let Some(cidrs) = overrides.allowed_user_cidrs {
+        cfg.security.allowed_user_cidrs = cidrs;
+    }
+    if let Some(val) = overrides.tls_mode {
+        cfg.tls.mode = val;
+    }
+    if let Some(val) = overrides.tls_cert_path {
+        cfg.tls.cert_path = Some(val);
+    }
+    if let Some(val) = overrides.tls_key_path {
+        cfg.tls.key_path = Some(val);
+    }
+    if let Some(val) = overrides.access_log {
+        cfg.proxy.access_log = if val == "off" { None } else { Some(val) };
+    }
+    if let Some(val) = overrides.auto_git_pull {
+        cfg.maintenance.auto_git_pull = val;
+    }
+
+    let all_keys = match overrides.olp_api_keys {
+        Some(k) if !k.is_empty() => k,
+        _ => vec![initial_api_key.clone()],
+    };
+    cfg.auth.olp_api_keys = all_keys.clone();
     cfg.save_to_path(config_path)?;
 
-    // Create default user profile in ~/.olp/config/<initial_api_key>.toml
-    let mut initial_profile = UserProfile::new(&initial_api_key);
-    initial_profile.user.name = Some("admin".to_string());
-    let profile_path = config_dir.join(format!("{}.toml", initial_api_key));
-    if !profile_path.exists() {
-        initial_profile.save_atomic(&profile_path)?;
+    // Create user profiles in ~/.olp/config/<key>.toml for each key
+    for key in &all_keys {
+        let profile_path = config_dir.join(format!("{}.toml", key));
+        if !profile_path.exists() {
+            let mut prof = UserProfile::new(key);
+            prof.user.name = Some("admin".to_string());
+            prof.save_atomic(&profile_path)?;
+        }
     }
+
+    let first_key = all_keys.first().cloned().unwrap_or(initial_api_key);
+    let first_profile = config_dir.join(format!("{}.toml", first_key));
 
     println!("\n================================================================================");
     println!("  [olp-proxy] Configuration saved to {}", config_path.display());
     println!("  ----------------------------------------------------------------------------");
-    println!("  olp_api_key  : {}", initial_api_key);
-    println!("  user profile : {}", profile_path.display());
+    println!("  olp_api_key  : {}", first_key);
+    println!("  user profile : {}", first_profile.display());
     println!("  ----------------------------------------------------------------------------");
     println!("  * olp_api_key : Put this in your olp-server's server.toml");
     println!("  * You can create additional user keys at ~/.olp/config/<new_key>.toml");
@@ -613,24 +745,72 @@ pub fn ensure_proxy_initialized(
 pub fn ensure_server_initialized(
     config_path: &Path,
     non_interactive: bool,
+    overrides: ServerCliOverrides,
 ) -> Result<ServerConfig> {
     let base_dir = olp_home_dir()?;
     ensure_secure_dir(&base_dir)?;
 
     if config_path.exists() {
         let mut cfg = ServerConfig::load_from_path(config_path)?;
+        let mut modified = false;
+
+        if let Some(val) = overrides.proxy_addr {
+            cfg.server.proxy_addr = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.ollama_addr {
+            cfg.server.ollama_addr = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.remote_port {
+            cfg.server.remote_port = Some(val);
+            modified = true;
+        }
+        if let Some(val) = overrides.olp_api_key {
+            cfg.server.olp_api_key = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.olp_server_id {
+            cfg.server.olp_server_id = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.passkey_user {
+            cfg.server.passkey_user = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.tls_verify {
+            cfg.server.tls_verify = Some(val);
+            modified = true;
+        }
+        if let Some(val) = overrides.auto_git_pull {
+            cfg.maintenance.auto_git_pull = val;
+            modified = true;
+        }
+
         if cfg.server.olp_server_id.is_empty() {
             cfg.server.olp_server_id = generate_random_server_id();
+            modified = true;
+        }
+        if modified {
             cfg.save_to_path(config_path)?;
         }
         return Ok(cfg);
     }
 
     let mut cfg = ServerConfig::default_config();
-    cfg.server.olp_server_id = generate_random_server_id();
-    cfg.server.passkey_user = generate_random_passkey();
+    cfg.server.olp_server_id = overrides
+        .olp_server_id
+        .unwrap_or_else(generate_random_server_id);
+    cfg.server.passkey_user = overrides
+        .passkey_user
+        .unwrap_or_else(generate_random_passkey);
 
-    if !non_interactive && io::stdin().is_terminal() {
+    let has_overrides = overrides.proxy_addr.is_some()
+        || overrides.olp_api_key.is_some()
+        || overrides.ollama_addr.is_some()
+        || overrides.remote_port.is_some();
+
+    if !non_interactive && !has_overrides && io::stdin().is_terminal() {
         println!("\n================================================================================");
         println!("  [olp-server] First-Time Configuration Setup");
         println!("================================================================================\n");
@@ -685,6 +865,25 @@ pub fn ensure_server_initialized(
         if !custom_passkey_user.is_empty() {
             cfg.server.passkey_user = custom_passkey_user;
         }
+    }
+
+    if let Some(val) = overrides.proxy_addr {
+        cfg.server.proxy_addr = val;
+    }
+    if let Some(val) = overrides.ollama_addr {
+        cfg.server.ollama_addr = val;
+    }
+    if let Some(val) = overrides.remote_port {
+        cfg.server.remote_port = Some(val);
+    }
+    if let Some(val) = overrides.olp_api_key {
+        cfg.server.olp_api_key = val;
+    }
+    if let Some(val) = overrides.tls_verify {
+        cfg.server.tls_verify = Some(val);
+    }
+    if let Some(val) = overrides.auto_git_pull {
+        cfg.maintenance.auto_git_pull = val;
     }
 
     if cfg.server.olp_api_key.is_empty() {

@@ -22,6 +22,9 @@ CONFIG_FILE="${OLP_CONFIG:-$OLP_DATA_DIR/proxy.toml}"
 # by this script and never forwarded to the binary (its CLI rejects positionals).
 CLEAN_ARGS=()
 EXPECT_CONFIG_VALUE=0
+NON_INTERACTIVE=0
+INIT_ONLY=0
+HELP_OR_VERSION=""
 for arg in "$@"; do
     if [ "$EXPECT_CONFIG_VALUE" -eq 1 ]; then
         CONFIG_FILE="$arg"
@@ -34,6 +37,18 @@ for arg in "$@"; do
             DAEMON_MODE=1
             ;;
         restart|ensure)
+            ;;
+        --non-interactive)
+            NON_INTERACTIVE=1
+            CLEAN_ARGS+=("$arg")
+            ;;
+        --init-only)
+            INIT_ONLY=1
+            CLEAN_ARGS+=("$arg")
+            ;;
+        --help|-h|--version|-V)
+            HELP_OR_VERSION="$arg"
+            CLEAN_ARGS+=("$arg")
             ;;
         -c|--config)
             EXPECT_CONFIG_VALUE=1
@@ -304,7 +319,7 @@ manage_cronjob() {
     fi
 
     # Nothing installed yet: offer to install (interactive runs only).
-    if [ "$DAEMON_MODE" -eq 0 ] && [ -t 0 ]; then
+    if [ "$DAEMON_MODE" -eq 0 ] && [ "$NON_INTERACTIVE" -eq 0 ] && [ -t 0 ]; then
         echo ""
         echo "================================================================================"
         echo "  [olp-proxy] Automated Cronjob Setup"
@@ -501,6 +516,15 @@ else
     fi
 fi
 
+# Handle immediate help / version / init-only flags
+if [ -n "$HELP_OR_VERSION" ]; then
+    exec "$BIN_PATH" "$HELP_OR_VERSION"
+fi
+
+if [ "$INIT_ONLY" -eq 1 ]; then
+    exec "$BIN_PATH" ${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"}
+fi
+
 # ------------------------------------------------------------------------------
 # 5. Launch with PID Tracking & Graceful Cleanup
 # ------------------------------------------------------------------------------
@@ -509,10 +533,10 @@ chmod 0700 "$OLP_DATA_DIR" 2>/dev/null || true
 
 # If config does not exist yet, run first-time setup
 if [ ! -f "$CONFIG_FILE" ]; then
-    if [ "$DAEMON_MODE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
-        "$BIN_PATH" --init-only --non-interactive
+    if [ "$DAEMON_MODE" -eq 1 ] || [ "$NON_INTERACTIVE" -eq 1 ] || [ ! -t 0 -a ! -t 1 ]; then
+        "$BIN_PATH" --init-only --non-interactive ${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"}
     elif [ -t 0 ]; then
-        "$BIN_PATH" --init-only
+        "$BIN_PATH" --init-only ${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"}
     fi
 fi
 

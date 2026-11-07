@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use olp::config::{ensure_server_initialized, olp_home_dir};
+use olp::config::{ensure_server_initialized, olp_home_dir, ServerCliOverrides};
 use olp::server::run_server_with_shutdown;
 use std::path::PathBuf;
 use tokio::sync::watch;
@@ -17,11 +17,43 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
+    /// Proxy server host:port (e.g. proxy.example.com:4443)
+    #[arg(long)]
+    proxy_addr: Option<String>,
+
+    /// User API key (olp_api_key recognized by the proxy)
+    #[arg(long)]
+    olp_api_key: Option<String>,
+
+    /// Client passkey_user required to query Ollama via this server
+    #[arg(long)]
+    passkey_user: Option<String>,
+
+    /// Local Ollama daemon address (defaults to 127.0.0.1:11434)
+    #[arg(long)]
+    ollama_addr: Option<String>,
+
+    /// Recommended or preferred public port on the proxy (e.g. 10000)
+    #[arg(long)]
+    remote_port: Option<u16>,
+
+    /// Unique server identifier (defaults to random srv_xxxxxxxx)
+    #[arg(long)]
+    server_id: Option<String>,
+
+    /// Enforce or skip TLS certificate CA root verification (true/false)
+    #[arg(long)]
+    tls_verify: Option<bool>,
+
+    /// Auto git pull on daily maintenance restart (true/false)
+    #[arg(long)]
+    auto_git_pull: Option<bool>,
+
     /// Initialize ~/.olp/server.toml, then exit without connecting
     #[arg(long)]
     init_only: bool,
 
-    /// Use default settings without interactive prompts if config is missing
+    /// Use default settings / flags without interactive prompts
     #[arg(long)]
     non_interactive: bool,
 }
@@ -55,7 +87,18 @@ async fn main() -> Result<()> {
         None => olp_home_dir()?.join("server.toml"),
     };
 
-    let cfg = ensure_server_initialized(&config_path, args.non_interactive)?;
+    let overrides = ServerCliOverrides {
+        proxy_addr: args.proxy_addr,
+        ollama_addr: args.ollama_addr,
+        remote_port: args.remote_port,
+        olp_api_key: args.olp_api_key,
+        olp_server_id: args.server_id,
+        passkey_user: args.passkey_user,
+        tls_verify: args.tls_verify,
+        auto_git_pull: args.auto_git_pull,
+    };
+
+    let cfg = ensure_server_initialized(&config_path, args.non_interactive, overrides)?;
 
     if args.init_only {
         println!("[olp-server] Initialization complete.");

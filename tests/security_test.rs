@@ -707,6 +707,92 @@ async fn test_plain_http_to_https_port_returns_helpful_bad_request() {
     assert!(resp_str.contains("The plain HTTP request was sent to HTTPS port"), "Should explain HTTPS required");
 }
 
+#[test]
+fn test_proxy_cli_overrides_and_scripting() {
+    let tmp = create_temp_dir("proxy-cli");
+    let cfg_path = tmp.join("proxy.toml");
+
+    let overrides = olp::config::ProxyCliOverrides {
+        listen_addr: Some("0.0.0.0:4545".to_string()),
+        allowed_ports: Some("20000-25000".to_string()),
+        olp_api_keys: Some(vec!["scripted-api-key-1".to_string(), "scripted-api-key-2".to_string()]),
+        allowed_server_cidrs: Some(vec!["10.0.0.0/8".to_string()]),
+        allowed_user_cidrs: Some(vec!["192.168.1.0/24".to_string()]),
+        tls_mode: Some("self-signed".to_string()),
+        tls_cert_path: None,
+        tls_key_path: None,
+        access_log: Some("off".to_string()),
+        auto_git_pull: Some(false),
+    };
+
+    let cfg = olp::config::ensure_proxy_initialized(&cfg_path, true, overrides).unwrap();
+    assert_eq!(cfg.proxy.listen_addr, "0.0.0.0:4545");
+    assert_eq!(cfg.proxy.allowed_ports, "20000-25000");
+    assert_eq!(cfg.auth.olp_api_keys, vec!["scripted-api-key-1", "scripted-api-key-2"]);
+    assert_eq!(cfg.security.allowed_server_cidrs, vec!["10.0.0.0/8"]);
+    assert_eq!(cfg.security.allowed_user_cidrs, vec!["192.168.1.0/24"]);
+    assert_eq!(cfg.tls.mode, "self-signed");
+    assert_eq!(cfg.proxy.access_log, None);
+    assert!(!cfg.maintenance.auto_git_pull);
+
+    // Verify it saved to disk
+    assert!(cfg_path.is_file());
+    let loaded = olp::config::ProxyConfig::load_from_path(&cfg_path).unwrap();
+    assert_eq!(loaded.proxy.listen_addr, "0.0.0.0:4545");
+    assert_eq!(loaded.auth.olp_api_keys.len(), 2);
+
+    // Subsequent call with CLI override updates existing config
+    let update_overrides = olp::config::ProxyCliOverrides {
+        listen_addr: Some("127.0.0.1:4646".to_string()),
+        ..Default::default()
+    };
+    let updated = olp::config::ensure_proxy_initialized(&cfg_path, true, update_overrides).unwrap();
+    assert_eq!(updated.proxy.listen_addr, "127.0.0.1:4646");
+    assert_eq!(updated.auth.olp_api_keys, vec!["scripted-api-key-1", "scripted-api-key-2"]);
+}
+
+#[test]
+fn test_server_cli_overrides_and_scripting() {
+    let tmp = create_temp_dir("server-cli");
+    let cfg_path = tmp.join("server.toml");
+
+    let overrides = olp::config::ServerCliOverrides {
+        proxy_addr: Some("proxy.domain.com:4443".to_string()),
+        ollama_addr: Some("127.0.0.1:11434".to_string()),
+        remote_port: Some(10500),
+        olp_api_key: Some("scripted-user-key".to_string()),
+        olp_server_id: Some("srv_custom123".to_string()),
+        passkey_user: Some("scripted-passkey-user".to_string()),
+        tls_verify: Some(true),
+        auto_git_pull: Some(false),
+    };
+
+    let cfg = olp::config::ensure_server_initialized(&cfg_path, true, overrides).unwrap();
+    assert_eq!(cfg.server.proxy_addr, "proxy.domain.com:4443");
+    assert_eq!(cfg.server.ollama_addr, "127.0.0.1:11434");
+    assert_eq!(cfg.server.remote_port, Some(10500));
+    assert_eq!(cfg.server.olp_api_key, "scripted-user-key");
+    assert_eq!(cfg.server.olp_server_id, "srv_custom123");
+    assert_eq!(cfg.server.passkey_user, "scripted-passkey-user");
+    assert_eq!(cfg.server.tls_verify, Some(true));
+    assert!(!cfg.maintenance.auto_git_pull);
+
+    // Verify it saved to disk
+    assert!(cfg_path.is_file());
+    let loaded = olp::config::ServerConfig::load_from_path(&cfg_path).unwrap();
+    assert_eq!(loaded.server.proxy_addr, "proxy.domain.com:4443");
+    assert_eq!(loaded.server.remote_port, Some(10500));
+
+    // Subsequent call with CLI override updates existing config
+    let update_overrides = olp::config::ServerCliOverrides {
+        remote_port: Some(10600),
+        ..Default::default()
+    };
+    let updated = olp::config::ensure_server_initialized(&cfg_path, true, update_overrides).unwrap();
+    assert_eq!(updated.server.remote_port, Some(10600));
+    assert_eq!(updated.server.proxy_addr, "proxy.domain.com:4443");
+}
+
 // ============================================================================
 // 6. MULTI-TENANT, ACL & BOUNDARY ATTACK TESTS
 // ============================================================================

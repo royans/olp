@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use olp::config::{ensure_proxy_initialized, olp_home_dir};
+use olp::config::{ensure_proxy_initialized, olp_home_dir, ProxyCliOverrides};
 use olp::proxy::start_proxy_server;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -16,11 +16,51 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Initialize ~/.olp/proxy.toml with random passkeys, then exit without starting the listener
+    /// Tunnel listen address for incoming olp-server connections (e.g. 0.0.0.0:4443)
+    #[arg(long)]
+    listen_addr: Option<String>,
+
+    /// Allowed public port range for allocated servers (e.g. 10000-20000)
+    #[arg(long)]
+    allowed_ports: Option<String>,
+
+    /// Initial olp_api_key (or comma-separated list of keys) for authenticating servers
+    #[arg(long)]
+    olp_api_key: Option<String>,
+
+    /// Allowed CIDR blocks for tunnel connections (comma-separated, default: 0.0.0.0/0, ::/0)
+    #[arg(long)]
+    allowed_server_cidrs: Option<String>,
+
+    /// Allowed CIDR blocks for user HTTP inference requests (comma-separated, default: 0.0.0.0/0, ::/0)
+    #[arg(long)]
+    allowed_user_cidrs: Option<String>,
+
+    /// Public TLS encryption mode: "off", "self-signed", or "manual"
+    #[arg(long)]
+    tls_mode: Option<String>,
+
+    /// Path to TLS certificate file (for "manual" TLS mode)
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// Path to TLS private key file (for "manual" TLS mode)
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// Apache-style access log path (or "off" to disable)
+    #[arg(long)]
+    access_log: Option<String>,
+
+    /// Auto git pull on daily maintenance restart (true/false)
+    #[arg(long)]
+    auto_git_pull: Option<bool>,
+
+    /// Initialize ~/.olp/proxy.toml with passkeys and settings, then exit without starting listener
     #[arg(long)]
     init_only: bool,
 
-    /// Use default settings without interactive prompts if config is missing
+    /// Use default settings / flags without interactive prompts
     #[arg(long)]
     non_interactive: bool,
 }
@@ -54,7 +94,35 @@ async fn main() -> Result<()> {
         None => olp_home_dir()?.join("proxy.toml"),
     };
 
-    let cfg = ensure_proxy_initialized(&config_path, args.non_interactive)?;
+    let overrides = ProxyCliOverrides {
+        listen_addr: args.listen_addr,
+        allowed_ports: args.allowed_ports,
+        olp_api_keys: args.olp_api_key.map(|k| {
+            k.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }),
+        allowed_server_cidrs: args.allowed_server_cidrs.map(|c| {
+            c.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }),
+        allowed_user_cidrs: args.allowed_user_cidrs.map(|c| {
+            c.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }),
+        tls_mode: args.tls_mode,
+        tls_cert_path: args.tls_cert,
+        tls_key_path: args.tls_key,
+        access_log: args.access_log,
+        auto_git_pull: args.auto_git_pull,
+    };
+
+    let cfg = ensure_proxy_initialized(&config_path, args.non_interactive, overrides)?;
 
     if args.init_only {
         println!("[olp-proxy] Initialization complete.");

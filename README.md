@@ -103,6 +103,16 @@ On first run, `olp-proxy` auto-generates your initial user API key and profile:
 > - `./start-proxy.sh stop` — Stops the proxy cleanly (`SIGTERM`).
 > - `./start-proxy.sh status` — Shows process status.
 
+#### Automated / Headless Setup for `olp-proxy`:
+Brand new instances can be completely scripted via CLI without interactive prompts:
+```bash
+./start-proxy.sh --daemon \
+  --listen-addr 0.0.0.0:4443 \
+  --allowed-ports 10000-20000 \
+  --olp-api-key "my-user-api-key" \
+  --non-interactive
+```
+
 ---
 
 ### Step 2: On the Private Ollama Machine (`olp-server`)
@@ -130,6 +140,17 @@ TLS 1.3 tunnel established! Exposing local Ollama (127.0.0.1:11434) on remote po
 > - `./start-server.sh uninstall-cron` — Removes managed cronjobs from crontab.
 > - `./start-server.sh stop` — Stops the server cleanly (`SIGTERM`).
 > - `./start-server.sh status` — Shows process status.
+
+#### Automated / Headless Setup for `olp-server`:
+Brand new instances can be completely scripted via CLI without interactive prompts:
+```bash
+./start-server.sh --daemon \
+  --proxy-addr proxy.example.com:4443 \
+  --olp-api-key "my-user-api-key" \
+  --passkey-user "my-client-passkey" \
+  --remote-port 10000 \
+  --non-interactive
+```
 
 ---
 
