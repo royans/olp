@@ -473,7 +473,7 @@ impl ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MaintenanceSection {
     /// When the install directory is a git checkout, run `git pull --ff-only` (and rebuild if
-    /// anything changed) on every scheduled/manual restart. Defaults to `true`.
+    /// anything changed) on every scheduled/manual restart. Defaults to `false`.
     #[serde(
         default = "default_auto_git_pull",
         deserialize_with = "deserialize_flexible_bool"
@@ -482,12 +482,12 @@ pub struct MaintenanceSection {
 }
 
 fn default_auto_git_pull() -> bool {
-    true
+    false
 }
 
 fn default_maintenance_for_existing_deployments() -> MaintenanceSection {
     MaintenanceSection {
-        auto_git_pull: true,
+        auto_git_pull: false,
     }
 }
 
@@ -633,6 +633,14 @@ pub fn ensure_proxy_initialized(
     let config_dir = olp_config_dir()?;
 
     if config_path.exists() {
+        if let Ok(raw_content) = fs::read_to_string(config_path) {
+            if !raw_content.contains("auto_git_pull") {
+                eprintln!(
+                    "[MAINTENANCE NOTICE] 'auto_git_pull' is missing from {} under [maintenance]. Automated git updates are DISABLED by default.",
+                    config_path.display()
+                );
+            }
+        }
         let mut cfg = ProxyConfig::load_from_path(config_path)?;
         let mut modified = false;
 
@@ -860,6 +868,14 @@ pub fn ensure_server_initialized(
     ensure_secure_dir(&base_dir)?;
 
     if config_path.exists() {
+        if let Ok(raw_content) = fs::read_to_string(config_path) {
+            if !raw_content.contains("auto_git_pull") {
+                eprintln!(
+                    "[MAINTENANCE NOTICE] 'auto_git_pull' is missing from {} under [maintenance]. Automated git updates are DISABLED by default.",
+                    config_path.display()
+                );
+            }
+        }
         let mut cfg = ServerConfig::load_from_path(config_path)?;
         let mut modified = false;
 
@@ -1038,12 +1054,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maintenance_defaults_to_git_pull_when_missing() {
+    fn maintenance_defaults_to_git_pull_false_when_missing() {
         let cfg: ServerConfig = toml::from_str(
             "[server]\nproxy_addr = \"a:1\"\nollama_addr = \"b:2\"\nolp_api_key = \"x\"\npasskey_user = \"y\"\n",
         )
         .unwrap();
-        assert!(cfg.maintenance.auto_git_pull);
+        assert!(!cfg.maintenance.auto_git_pull);
     }
 
     #[test]

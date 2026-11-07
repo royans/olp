@@ -121,7 +121,7 @@ find_compiled_binary() {
 # 2. Git Auto-Update Logic
 # ------------------------------------------------------------------------------
 # Reads `auto_git_pull` from the [maintenance] section of the config file.
-# For existing deployments, missing key => enabled. Going forward / new => disabled.
+# Defaults to OFF (disabled) when omitted or missing.
 git_pull_enabled() {
     if [ ! -f "$CONFIG_FILE" ]; then
         return 1
@@ -132,8 +132,24 @@ git_pull_enabled() {
         false|no|n|off|0) return 1 ;;
         true|yes|y|on|1) return 0 ;;
     esac
-    # For existing deployments where auto_git_pull was omitted, leave autoupdate on:
-    return 0
+    # When auto_git_pull is omitted, default to OFF (disabled)
+    return 1
+}
+
+# Emits a one-time notice when auto_git_pull is missing from the configuration file
+check_missing_auto_git_pull_notice() {
+    if [ -f "$CONFIG_FILE" ]; then
+        if ! grep -q "auto_git_pull" "$CONFIG_FILE" 2>/dev/null; then
+            echo ""
+            echo "================================================================================"
+            echo "  [MAINTENANCE NOTICE] 'auto_git_pull' is missing from $CONFIG_FILE."
+            echo "  Automated git updates are DISABLED by default."
+            echo "  To configure explicitly, set 'auto_git_pull = false' or 'auto_git_pull = true'"
+            echo "  under [maintenance] in $CONFIG_FILE."
+            echo "================================================================================"
+            echo ""
+        fi
+    fi
 }
 
 # Checks if local git repository is behind upstream and warns with a 15-second delayed start
@@ -222,6 +238,7 @@ auto_update_from_git() {
             return 0
         fi
         if [ -d ".git" ] && ! git_pull_enabled; then
+            check_missing_auto_git_pull_notice
             check_git_updates_and_warn
             return 0
         fi

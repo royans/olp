@@ -137,10 +137,10 @@ Brand new instances can be completely scripted via CLI without interactive promp
   - **The model name requested by the client does not matter.** Whether Cline, Open WebUI, or curl requests `llama3.1`, `auto`, `default`, or anything else, `olp-server` transparently rewrites the request to whatever model is loaded (e.g., `hf.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M`).
   - Automatically rewrites model parameters in `/api/show` so agent context windows, capabilities, and templates work out of the box without manual configuration.
 - **Zero Inbound Port Forwarding on NAT**: `olp-server` initiates an *outbound* connection to `olp-proxy` over a single TLS 1.3 port (`:4443`).
-- **Encrypted TLS 1.3 Reverse Tunnel**: All multiplexed traffic is end-to-end encrypted with forward secrecy over TLS 1.3 using Yamux.
+- **Encrypted TLS 1.3 Reverse Tunnel**: All multiplexed tunnel traffic between olp-server and olp-proxy is encrypted in transit with forward secrecy over TLS 1.3 using Yamux.
 - **Strict Multi-User Session Isolation & PII Safety**:
   - Independent Yamux substreams and ephemeral local TCP connections per request guarantee zero session bleed or data mixing between concurrent users.
-  - Completely stateless architecture: no prompt logging, disk caching, or cross-request memory.
+  - Prompts pass through the gateway encrypted in transit and are never logged or stored on disk; for zero trust, you can run your own self-hosted `olp-proxy`.
   - Compatible with Ollama's isolated parallel slots (`OLLAMA_NUM_PARALLEL`).
 - **Built-in CORS & Webview Compatibility**: Full CORS preflight (`OPTIONS`) handling without authentication, enabling seamless integration with VS Code extensions (Cline, Roo Code) and browser web interfaces (Open WebUI).
 - **Flexible Client Authentication**: Supports Bearer tokens, HTTP Basic Auth, and custom `x-api-key` / `ollama-api-key` headers.
@@ -335,7 +335,7 @@ ollama run default
 
 When multiple users query the same proxied Ollama instance:
 
-* **No Shared Sessions or Cross-Talk**: Each client request travels across an isolated Yamux substream with its own unique channel ID and triggers a distinct ephemeral TCP connection to local Ollama.
+* **Privacy in Transit & Zero Prompt Logging**: Prompts pass through the gateway encrypted in transit (TLS 1.3) and are never logged or stored on disk. The proxy only inspects HTTP headers in memory to verify authentication and route requests. For zero trust, you can easily run your own self-hosted `olp-proxy` on your own VPS.
 * **No Cache Pollution or PII Leakage**: `olp` is strictly stateless. It does not cache prompts, conversation histories, or response bodies. Ollama's attention KV cache evaluates token prefixes strictly per sequence; attention tensors from one user are never injected into another user's generation.
 * **Independent IP Rate Limiting**: Brute-force protection tracks failures per IP address. One user's authentication mistakes will never lock out another user.
 * **Parallel Processing**: To allow Ollama to generate responses for multiple users concurrently (rather than queuing sequentially), set `OLLAMA_NUM_PARALLEL` on the Ollama host before starting Ollama:
@@ -380,7 +380,7 @@ To protect both the public proxy and private GPU owners without split-brain secu
 ### 4. Log Privacy & Sanitization
 Access logs strictly omit sensitive data:
 - Passkeys, bearer tokens, and API keys are **never** logged (`auth=bearer`, `auth=basic`, `auth=api_key`, or `auth=-`).
-- Request and response body text snippets are **never** logged, completely eliminating prompt, PII, and output leakage.
+- Request and response body text snippets are **never** logged, completely eliminating prompt, PII, and output leakage. Prompts pass through the gateway encrypted in transit and are never stored on disk.
 
 ### 5. Pre-Auth Body Defense & Memory Exhaustion Protection
 - **Pre-Auth Validation**: Client IP CIDR, HTTP method (`CONNECT`), and passkey authentication headers are validated **before** any request body bytes are read into memory. Unauthenticated or malformed requests are rejected immediately with zero body buffering.
