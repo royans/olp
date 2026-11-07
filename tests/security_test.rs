@@ -635,6 +635,78 @@ async fn test_apache_access_log_file_logging() {
     assert!(content.contains("204"));
 }
 
+#[tokio::test]
+async fn test_plain_http_to_https_port_returns_helpful_bad_request() {
+    let tmp = create_temp_dir("plain-http-https");
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_path = tmp.join("cert.pem");
+    let key_path = tmp.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19300-19400".to_string(),
+            listener_grace_period_sec: 60,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec!["plain-http-pass".to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection {
+            mode: "manual".to_string(),
+            cert_path: Some(cert_path.to_string_lossy().to_string()),
+            key_path: Some(key_path.to_string_lossy().to_string()),
+        },
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: "plain-http-pass".to_string(),
+            olp_server_id: "srv_plain_http".to_string(),
+            passkey_user: "user-pass".to_string(),
+            remote_port: Some(19350),
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:19350").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Connect with plain HTTP (unencrypted) to this HTTPS port
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19350").await.unwrap();
+    let req = "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19350\r\n\r\n";
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+
+    let mut resp = vec![0u8; 512];
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp[..n]);
+
+    assert!(resp_str.contains("400 Bad Request"), "Should return HTTP 400 Bad Request");
+    assert!(resp_str.contains("The plain HTTP request was sent to HTTPS port"), "Should explain HTTPS required");
+}
+
 // ============================================================================
 // 6. MULTI-TENANT, ACL & BOUNDARY ATTACK TESTS
 // ============================================================================

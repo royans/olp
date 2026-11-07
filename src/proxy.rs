@@ -1030,6 +1030,25 @@ async fn run_public_port_listener(
                 let state_ref = state.clone();
                 tokio::spawn(async move {
                     if let Some(ref acceptor) = state_ref.public_tls_acceptor {
+                        // Detect plaintext HTTP requests sent to an HTTPS port
+                        let mut peek_buf = [0u8; 4];
+                        if let Ok(n) = stream.peek(&mut peek_buf).await {
+                            if n >= 3 && peek_buf[0] != 0x16 {
+                                if &peek_buf[..3] == b"GET"
+                                    || &peek_buf[..4] == b"POST"
+                                    || &peek_buf[..4] == b"HEAD"
+                                    || &peek_buf[..4] == b"OPTI"
+                                    || &peek_buf[..3] == b"PUT"
+                                    || &peek_buf[..4] == b"DELE"
+                                {
+                                    let err_resp = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"error\":\"The plain HTTP request was sent to HTTPS port. Please use https:// instead of http://\"}\r\n";
+                                    let mut s = stream;
+                                    let _ = tokio::io::AsyncWriteExt::write_all(&mut s, err_resp).await;
+                                    return;
+                                }
+                            }
+                        }
+
                         match tokio::time::timeout(
                             Duration::from_secs(10),
                             acceptor.accept(stream),
