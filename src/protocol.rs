@@ -50,6 +50,8 @@ pub struct ServerAuthRegister {
     pub recommended_port: Option<u16>,
     pub passkey_user: String,
     pub auth_token: [u8; 32],
+    #[serde(default)]
+    pub policy_override: Option<bool>,
 }
 
 impl ServerAuthRegister {
@@ -60,6 +62,24 @@ impl ServerAuthRegister {
         passkey_user: &str,
         proxy_nonce: &[u8; 32],
     ) -> Self {
+        Self::with_policy(
+            olp_api_key,
+            olp_server_id,
+            recommended_port,
+            passkey_user,
+            proxy_nonce,
+            None,
+        )
+    }
+
+    pub fn with_policy(
+        olp_api_key: &str,
+        olp_server_id: &str,
+        recommended_port: Option<u16>,
+        passkey_user: &str,
+        proxy_nonce: &[u8; 32],
+        policy_override: Option<bool>,
+    ) -> Self {
         let auth_token = compute_server_auth_token(proxy_nonce, olp_server_id, olp_api_key);
         Self {
             olp_api_key: olp_api_key.to_string(),
@@ -67,7 +87,25 @@ impl ServerAuthRegister {
             recommended_port,
             passkey_user: passkey_user.to_string(),
             auth_token,
+            policy_override,
         }
+    }
+}
+
+/// Returns true if the HTTP method and path target a sensitive or mutating Ollama operation
+/// (such as downloading/pulling models, deleting models, creating custom models, copying, or pushing).
+/// Read-only inference and status endpoints (generate, chat, embeddings, embed, tags, version, show, ps) return false.
+pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
+    let raw_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    let normalized_path = if raw_path.is_empty() { "/" } else { raw_path };
+
+    match (method, normalized_path) {
+        (&hyper::Method::GET, "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps") => false,
+        (&hyper::Method::HEAD, "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps") => false,
+        (&hyper::Method::POST, "/api/generate" | "/api/chat" | "/api/embeddings" | "/api/embed" | "/api/show") => false,
+        // All mutating operations (e.g. POST /api/pull, DELETE /api/delete, POST /api/push,
+        // POST /api/create, POST /api/copy, /api/blobs/*, etc.) or unknown verbs are sensitive.
+        _ => true,
     }
 }
 
@@ -290,5 +328,34 @@ mod tests {
         assert!(!is_safe_identifier("bad/path"));
         assert!(!is_safe_identifier("bad\\path"));
         assert!(!is_safe_identifier("bad key with spaces"));
+    }
+
+    #[test]
+    fn test_is_sensitive_ollama_op() {
+        use hyper::Method;
+
+        // Safe / Read-Only endpoints
+        assert!(!is_sensitive_ollama_op(&Method::GET, "/"));
+        assert!(!is_sensitive_ollama_op(&Method::GET, "/api"));
+        assert!(!is_sensitive_ollama_op(&Method::GET, "/api/version"));
+        assert!(!is_sensitive_ollama_op(&Method::GET, "/api/tags"));
+        assert!(!is_sensitive_ollama_op(&Method::GET, "/api/tags?verbose=true"));
+        assert!(!is_sensitive_ollama_op(&Method::GET, "/api/ps"));
+        assert!(!is_sensitive_ollama_op(&Method::POST, "/api/generate"));
+        assert!(!is_sensitive_ollama_op(&Method::POST, "/api/chat"));
+        assert!(!is_sensitive_ollama_op(&Method::POST, "/api/embeddings"));
+        assert!(!is_sensitive_ollama_op(&Method::POST, "/api/embed"));
+        assert!(!is_sensitive_ollama_op(&Method::POST, "/api/show"));
+
+        // Sensitive / Mutating endpoints
+        assert!(is_sensitive_ollama_op(&Method::POST, "/api/pull"));
+        assert!(is_sensitive_ollama_op(&Method::POST, "/api/push"));
+        assert!(is_sensitive_ollama_op(&Method::DELETE, "/api/delete"));
+        assert!(is_sensitive_ollama_op(&Method::POST, "/api/create"));
+        assert!(is_sensitive_ollama_op(&Method::POST, "/api/copy"));
+        assert!(is_sensitive_ollama_op(&Method::POST, "/api/blobs/sha256:1234"));
+        assert!(is_sensitive_ollama_op(&Method::PUT, "/api/blobs/sha256:1234"));
+        assert!(is_sensitive_ollama_op(&Method::DELETE, "/api/blobs/sha256:1234"));
+        assert!(is_sensitive_ollama_op(&Method::POST, "/unknown/endpoint"));
     }
 }

@@ -11,7 +11,7 @@ use olp::protocol::{
     verify_server_auth_token,
 };
 use olp::proxy::{
-    extract_auth_token, extract_model, format_apache_timestamp, sanitize_for_log,
+    extract_auth_scheme, extract_model, format_apache_timestamp, sanitize_for_log,
     start_proxy_server, verify_http_headers_auth,
 };
 use olp::server::run_single_tunnel_session;
@@ -21,6 +21,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
+
+fn test_proxy_tls() -> ProxyTlsSection {
+    ProxyTlsSection {
+        mode: "off".to_string(),
+        cert_path: None,
+        key_path: None,
+        allow_broken_certs: true,
+    }
+}
 
 fn create_temp_dir(suffix: &str) -> PathBuf {
     static ID: AtomicUsize = AtomicUsize::new(100);
@@ -286,7 +295,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             olp_api_keys: vec!["legit-proxy-pass".to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -303,7 +312,8 @@ async fn test_port_range_and_forbidden_port_rejection() {
             olp_server_id: "srv_priv".to_string(),
             passkey_user: "user-pass".to_string(),
             remote_port: Some(80), // privileged port!
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -331,7 +341,8 @@ async fn test_port_range_and_forbidden_port_rejection() {
             olp_server_id: "srv_out".to_string(),
             passkey_user: "user-pass".to_string(),
             remote_port: Some(25000), // outside allowed 15000-16000
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -364,7 +375,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             olp_api_keys: vec!["shared-proxy-pass".to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -380,7 +391,8 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             olp_server_id: "srv_simul_1".to_string(),
             passkey_user: "user-pass-1".to_string(),
             remote_port: Some(17101),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -394,7 +406,8 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             olp_server_id: "srv_simul_2".to_string(),
             passkey_user: "user-pass-2".to_string(),
             remote_port: Some(17102),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -442,7 +455,12 @@ async fn test_ca_verification_rejects_untrusted_certificates() {
             olp_api_keys: vec!["ca-test-passkey".to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: ProxyTlsSection {
+            mode: "self-signed".to_string(),
+            cert_path: None,
+            key_path: None,
+            allow_broken_certs: true,
+        },
         maintenance: Default::default(),
     };
 
@@ -488,19 +506,15 @@ fn test_server_should_verify_ca_auto_detection() {
         passkey_user: "user_test".to_string(),
         remote_port: Some(18434),
         tls_verify: None,
+        read_only: None,
     };
-    assert!(!s.should_verify_ca());
-
-    s.proxy_addr = "localhost:4443".to_string();
-    assert!(!s.should_verify_ca());
-
-    s.proxy_addr = "192.168.1.100:4443".to_string();
-    assert!(!s.should_verify_ca());
+    // Strict CA root verification is enabled by default for all hosts
+    assert!(s.should_verify_ca());
 
     s.proxy_addr = "proxy.example.com:4443".to_string();
     assert!(s.should_verify_ca());
 
-    // Explicit override
+    // Explicit opt-out for testing environments
     s.tls_verify = Some(false);
     assert!(!s.should_verify_ca());
 
@@ -541,17 +555,21 @@ fn test_apache_access_log_helpers() {
     let no_model_uri: hyper::Uri = "/api/tags".parse().unwrap();
     assert_eq!(extract_model(empty_body, &no_model_uri), "-");
 
-    // 4. Token extraction
+    // 4. Token sanitization / scheme extraction (no plaintext secrets logged!)
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer test-token-123"));
-    assert_eq!(extract_auth_token(&headers), "Bearer:test-token-123");
+    assert_eq!(extract_auth_scheme(&headers), "auth=bearer");
 
     headers.clear();
     headers.insert(hyper::header::HeaderName::from_static("x-api-key"), HeaderValue::from_static("custom-api-key"));
-    assert_eq!(extract_auth_token(&headers), "ApiKey:custom-api-key");
+    assert_eq!(extract_auth_scheme(&headers), "auth=api_key");
 
     headers.clear();
-    assert_eq!(extract_auth_token(&headers), "-");
+    headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjpwYXNz"));
+    assert_eq!(extract_auth_scheme(&headers), "auth=basic");
+
+    headers.clear();
+    assert_eq!(extract_auth_scheme(&headers), "-");
 }
 
 #[tokio::test]
@@ -570,7 +588,7 @@ async fn test_apache_access_log_file_logging() {
             olp_api_keys: vec!["access-log-proxy-pass".to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -587,7 +605,8 @@ async fn test_apache_access_log_file_logging() {
             olp_server_id: "srv_access_log".to_string(),
             passkey_user: "access-log-user-pass".to_string(),
             remote_port: Some(19150),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -595,7 +614,8 @@ async fn test_apache_access_log_file_logging() {
 
     let (_tx, mut rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        eprintln!("[TUNNEL DEBUG] run_single_tunnel_session result: {:?}", res);
     });
 
     // Wait for the public port to open
@@ -619,18 +639,26 @@ async fn test_apache_access_log_file_logging() {
     tokio::io::AsyncWriteExt::write_all(&mut options_req, options_payload.as_bytes()).await.unwrap();
     let _ = tokio::io::AsyncReadExt::read(&mut options_req, &mut resp_buf).await;
 
+    // Send an authorized request with model in query param
+    let mut auth_req = tokio::net::TcpStream::connect("127.0.0.1:19150").await.unwrap();
+    let auth_payload = "GET /api/tags?model=llama3 HTTP/1.1\r\nHost: 127.0.0.1:19150\r\nAuthorization: Bearer access-log-user-pass\r\n\r\n";
+    tokio::io::AsyncWriteExt::write_all(&mut auth_req, auth_payload.as_bytes()).await.unwrap();
+    let _ = tokio::io::AsyncReadExt::read(&mut auth_req, &mut resp_buf).await;
+
     // Allow background logger to flush to disk
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     assert!(log_path.exists(), "access.log must be created");
     let content = std::fs::read_to_string(&log_path).unwrap();
 
-    // Verify Apache log lines
+    // Verify sanitized Apache log lines: credentials and prompt/response snippets MUST NOT be logged!
     assert!(content.contains("127.0.0.1"));
     assert!(content.contains("401"));
-    assert!(content.contains("Bearer:bad-token"));
+    assert!(content.contains("auth=bearer"));
+    assert!(!content.contains("bad-token"), "Passkeys and bearer tokens must never be logged in access.log");
     assert!(content.contains("model=\"llama3\""));
-    assert!(content.contains("req=\"{\\\"model\\\":\\\"llama3\\\",\\\"prompt\\\":\\\"hello\\\"}\""));
+    assert!(!content.contains("prompt"), "Query text snippets must never be logged in access.log");
+    assert!(!content.contains("hello"), "Query text snippets must never be logged in access.log");
     assert!(content.contains("OPTIONS /api/tags HTTP/1.1"));
     assert!(content.contains("204"));
 }
@@ -659,6 +687,7 @@ async fn test_plain_http_to_https_port_returns_helpful_bad_request() {
             mode: "manual".to_string(),
             cert_path: Some(cert_path.to_string_lossy().to_string()),
             key_path: Some(key_path.to_string_lossy().to_string()),
+            allow_broken_certs: true,
         },
         maintenance: Default::default(),
     };
@@ -676,7 +705,8 @@ async fn test_plain_http_to_https_port_returns_helpful_bad_request() {
             olp_server_id: "srv_plain_http".to_string(),
             passkey_user: "user-pass".to_string(),
             remote_port: Some(19350),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -684,7 +714,8 @@ async fn test_plain_http_to_https_port_returns_helpful_bad_request() {
 
     let (_tx, mut rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        eprintln!("[TUNNEL DEBUG] run_single_tunnel_session result: {:?}", res);
     });
 
     for _ in 0..40 {
@@ -723,6 +754,7 @@ fn test_proxy_cli_overrides_and_scripting() {
         tls_key_path: None,
         access_log: Some("off".to_string()),
         auto_git_pull: Some(false),
+        ..Default::default()
     };
 
     let cfg = olp::config::ensure_proxy_initialized(&cfg_path, true, overrides).unwrap();
@@ -765,6 +797,7 @@ fn test_server_cli_overrides_and_scripting() {
         passkey_user: Some("scripted-passkey-user".to_string()),
         tls_verify: Some(true),
         auto_git_pull: Some(false),
+        ..Default::default()
     };
 
     let cfg = olp::config::ensure_server_initialized(&cfg_path, true, overrides).unwrap();
@@ -810,7 +843,7 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
             olp_api_keys: vec!["valid_user_key".to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -827,7 +860,8 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
             olp_server_id: "srv_valid".to_string(),
             passkey_user: "user_pass".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -848,7 +882,8 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
             olp_server_id: "srv/../../evil".to_string(),
             passkey_user: "user_pass".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -875,7 +910,7 @@ async fn test_user_disabled_account_rejection() {
             olp_api_keys: vec![user_key.to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -898,7 +933,8 @@ async fn test_user_disabled_account_rejection() {
             olp_server_id: "srv_disabled_test".to_string(),
             passkey_user: "user_pass".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -927,7 +963,7 @@ async fn test_user_max_servers_limit_enforcement() {
             olp_api_keys: vec![user_key.to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -951,7 +987,8 @@ async fn test_user_max_servers_limit_enforcement() {
             olp_server_id: "srv_slot1".to_string(),
             passkey_user: "user_pass".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -974,7 +1011,8 @@ async fn test_user_max_servers_limit_enforcement() {
             olp_server_id: "srv_slot2_overflow".to_string(),
             passkey_user: "user_pass".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -990,6 +1028,7 @@ async fn test_user_max_servers_limit_enforcement() {
     let _ = handle1.await;
     let _ = std::fs::remove_file(&profile_path);
 }
+
 
 #[tokio::test]
 async fn test_cross_user_port_stealing_prevention() {
@@ -1007,7 +1046,7 @@ async fn test_cross_user_port_stealing_prevention() {
             olp_api_keys: vec![alice_key.to_string(), bob_key.to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -1025,9 +1064,11 @@ async fn test_cross_user_port_stealing_prevention() {
             port: 17500,
             reserved: true,
             passkey_user: "alice_pass".to_string(),
+            passkey_user_hash: None,
             allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
             allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
             created_at: None,
+            read_only: None,
         },
     );
     alice_profile.save_atomic(&alice_profile_path).unwrap();
@@ -1041,7 +1082,8 @@ async fn test_cross_user_port_stealing_prevention() {
             olp_server_id: "srv_bob_box".to_string(),
             passkey_user: "bob_pass".to_string(),
             remote_port: Some(17500), // recommending Alice's port!
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1067,6 +1109,7 @@ async fn test_cross_user_port_stealing_prevention() {
     let _ = std::fs::remove_file(&bob_profile_path);
 }
 
+
 #[tokio::test]
 async fn test_port_exhaustion_returns_clean_error() {
     let user_key = "exhaustion_user";
@@ -1081,7 +1124,7 @@ async fn test_port_exhaustion_returns_clean_error() {
             olp_api_keys: vec![user_key.to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -1098,7 +1141,8 @@ async fn test_port_exhaustion_returns_clean_error() {
             olp_server_id: "srv_ex1".to_string(),
             passkey_user: "pass".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1119,7 +1163,8 @@ async fn test_port_exhaustion_returns_clean_error() {
             olp_server_id: "srv_ex2".to_string(),
             passkey_user: "pass".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1140,7 +1185,8 @@ async fn test_port_exhaustion_returns_clean_error() {
             olp_server_id: "srv_ex3".to_string(),
             passkey_user: "pass".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1161,6 +1207,7 @@ async fn test_port_exhaustion_returns_clean_error() {
     let _ = std::fs::remove_file(&profile_path);
 }
 
+
 #[tokio::test]
 async fn test_server_specific_cidr_restrictions() {
     let user_key = "per_server_cidr_user";
@@ -1175,7 +1222,7 @@ async fn test_server_specific_cidr_restrictions() {
             olp_api_keys: vec![user_key.to_string()],
         },
         security: ProxySecuritySection::default(),
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -1193,9 +1240,11 @@ async fn test_server_specific_cidr_restrictions() {
             port: 17850,
             reserved: false,
             passkey_user: "user_pass".to_string(),
+            passkey_user_hash: None,
             allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
             allowed_server_cidrs: vec!["192.168.254.1/32".to_string()], // 127.0.0.1 disallowed!
             created_at: None,
+            read_only: None,
         },
     );
     profile.save_atomic(&profile_path).unwrap();
@@ -1208,7 +1257,8 @@ async fn test_server_specific_cidr_restrictions() {
             olp_server_id: "srv_restricted_cidr".to_string(),
             passkey_user: "user_pass".to_string(),
             remote_port: Some(17850),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1226,3 +1276,621 @@ async fn test_server_specific_cidr_restrictions() {
 
     let _ = std::fs::remove_file(&profile_path);
 }
+
+
+
+// ============================================================================
+// 7. SENSITIVE OPERATIONS POLICY, MUTUAL EXCLUSION & STRICT TLS TESTS
+// ============================================================================
+
+#[tokio::test]
+async fn test_sensitive_operations_blocked_by_default_on_proxy() {
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = mock_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await;
+                });
+            }
+        }
+    });
+
+    let user_key = "ro_policy_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "18100-18200".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection {
+            read_only: true, // Default: read-only enabled
+            ..Default::default()
+        },
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_ro_test".to_string(),
+            passkey_user: "ro_user_pass".to_string(),
+            remote_port: Some(18150),
+            tls_verify: Some(false),
+            read_only: None, // Controlled by proxy!
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        eprintln!("[TUNNEL DEBUG] run_single_tunnel_session result: {:?}", res);
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:18150").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let auth_header = format!("Bearer ro_user_pass");
+
+    // 1. Safe / RO request (GET /api/tags) -> 200 OK
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:18150").await.unwrap();
+    let req = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:18150\r\nAuthorization: {}\r\nConnection: close\r\n\r\n", auth_header);
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+    let mut resp_buf = vec![0u8; 1024];
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&resp_buf[..n]);
+    assert!(resp.contains("200 OK"), "GET /api/tags must be permitted in read-only mode");
+
+    // 2. Sensitive request (POST /api/pull) -> 403 Forbidden
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:18150").await.unwrap();
+    let body = "{\"name\":\"evil\"}";
+    let req2 = format!(
+        "POST /api/pull HTTP/1.1\r\nHost: 127.0.0.1:18150\r\nAuthorization: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        auth_header,
+        body.len(),
+        body
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes()).await.unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut resp_buf).await.unwrap();
+    let resp2 = String::from_utf8_lossy(&resp_buf[..n2]);
+    assert!(resp2.contains("403 Forbidden"), "POST /api/pull must be blocked with 403 Forbidden");
+    assert!(resp2.contains("sensitive Ollama operations are disabled"));
+
+    // 3. Sensitive request (DELETE /api/delete) -> 403 Forbidden
+    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:18150").await.unwrap();
+    let req3 = format!("DELETE /api/delete HTTP/1.1\r\nHost: 127.0.0.1:18150\r\nAuthorization: {}\r\nConnection: close\r\n\r\n", auth_header);
+    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req3.as_bytes()).await.unwrap();
+    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut resp_buf).await.unwrap();
+    let resp3 = String::from_utf8_lossy(&resp_buf[..n3]);
+    assert!(resp3.contains("403 Forbidden"), "DELETE /api/delete must be blocked with 403 Forbidden");
+}
+
+#[tokio::test]
+async fn test_policy_coexistence_conflict_fails_tunnel() {
+    let user_key = "conflict_policy_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "18200-18300".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection {
+            read_only: true,
+            policy_authority: "proxy".to_string(), // Proxy has authority!
+            ..Default::default()
+        },
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    // Server ALSO specifies policy (read_only = Some(false)) -> Conflict!
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_conflict".to_string(),
+            passkey_user: "user_pass".to_string(),
+            remote_port: None,
+            tls_verify: Some(false),
+            read_only: Some(false), // Attempting to configure on server when proxy is authority!
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+    assert!(res.is_err(), "Tunnel registration must fail due to policy coexistence conflict");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("CRITICAL CONFIG CONFLICT"),
+        "Expected CRITICAL CONFIG CONFLICT, got: {}",
+        err_msg
+    );
+}
+
+#[tokio::test]
+async fn test_missing_tls_certs_fails_proxy_without_allow_broken_certs() {
+    let tmp = create_temp_dir("missing-tls-certs");
+    let non_existent_cert = tmp.join("non_existent_cert.pem");
+    let non_existent_key = tmp.join("non_existent_key.pem");
+
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "18300-18400".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec!["tls-fail-key".to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection {
+            mode: "manual".to_string(),
+            cert_path: Some(non_existent_cert.to_string_lossy().to_string()),
+            key_path: Some(non_existent_key.to_string_lossy().to_string()),
+            allow_broken_certs: false, // Broken certs disabled by default!
+        },
+        maintenance: Default::default(),
+    };
+
+    let res = start_proxy_server(proxy_cfg).await;
+    assert!(res.is_err(), "Proxy must fail startup when TLS certs are missing and allow_broken_certs is false");
+    let err = res.err().unwrap().to_string();
+    assert!(err.contains("CRITICAL TLS ERROR"), "Expected CRITICAL TLS ERROR, got: {}", err);
+}
+
+// ============================================================================
+// 8. ADVANCED SECURITY: PRE-AUTH VALIDATION, BODY CAPS, CONCURRENCY & HASH STORAGE
+// ============================================================================
+
+#[tokio::test]
+async fn test_unauthenticated_request_rejects_without_buffering_large_body() {
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+
+    let user_key = "preauth_test_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19200-19300".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_preauth_test".to_string(),
+            passkey_user: "legit_pass".to_string(),
+            remote_port: Some(19250),
+            tls_verify: Some(false),
+            read_only: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        eprintln!("[TUNNEL DEBUG] run_single_tunnel_session result: {:?}", res);
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:19250").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Send request with wrong passkey and massive Content-Length (50 MB)
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19250").await.unwrap();
+    let req = "POST /api/chat HTTP/1.1\r\nHost: 127.0.0.1:19250\r\nAuthorization: Bearer wrong-pass\r\nContent-Length: 52428800\r\nConnection: close\r\n\r\npartial";
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+
+    let mut resp_buf = vec![0u8; 1024];
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&resp_buf[..n]);
+
+    // Must be rejected with 401 Unauthorized immediately before body is consumed
+    assert!(resp.contains("401 Unauthorized"), "Must reject before buffering body: {}", resp);
+}
+
+#[tokio::test]
+async fn test_max_request_body_size_rejection() {
+    let user_key = "body_cap_user";
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    let _ = std::fs::remove_file(&profile_path);
+
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19800-19900".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection {
+            max_request_body_size_mb: 1, // Cap at 1 MB
+            ..Default::default()
+        },
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_body_cap".to_string(),
+            passkey_user: "my_pass".to_string(),
+            remote_port: Some(19850),
+            tls_verify: Some(false),
+            read_only: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:19850").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Authenticated request with Content-Length: 2 MB (> 1 MB limit)
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19850").await.unwrap();
+    let req = "POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1:19850\r\nAuthorization: Bearer my_pass\r\nContent-Length: 2097152\r\nConnection: close\r\n\r\n";
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+
+    let mut resp_buf = vec![0u8; 1024];
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut resp_buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&resp_buf[..n]);
+
+    assert!(resp.contains("413 Payload Too Large"), "Must reject oversized request with 413: {}", resp);
+    assert!(resp.contains("payload too large"));
+
+    let _ = std::fs::remove_file(&profile_path);
+}
+
+#[tokio::test]
+async fn test_backend_concurrency_throttling_returns_429() {
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = mock_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    // Sleep to simulate slow LLM inference
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await;
+                });
+            }
+        }
+    });
+
+    let user_key = "concurrency_test_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19400-19500".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection {
+            max_active_requests_per_server: 1, // Only 1 active request permitted at a time!
+            ..Default::default()
+        },
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_concurrency".to_string(),
+            passkey_user: "cc_pass".to_string(),
+            remote_port: Some(19450),
+            tls_verify: Some(false),
+            read_only: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        eprintln!("[TUNNEL DEBUG] run_single_tunnel_session result: {:?}", res);
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:19450").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Client 1 sends request that takes 400ms
+    let h1 = tokio::spawn(async move {
+        let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19450").await.unwrap();
+        let req1 = "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19450\r\nAuthorization: Bearer cc_pass\r\nConnection: close\r\n\r\n";
+        tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    // Wait 50ms to ensure client 1 has acquired the permit
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Client 2 sends concurrent request while client 1 is in-flight -> must receive 429
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19450").await.unwrap();
+    let req2 = "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19450\r\nAuthorization: Bearer cc_pass\r\nConnection: close\r\n\r\n";
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes()).await.unwrap();
+    let mut buf2 = vec![0u8; 1024];
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf2).await.unwrap();
+    let resp2 = String::from_utf8_lossy(&buf2[..n2]);
+
+    assert!(resp2.contains("429 Too Many Requests"), "Concurrent request must receive 429: {}", resp2);
+    assert!(resp2.contains("server busy: maximum concurrent requests reached"));
+
+    let resp1 = h1.await.unwrap();
+    assert!(resp1.contains("200 OK"));
+}
+
+#[tokio::test]
+async fn test_authenticated_request_rate_limiting() {
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = mock_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await;
+                });
+            }
+        }
+    });
+
+    let user_key = "rate_limit_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19500-19600".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection {
+            max_requests_per_min: 2, // Only 2 requests per minute allowed!
+            ..Default::default()
+        },
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_rate_limit".to_string(),
+            passkey_user: "rl_pass".to_string(),
+            remote_port: Some(19550),
+            tls_verify: Some(false),
+            read_only: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        eprintln!("[TUNNEL DEBUG] run_single_tunnel_session result: {:?}", res);
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:19550").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Request 1 -> 200 OK
+    let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:19550").await.unwrap();
+    let req1 = "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19550\r\nAuthorization: Bearer rl_pass\r\nConnection: close\r\n\r\n";
+    tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n1 = tokio::io::AsyncReadExt::read(&mut tcp1, &mut buf).await.unwrap();
+    let resp1 = String::from_utf8_lossy(&buf[..n1]);
+    assert!(resp1.contains("200 OK"));
+
+    // Request 2 -> 200 OK
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:19550").await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req1.as_bytes()).await.unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut buf).await.unwrap();
+    let resp2 = String::from_utf8_lossy(&buf[..n2]);
+    assert!(resp2.contains("200 OK"));
+
+    // Request 3 -> Rate limit exceeded! (429 Too Many Requests)
+    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:19550").await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req1.as_bytes()).await.unwrap();
+    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut buf).await.unwrap();
+    let resp3 = String::from_utf8_lossy(&buf[..n3]);
+    assert!(resp3.contains("429 Too Many Requests"), "3rd request must receive 429: {}", resp3);
+    assert!(resp3.contains("rate limit exceeded"));
+}
+
+#[tokio::test]
+async fn test_user_profile_salted_hash_passkey_verification() {
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = mock_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await;
+                });
+            }
+        }
+    });
+
+    let user_key = "hash_storage_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "19600-19700".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    let raw_passkey = "my_super_secret_client_passkey!";
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_hash_test".to_string(),
+            passkey_user: raw_passkey.to_string(),
+            remote_port: Some(19650),
+            tls_verify: Some(false),
+            read_only: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+        eprintln!("[TUNNEL DEBUG] run_single_tunnel_session result: {:?}", res);
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:19650").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Inspect user profile file on disk
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    assert!(profile_path.exists());
+    let profile_content = std::fs::read_to_string(&profile_path).unwrap();
+
+    // Verify plaintext passkey is NOT stored on disk!
+    assert!(!profile_content.contains(raw_passkey), "Plaintext passkey must not be saved on disk!");
+    assert!(profile_content.contains("passkey_user_hash = \"$blake3$"));
+
+    // Verify user can authenticate using the raw passkey
+    let mut tcp = tokio::net::TcpStream::connect("127.0.0.1:19650").await.unwrap();
+    let req = format!("GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1:19650\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n", raw_passkey);
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("200 OK"), "Authentication must succeed with passkey against stored hash");
+
+    let _ = std::fs::remove_file(&profile_path);
+}
+

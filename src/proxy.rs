@@ -3,9 +3,9 @@ use crate::config::{expand_path, olp_config_dir, ProxyConfig, UserProfile, UserS
 use crate::keys::{enforce_private_file_permissions, IpRateLimiter, PasskeyVerifier};
 use crate::mux::{spawn_mux_session, MuxHandle};
 use crate::protocol::{
-    configure_tunnel_socket, create_tunnel_tls_server_config, is_safe_identifier, read_frame,
-    verify_server_auth_token, write_frame, ProxyHelloChallenge, ServerAuthRegister,
-    TunnelEstablished,
+    configure_tunnel_socket, create_tunnel_tls_server_config, is_safe_identifier,
+    is_sensitive_ollama_op, read_frame, verify_server_auth_token, write_frame,
+    ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -24,7 +24,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
@@ -44,8 +44,25 @@ fn full_body<T: Into<Bytes>>(chunk: T) -> BoxHttpBody {
 
 pub fn build_public_tls_acceptor(config: &ProxyConfig) -> Result<Option<TlsAcceptor>> {
     match config.tls.mode.as_str() {
-        "off" => Ok(None),
+        "off" => {
+            warn!(
+                "\n================================================================================\n\
+                 [TLS WARNING] Public endpoint TLS is disabled (mode = 'off').\n\
+                 Connections between clients and proxy will be sent unencrypted over plaintext HTTP!\n\
+                 This mode is INSECURE and NOT RECOMMENDED for production deployments.\n\
+                 ================================================================================"
+            );
+            Ok(None)
+        }
         "self-signed" => {
+            if !config.tls.allow_broken_certs {
+                return Err(anyhow!(
+                    "CRITICAL TLS ERROR: `tls.mode = \"self-signed\"` produces untrusted/broken certificates, \
+                     which are disabled by default. Run ./renew-tls.sh to issue valid Let's Encrypt certificates, \
+                     or explicitly set `allow_broken_certs = true` under [tls] in proxy.toml (not recommended)."
+                ));
+            }
+            warn!("[TLS NOTICE] Using ephemeral self-signed TLS for public endpoints (allow_broken_certs = true).");
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
             let cert_der = CertificateDer::from(cert.cert);
             let key_der =
@@ -58,14 +75,38 @@ pub fn build_public_tls_acceptor(config: &ProxyConfig) -> Result<Option<TlsAccep
             Ok(Some(TlsAcceptor::from(Arc::new(server_cfg))))
         }
         "manual" => {
-            let cert_path_str = config.tls.cert_path.as_ref().ok_or_else(|| {
-                anyhow!("tls.cert_path is required when tls.mode is set to 'manual'")
-            })?;
-            let key_path_str = config.tls.key_path.as_ref().ok_or_else(|| {
-                anyhow!("tls.key_path is required when tls.mode is set to 'manual'")
-            })?;
+            let cert_path_str = config.tls.cert_path.as_deref().unwrap_or("~/.olp/tls/cert.pem");
+            let key_path_str = config.tls.key_path.as_deref().unwrap_or("~/.olp/tls/key.pem");
             let cert_path = expand_path(cert_path_str)?;
             let key_path = expand_path(key_path_str)?;
+
+            if !cert_path.exists() || !key_path.exists() {
+                if !config.tls.allow_broken_certs {
+                    return Err(anyhow!(
+                        "CRITICAL TLS ERROR: TLS certificates not found:\n  cert: {}\n  key:  {}\n\
+                         Non-TLS connections and broken certificates are DISABLED BY DEFAULT.\n\
+                         Run ./renew-tls.sh to issue Let's Encrypt certificates, or configure `allow_broken_certs = true` \
+                         under [tls] in proxy.toml (not recommended) to bypass.",
+                        cert_path.display(),
+                        key_path.display()
+                    ));
+                }
+                warn!(
+                    "[TLS NOTICE] TLS certificate files not found; falling back to ephemeral self-signed TLS \
+                     because allow_broken_certs = true."
+                );
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+                let cert_der = CertificateDer::from(cert.cert);
+                let key_der =
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+                let provider = Arc::new(rustls::crypto::ring::default_provider());
+                let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
+                    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert_der], key_der)?;
+                return Ok(Some(TlsAcceptor::from(Arc::new(server_cfg))));
+            }
+
             enforce_private_file_permissions(&key_path)?;
 
             let cert_file = File::open(&cert_path)
@@ -88,7 +129,7 @@ pub fn build_public_tls_acceptor(config: &ProxyConfig) -> Result<Option<TlsAccep
             Ok(Some(TlsAcceptor::from(Arc::new(server_cfg))))
         }
         other => Err(anyhow!(
-            "Invalid tls.mode '{}' (expected 'off', 'self-signed', or 'manual')",
+            "Invalid tls.mode '{}' (expected 'manual', 'self-signed', or 'off')",
             other
         )),
     }
@@ -102,6 +143,9 @@ pub struct PortWorker {
     pub user_verifier: RwLock<PasskeyVerifier>,
     pub user_ip_filter: RwLock<Arc<IpFilter>>,
     pub assigned_server_id: RwLock<Option<String>>,
+    pub read_only: AtomicBool,
+    pub concurrency_semaphore: Arc<tokio::sync::Semaphore>,
+    pub request_rate_limiter: Arc<crate::keys::RequestRateLimiter>,
 }
 
 impl PortWorker {
@@ -260,59 +304,51 @@ pub fn extract_model(body_bytes: &[u8], uri: &hyper::Uri) -> String {
     "-".to_string()
 }
 
-/// Extracts the client authentication credential / token string for logging.
-pub fn extract_auth_token(headers: &hyper::HeaderMap) -> String {
+/// Extracts client authentication scheme indicator for access logging without logging raw tokens or passkeys.
+pub fn extract_auth_scheme(headers: &hyper::HeaderMap) -> &'static str {
     if let Some(auth) = headers.get(AUTHORIZATION).and_then(|h| h.to_str().ok()) {
         let auth = auth.trim();
-        if let Some(token) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
-            return format!("Bearer:{}", token.trim());
+        if auth.starts_with("Bearer ") || auth.starts_with("bearer ") {
+            return "auth=bearer";
         }
-        if let Some(b64) = auth.strip_prefix("Basic ").or_else(|| auth.strip_prefix("basic ")) {
-            if let Ok(decoded) = BASE64.decode(b64.trim()) {
-                if let Ok(str_val) = String::from_utf8(decoded) {
-                    return format!("Basic:{}", str_val);
-                }
-            }
-            return format!("Basic:{}", b64.trim());
+        if auth.starts_with("Basic ") || auth.starts_with("basic ") {
+            return "auth=basic";
         }
-        return auth.replace(' ', "_");
+        return "auth=present";
     }
 
     for header_name in &["x-api-key", "api-key", "ollama-api-key", "x-auth-token"] {
-        if let Some(val) = headers.get(*header_name).and_then(|h| h.to_str().ok()) {
-            return format!("ApiKey:{}", val.trim());
+        if headers.contains_key(*header_name) {
+            return "auth=api_key";
         }
     }
 
-    "-".to_string()
+    "-"
 }
 
 /// Streaming body wrapper that passes chunks in real-time, counts total bytes,
-/// captures a snippet of the response, and triggers a callback when complete or dropped.
+/// and triggers a callback with byte count when complete or dropped without retaining body contents.
 pub struct LoggingBody<B> {
     inner: B,
-    on_complete: Option<Box<dyn FnOnce(usize, String) + Send + Sync + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(usize) + Send + Sync + 'static>>,
     total_bytes: usize,
-    snippet_buf: Vec<u8>,
 }
 
 impl<B> LoggingBody<B> {
     pub fn new(
         inner: B,
-        on_complete: impl FnOnce(usize, String) + Send + Sync + 'static,
+        on_complete: impl FnOnce(usize) + Send + Sync + 'static,
     ) -> Self {
         Self {
             inner,
             on_complete: Some(Box::new(on_complete)),
             total_bytes: 0,
-            snippet_buf: Vec::with_capacity(128),
         }
     }
 
     fn finish(&mut self) {
         if let Some(cb) = self.on_complete.take() {
-            let snippet = sanitize_for_log(&String::from_utf8_lossy(&self.snippet_buf), 100);
-            cb(self.total_bytes, snippet);
+            cb(self.total_bytes);
         }
     }
 }
@@ -333,10 +369,6 @@ where
             std::task::Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     this.total_bytes += data.len();
-                    if this.snippet_buf.len() < 128 {
-                        let take = (128 - this.snippet_buf.len()).min(data.len());
-                        this.snippet_buf.extend_from_slice(&data[..take]);
-                    }
                 }
                 std::task::Poll::Ready(Some(Ok(frame)))
             }
@@ -518,14 +550,16 @@ impl ProxyState {
             }
         };
 
-        // 6. Persist into user profile
+        // 6. Persist into user profile with salted one-way hash
         let existing = profile.servers.get(server_id).cloned();
+        let passkey_hash = PasskeyVerifier::from_passkey(passkey_user).to_encoded_hash();
         profile.servers.insert(
             server_id.to_string(),
             UserServerConfig {
                 port,
                 reserved: existing.as_ref().map(|s| s.reserved).unwrap_or(false),
-                passkey_user: passkey_user.to_string(),
+                passkey_user: "".to_string(), // Omit plaintext from disk
+                passkey_user_hash: Some(passkey_hash),
                 allowed_user_cidrs: existing
                     .as_ref()
                     .map(|s| s.allowed_user_cidrs.clone())
@@ -535,8 +569,10 @@ impl ProxyState {
                     .map(|s| s.allowed_server_cidrs.clone())
                     .unwrap_or_else(|| self.config.security.allowed_server_cidrs.clone()),
                 created_at: existing
-                    .and_then(|s| s.created_at)
+                    .as_ref()
+                    .and_then(|s| s.created_at.clone())
                     .or_else(|| Some(format_apache_timestamp(std::time::SystemTime::now()))),
+                read_only: existing.as_ref().and_then(|s| s.read_only),
             },
         );
 
@@ -632,61 +668,62 @@ pub async fn start_proxy_server(
     let local_addr = listener.local_addr()?;
 
     let tunnel_tls_acceptor = if config.tls.mode == "manual" {
-        if let (Some(cert_path_str), Some(key_path_str)) = (&config.tls.cert_path, &config.tls.key_path) {
-            let cert_path = expand_path(cert_path_str)?;
-            let key_path = expand_path(key_path_str)?;
-            if cert_path.exists() && key_path.exists() {
-                let cert_file = File::open(&cert_path)
-                    .with_context(|| format!("Failed to open TLS cert {}", cert_path.display()))?;
-                let mut cert_reader = BufReader::new(cert_file);
-                let certs: Vec<CertificateDer<'static>> =
-                    rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+        let cert_path_str = config.tls.cert_path.as_deref().unwrap_or("~/.olp/tls/cert.pem");
+        let key_path_str = config.tls.key_path.as_deref().unwrap_or("~/.olp/tls/key.pem");
+        let cert_path = expand_path(cert_path_str)?;
+        let key_path = expand_path(key_path_str)?;
+        if cert_path.exists() && key_path.exists() {
+            let cert_file = File::open(&cert_path)
+                .with_context(|| format!("Failed to open TLS cert {}", cert_path.display()))?;
+            let mut cert_reader = BufReader::new(cert_file);
+            let certs: Vec<CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
 
-                let key_file = File::open(&key_path)
-                    .with_context(|| format!("Failed to open TLS key {}", key_path.display()))?;
-                let mut key_reader = BufReader::new(key_file);
-                let key = rustls_pemfile::private_key(&mut key_reader)?
-                    .ok_or_else(|| anyhow!("No private key found in {}", key_path.display()))?;
+            let key_file = File::open(&key_path)
+                .with_context(|| format!("Failed to open TLS key {}", key_path.display()))?;
+            let mut key_reader = BufReader::new(key_file);
+            let key = rustls_pemfile::private_key(&mut key_reader)?
+                .ok_or_else(|| anyhow!("No private key found in {}", key_path.display()))?;
 
-                let provider = Arc::new(rustls::crypto::ring::default_provider());
-                let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
-                    .with_protocol_versions(&[&rustls::version::TLS13])?
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)?;
-                info!(
-                    "Tunnel control port (:4443) secured with CA TLS certificate ({})",
-                    cert_path.display()
-                );
-                TlsAcceptor::from(Arc::new(server_cfg))
-            } else {
-                warn!(
-                    "\n================================================================================\n\
-                     [TLS WARNING] Configured TLS certificate/key not found:\n  cert: {}\n  key:  {}\n\
-                     Falling back to ephemeral self-signed TLS certificate on control port (:4443).\n\
-                     Connecting olp-servers using public domains enforce Mozilla WebPKI CA verification\n\
-                     and will REJECT this certificate with 'TLS handshake failed'.\n\
-                     Run ./renew-tls.sh to issue Let's Encrypt certificates, or configure `tls_verify = false`\n\
-                     on clients for internal testing only.\n\
-                     ================================================================================",
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?;
+            info!(
+                "Tunnel control port (:4443) secured with CA TLS certificate ({})",
+                cert_path.display()
+            );
+            TlsAcceptor::from(Arc::new(server_cfg))
+        } else {
+            if !config.tls.allow_broken_certs {
+                return Err(anyhow!(
+                    "CRITICAL TLS ERROR: TLS certificates not found:\n  cert: {}\n  key:  {}\n\
+                     Non-TLS connections and broken certificates are DISABLED BY DEFAULT.\n\
+                     Run ./renew-tls.sh to issue Let's Encrypt certificates, or pass --allow-broken-certs / set allow_broken_certs = true (not recommended) to bypass.",
                     cert_path.display(),
                     key_path.display()
-                );
-                TlsAcceptor::from(create_tunnel_tls_server_config()?)
+                ));
             }
-        } else {
             warn!(
                 "\n================================================================================\n\
-                 [TLS WARNING] No TLS cert_path/key_path configured in proxy.toml [tls].\n\
-                 Proxy is using an ephemeral self-signed TLS certificate on control port (:4443).\n\
-                 Connecting olp-servers using public domain names enforce CA verification and will\n\
-                 FAIL with 'TLS handshake failed'. Run ./renew-tls.sh to setup Let's Encrypt.\n\
-                 ================================================================================"
+                 [TLS WARNING] Configured TLS certificate/key not found:\n  cert: {}\n  key:  {}\n\
+                 Falling back to ephemeral self-signed TLS certificate on control port (:4443) because allow_broken_certs = true.\n\
+                 ================================================================================",
+                cert_path.display(),
+                key_path.display()
             );
             TlsAcceptor::from(create_tunnel_tls_server_config()?)
         }
     } else {
+        if !config.tls.allow_broken_certs {
+            return Err(anyhow!(
+                "CRITICAL TLS ERROR: Ephemeral/self-signed certificates on tunnel control port (:4443) are disabled by default when tls.mode != 'manual'.\n\
+                 Set tls.mode = 'manual' with valid Let's Encrypt certificates, or pass --allow-broken-certs / set allow_broken_certs = true (not recommended)."
+            ));
+        }
         warn!(
-            "[TLS NOTICE] TLS mode is '{}'. Tunnel control port (:4443) is using ephemeral self-signed TLS.",
+            "[TLS NOTICE] TLS mode is '{}'. Tunnel control port (:4443) is using ephemeral self-signed TLS (allow_broken_certs = true).",
             config.tls.mode
         );
         TlsAcceptor::from(create_tunnel_tls_server_config()?)
@@ -925,9 +962,76 @@ async fn handle_incoming_tunnel(
 
     // Configure worker credentials & ACL specifically for this server
     {
-        *worker.user_verifier.write().unwrap() = PasskeyVerifier::from_passkey(&server_cfg.passkey_user);
+        *worker.user_verifier.write().unwrap() = server_cfg.get_verifier();
         *worker.user_ip_filter.write().unwrap() = Arc::new(IpFilter::new(&server_cfg.allowed_user_cidrs)?);
         *worker.assigned_server_id.write().unwrap() = Some(register.olp_server_id.clone());
+    }
+
+    // Step 8b: Policy enforcement and conflict checking
+    // Rule: "The two controls cannot coexist... you cannot control the behavior both on server and proxy. Only one can be used."
+    if state.config.security.policy_authority == "proxy" {
+        if register.policy_override.is_some() {
+            let conflict_msg = format!(
+                "CRITICAL CONFIG CONFLICT: Sensitive operation controls cannot coexist on both proxy and server!\n\
+                 olp-proxy is currently configured as policy authority (read_only = {}). Server '{}' also attempted to specify policy.\n\
+                 Only one side can control policy. Remove `read_only` from server.toml, or configure `policy_authority = \"server\"` in proxy.toml.",
+                state.config.security.read_only,
+                register.olp_server_id
+            );
+            error!("\n================================================================================\n{}\n================================================================================", conflict_msg);
+            let _ = write_frame(
+                &mut tls_stream,
+                &TunnelEstablished {
+                    accepted: false,
+                    assigned_port: 0,
+                    message: conflict_msg.clone(),
+                },
+            )
+            .await;
+            return Err(anyhow!(conflict_msg));
+        }
+
+        // Proxy controls policy (default: read_only = true)
+        let is_ro = server_cfg.read_only.unwrap_or(state.config.security.read_only);
+        info!(
+            "[POLICY] Proxy controls policy for server '{}': read_only = {} (sensitive Ollama operations {})",
+            register.olp_server_id,
+            is_ro,
+            if is_ro { "BLOCKED" } else { "ALLOWED" }
+        );
+        worker.read_only.store(is_ro, Ordering::Relaxed);
+    } else if state.config.security.policy_authority == "server" {
+        if let Some(server_ro) = register.policy_override {
+            info!(
+                "[POLICY] Server '{}' controls policy: read_only = {} (sensitive Ollama operations {})",
+                register.olp_server_id,
+                server_ro,
+                if server_ro { "BLOCKED" } else { "ALLOWED" }
+            );
+            worker.read_only.store(server_ro, Ordering::Relaxed);
+        } else {
+            let conflict_msg = format!(
+                "CRITICAL CONFIG ERROR: Proxy is configured with `policy_authority = \"server\"`, but server '{}' did not specify policy (read_only is unset in server.toml).\n\
+                 Specify `read_only = true` or `read_only = false` in server.toml.",
+                register.olp_server_id
+            );
+            error!("\n================================================================================\n{}\n================================================================================", conflict_msg);
+            let _ = write_frame(
+                &mut tls_stream,
+                &TunnelEstablished {
+                    accepted: false,
+                    assigned_port: 0,
+                    message: conflict_msg.clone(),
+                },
+            )
+            .await;
+            return Err(anyhow!(conflict_msg));
+        }
+    } else {
+        return Err(anyhow!(
+            "Invalid security.policy_authority '{}' in proxy.toml (must be 'proxy' or 'server')",
+            state.config.security.policy_authority
+        ));
     }
 
     // Step 9: Acknowledge tunnel registration before upgrading stream to Yamux
@@ -995,6 +1099,11 @@ fn get_or_create_port_worker(
         .with_context(|| format!("Failed to bind public port {}", port))?;
 
     let default_user_filter = Arc::new(IpFilter::new(&state.config.security.allowed_user_cidrs)?);
+    let max_active = if state.config.security.max_active_requests_per_server > 0 {
+        state.config.security.max_active_requests_per_server
+    } else {
+        usize::MAX / 2
+    };
     let worker = Arc::new(PortWorker {
         port,
         active_mux: RwLock::new(None),
@@ -1003,6 +1112,11 @@ fn get_or_create_port_worker(
         user_verifier: RwLock::new(PasskeyVerifier::from_passkey("")),
         user_ip_filter: RwLock::new(default_user_filter),
         assigned_server_id: RwLock::new(None),
+        read_only: AtomicBool::new(state.config.security.read_only),
+        concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(max_active)),
+        request_rate_limiter: Arc::new(crate::keys::RequestRateLimiter::new(
+            state.config.security.max_requests_per_min,
+        )),
     });
 
     guard.insert(port, worker.clone());
@@ -1096,17 +1210,22 @@ async fn serve_public_http_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let state_ref = state.clone();
     let service = service_fn(move |req: Request<Incoming>| {
         let worker = worker.clone();
-        let state = state.clone();
+        let state = state_ref.clone();
         async move { handle_public_http_request(req, client_ip, worker, state).await }
     });
 
-    let _ = server_http1::Builder::new()
-        .preserve_header_case(true)
-        .title_case_headers(true)
-        .serve_connection(TokioIo::new(io), service)
-        .await;
+    let timeout_dur = Duration::from_secs(state.config.security.connection_timeout_sec.max(10));
+    let _ = tokio::time::timeout(
+        timeout_dur,
+        server_http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .serve_connection(TokioIo::new(io), service),
+    )
+    .await;
 }
 
 async fn handle_public_http_request(
@@ -1125,28 +1244,7 @@ async fn handle_public_http_request(
         .unwrap_or_else(|| req.uri().path())
         .to_string();
     let version = format!("{:?}", req.version());
-    let token = extract_auth_token(req.headers());
-
-    let (mut parts, incoming_body) = req.into_parts();
-    let body_bytes = if parts.method == Method::GET
-        || parts.method == Method::HEAD
-        || parts.method == Method::OPTIONS
-    {
-        Bytes::new()
-    } else {
-        match incoming_body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => Bytes::new(),
-        }
-    };
-
-    let req_size = body_bytes.len();
-    let req_snippet = if body_bytes.is_empty() {
-        "-".to_string()
-    } else {
-        sanitize_for_log(&String::from_utf8_lossy(&body_bytes), 100)
-    };
-    let model = extract_model(&body_bytes, &parts.uri);
+    let auth_scheme = extract_auth_scheme(req.headers());
 
     let access_logger = state.access_logger.clone();
     let log_event = {
@@ -1154,15 +1252,12 @@ async fn handle_public_http_request(
         let method = method.clone();
         let uri = uri.clone();
         let version = version.clone();
-        let token = token.clone();
-        let model = model.clone();
-        let req_snippet = req_snippet.clone();
-        move |status: StatusCode, resp_bytes: usize, resp_snippet: String| {
+        move |status: StatusCode, resp_bytes: usize, req_size: usize, model: &str| {
             let duration_ms = start_time.elapsed().as_millis();
             let line = format!(
-                r#"{ip} - {token} [{timestamp}] "{method} {uri} {version}" {status} {resp_bytes} {duration_ms}ms model="{model}" req_bytes={req_bytes} req="{req_snippet}" resp="{resp_snippet}""#,
+                r#"{ip} - {auth_scheme} [{timestamp}] "{method} {uri} {version}" {status} {resp_bytes} {duration_ms}ms model="{model}" req_bytes={req_bytes}"#,
                 ip = client_ip,
-                token = token,
+                auth_scheme = auth_scheme,
                 timestamp = timestamp_str,
                 method = method,
                 uri = uri,
@@ -1172,16 +1267,23 @@ async fn handle_public_http_request(
                 duration_ms = duration_ms,
                 model = model,
                 req_bytes = req_size,
-                req_snippet = req_snippet,
-                resp_snippet = resp_snippet,
             );
             access_logger.log(line);
         }
     };
 
+    // 0. Reject CONNECT method immediately with 405 Method Not Allowed
+    if method == Method::CONNECT {
+        let err_json = r#"{"error":"CONNECT method is forbidden"}"#;
+        log_event(StatusCode::METHOD_NOT_ALLOWED, err_json.len(), 0, "-");
+        let mut resp = Response::new(full_body(err_json));
+        *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+        return Ok(resp);
+    }
+
     // 1. Handle CORS preflight without requiring authentication
-    if parts.method == Method::OPTIONS {
-        log_event(StatusCode::NO_CONTENT, 0, "-".to_string());
+    if method == Method::OPTIONS {
+        log_event(StatusCode::NO_CONTENT, 0, 0, "-");
         let mut resp = Response::new(full_body(Bytes::new()));
         *resp.status_mut() = StatusCode::NO_CONTENT;
         resp.headers_mut().insert(
@@ -1211,7 +1313,7 @@ async fn handle_public_http_request(
             client_ip, worker.port
         );
         let err_json = r#"{"error":"forbidden: IP address not allowed by proxy filter"}"#;
-        log_event(StatusCode::FORBIDDEN, err_json.len(), sanitize_for_log(err_json, 100));
+        log_event(StatusCode::FORBIDDEN, err_json.len(), 0, "-");
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::FORBIDDEN;
         resp.headers_mut().insert(
@@ -1224,7 +1326,7 @@ async fn handle_public_http_request(
     // 3. Check pre-tunnel IP brute-force rate limiter
     if state.rate_limiter.is_locked_out(&client_ip).is_some() {
         let err_json = r#"{"error":"too many failed authentication attempts, try again later"}"#;
-        log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), sanitize_for_log(err_json, 100));
+        log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-");
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         resp.headers_mut()
@@ -1236,16 +1338,16 @@ async fn handle_public_http_request(
         return Ok(resp);
     }
 
-    // 4. Verify passkey_user using Basic Auth or Bearer Token in constant time
+    // 4. Verify passkey_user using Basic Auth or Bearer Token in constant time BEFORE body collection
     let is_auth_valid = {
         let verifier = worker.user_verifier.read().unwrap();
-        verify_http_headers_auth(&parts.headers, &verifier)
+        verify_http_headers_auth(req.headers(), &verifier)
     };
 
     if !is_auth_valid {
         state.rate_limiter.record_failure(client_ip);
         let err_json = r#"{"error":"unauthorized: valid Basic Auth (username:passkey_user) or Bearer passkey_user required"}"#;
-        log_event(StatusCode::UNAUTHORIZED, err_json.len(), sanitize_for_log(err_json, 100));
+        log_event(StatusCode::UNAUTHORIZED, err_json.len(), 0, "-");
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::UNAUTHORIZED;
         resp.headers_mut().insert(
@@ -1261,7 +1363,133 @@ async fn handle_public_http_request(
 
     state.rate_limiter.record_success(&client_ip);
 
-    // 5. Retrieve active Yamux session
+    // 5. Check authenticated request rate limiter
+    if !worker.request_rate_limiter.check_and_record(worker.port) {
+        warn!(
+            "[RATE LIMIT] Request on port {} exceeded max_requests_per_min ({})",
+            worker.port, state.config.security.max_requests_per_min
+        );
+        let err_json = r#"{"error":"rate limit exceeded: too many requests per minute"}"#;
+        log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-");
+        let mut resp = Response::new(full_body(err_json));
+        *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        resp.headers_mut().insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("10"));
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_static("*"),
+        );
+        return Ok(resp);
+    }
+
+    // 6. Enforce read-only policy for sensitive Ollama operations
+    let is_read_only = worker.read_only.load(Ordering::Relaxed);
+    if is_read_only && is_sensitive_ollama_op(&method, &uri) {
+        warn!(
+            "[POLICY] Blocked sensitive Ollama operation '{} {}' on port {} (read-only mode active)",
+            method, uri, worker.port
+        );
+        let err_json = r#"{"error":"operation forbidden: sensitive Ollama operations are disabled (read-only mode active)"}"#;
+        log_event(StatusCode::FORBIDDEN, err_json.len(), 0, "-");
+        let mut resp = Response::new(full_body(err_json));
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_static("*"),
+        );
+        return Ok(resp);
+    }
+
+    // 7. Enforce maximum request body size limit via Content-Length header
+    let max_bytes = state.config.security.max_request_body_size_mb * 1024 * 1024;
+    if max_bytes > 0 {
+        if let Some(cl_val) = req.headers().get(hyper::header::CONTENT_LENGTH) {
+            if let Ok(cl_str) = cl_val.to_str() {
+                if let Ok(cl) = cl_str.trim().parse::<usize>() {
+                    if cl > max_bytes {
+                        warn!(
+                            "[SECURITY] Rejected request exceeding max body size ({} > {} bytes) on port {}",
+                            cl, max_bytes, worker.port
+                        );
+                        let err_json = r#"{"error":"payload too large: request body exceeds maximum allowed size"}"#;
+                        log_event(StatusCode::PAYLOAD_TOO_LARGE, err_json.len(), cl, "-");
+                        let mut resp = Response::new(full_body(err_json));
+                        *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                        resp.headers_mut().insert(
+                            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                            hyper::header::HeaderValue::from_static("*"),
+                        );
+                        return Ok(resp);
+                    }
+                }
+            }
+        }
+    }
+
+    // 8. Backend concurrency throttling (GPU VRAM / saturation protection)
+    let permit = match worker.concurrency_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!(
+                "[CONCURRENCY] Max active concurrent requests ({}) reached for worker port {}",
+                state.config.security.max_active_requests_per_server, worker.port
+            );
+            let err_json = r#"{"error":"server busy: maximum concurrent requests reached for this backend"}"#;
+            log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-");
+            let mut resp = Response::new(full_body(err_json));
+            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            resp.headers_mut().insert(RETRY_AFTER, hyper::header::HeaderValue::from_static("5"));
+            resp.headers_mut().insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                hyper::header::HeaderValue::from_static("*"),
+            );
+            return Ok(resp);
+        }
+    };
+
+    // 9. Now collect request body with maximum size streaming cap
+    let (mut parts, incoming_body) = req.into_parts();
+    let max_cap = if max_bytes > 0 { max_bytes } else { usize::MAX };
+    let mut collected = bytes::BytesMut::new();
+    let mut body_stream = incoming_body;
+    let mut overflow = false;
+
+    if parts.method != Method::GET
+        && parts.method != Method::HEAD
+        && parts.method != Method::OPTIONS
+    {
+        while let Some(frame_res) = http_body_util::BodyExt::frame(&mut body_stream).await {
+            match frame_res {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        if collected.len() + data.len() > max_cap {
+                            overflow = true;
+                            break;
+                        }
+                        collected.extend_from_slice(&data);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    if overflow {
+        let err_json = r#"{"error":"payload too large: request body exceeds maximum allowed size"}"#;
+        log_event(StatusCode::PAYLOAD_TOO_LARGE, err_json.len(), collected.len(), "-");
+        let mut resp = Response::new(full_body(err_json));
+        *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_static("*"),
+        );
+        return Ok(resp);
+    }
+
+    let body_bytes = collected.freeze();
+    let req_size = body_bytes.len();
+    let model = extract_model(&body_bytes, &parts.uri);
+
+    // 10. Retrieve active Yamux session
     let mux = {
         let guard = worker.active_mux.read().unwrap();
         guard.clone()
@@ -1271,7 +1499,7 @@ async fn handle_public_http_request(
         Some(m) if !m.is_closed() => m,
         _ => {
             let err_json = r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#;
-            log_event(StatusCode::SERVICE_UNAVAILABLE, err_json.len(), sanitize_for_log(err_json, 100));
+            log_event(StatusCode::SERVICE_UNAVAILABLE, err_json.len(), req_size, &model);
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
             resp.headers_mut().insert(
@@ -1282,12 +1510,12 @@ async fn handle_public_http_request(
         }
     };
 
-    // 6. Open new Yamux substream to `olp-server`
+    // 11. Open new Yamux substream to `olp-server`
     let mux_stream = match mux.open_stream().await {
         Ok(s) => s,
         Err(_) => {
             let err_json = r#"{"error":"failed to open substream to olp-server"}"#;
-            log_event(StatusCode::BAD_GATEWAY, err_json.len(), sanitize_for_log(err_json, 100));
+            log_event(StatusCode::BAD_GATEWAY, err_json.len(), req_size, &model);
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             resp.headers_mut().insert(
@@ -1298,13 +1526,13 @@ async fn handle_public_http_request(
         }
     };
 
-    // 7. Forward HTTP request with stripped auth headers
+    // 12. Forward HTTP request with stripped auth headers
     let (mut client_sender, conn) =
         match hyper::client::conn::http1::handshake(TokioIo::new(mux_stream)).await {
             Ok(pair) => pair,
             Err(_) => {
                 let err_json = r#"{"error":"failed HTTP handshake over tunnel substream"}"#;
-                log_event(StatusCode::BAD_GATEWAY, err_json.len(), sanitize_for_log(err_json, 100));
+                log_event(StatusCode::BAD_GATEWAY, err_json.len(), req_size, &model);
                 let mut resp = Response::new(full_body(err_json));
                 *resp.status_mut() = StatusCode::BAD_GATEWAY;
                 resp.headers_mut().insert(
@@ -1335,14 +1563,16 @@ async fn handle_public_http_request(
                 .or_insert_with(|| hyper::header::HeaderValue::from_static("*"));
             let status = u_parts.status;
             let boxed_upstream = u_body.map_err(|e| e).boxed();
-            let logging_body = LoggingBody::new(boxed_upstream, move |resp_bytes, resp_snippet| {
-                log_event(status, resp_bytes, resp_snippet);
+            let model_for_log = model.clone();
+            let logging_body = LoggingBody::new(boxed_upstream, move |resp_bytes| {
+                let _hold_permit_until_stream_finished = permit;
+                log_event(status, resp_bytes, req_size, &model_for_log);
             });
             Ok(Response::from_parts(u_parts, logging_body.boxed()))
         }
         Err(_) => {
             let err_json = r#"{"error":"upstream olp-server failed to respond"}"#;
-            log_event(StatusCode::BAD_GATEWAY, err_json.len(), sanitize_for_log(err_json, 100));
+            log_event(StatusCode::BAD_GATEWAY, err_json.len(), req_size, &model);
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             resp.headers_mut().insert(

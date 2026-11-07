@@ -4,13 +4,29 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-# Adjust working directory and binary path to your installation:
-WorkingDirectory=/root/olp
-ExecStart=/root/olp/target/release/olp-proxy --non-interactive
+# Unprivileged user execution (recommended):
+# User=olp
+# Group=olp
+WorkingDirectory=/opt/olp
+ExecStart=/opt/olp/target/release/olp-proxy --non-interactive
 Restart=always
 RestartSec=5s
 LimitNOFILE=65535
+
+# Linux Process Isolation & Security Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/olp ~/.olp
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

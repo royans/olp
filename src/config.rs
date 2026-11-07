@@ -20,7 +20,7 @@ pub struct ProxyConfig {
     pub security: ProxySecuritySection,
     #[serde(default)]
     pub tls: ProxyTlsSection,
-    #[serde(default)]
+    #[serde(default = "default_maintenance_for_existing_deployments")]
     pub maintenance: MaintenanceSection,
 }
 
@@ -97,13 +97,29 @@ pub struct UserServerConfig {
     pub port: u16,
     #[serde(default)]
     pub reserved: bool,
+    #[serde(default)]
     pub passkey_user: String,
+    #[serde(default)]
+    pub passkey_user_hash: Option<String>,
     #[serde(default = "default_allowed_cidrs")]
     pub allowed_user_cidrs: Vec<String>,
     #[serde(default = "default_allowed_cidrs")]
     pub allowed_server_cidrs: Vec<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub read_only: Option<bool>,
+}
+
+impl UserServerConfig {
+    pub fn get_verifier(&self) -> crate::keys::PasskeyVerifier {
+        if let Some(ref h) = self.passkey_user_hash {
+            if let Some(v) = crate::keys::PasskeyVerifier::from_encoded_hash(h) {
+                return v;
+            }
+        }
+        crate::keys::PasskeyVerifier::from_passkey(&self.passkey_user)
+    }
 }
 
 impl UserProfile {
@@ -153,6 +169,42 @@ pub struct ProxySecuritySection {
     pub max_auth_failures_per_min: u32,
     #[serde(default = "default_max_concurrent_streams")]
     pub max_concurrent_streams: usize,
+    #[serde(default = "default_read_only_true")]
+    pub read_only: bool,
+    #[serde(default = "default_policy_authority")]
+    pub policy_authority: String,
+    #[serde(default = "default_max_request_body_size_mb")]
+    pub max_request_body_size_mb: usize,
+    #[serde(default = "default_max_active_requests_per_server")]
+    pub max_active_requests_per_server: usize,
+    #[serde(default = "default_max_requests_per_min")]
+    pub max_requests_per_min: u32,
+    #[serde(default = "default_connection_timeout_sec")]
+    pub connection_timeout_sec: u64,
+}
+
+fn default_read_only_true() -> bool {
+    true
+}
+
+fn default_policy_authority() -> String {
+    "proxy".to_string()
+}
+
+fn default_max_request_body_size_mb() -> usize {
+    32
+}
+
+fn default_max_active_requests_per_server() -> usize {
+    4
+}
+
+fn default_max_requests_per_min() -> u32 {
+    300
+}
+
+fn default_connection_timeout_sec() -> u64 {
+    120
 }
 
 impl Default for ProxySecuritySection {
@@ -162,6 +214,12 @@ impl Default for ProxySecuritySection {
             allowed_user_cidrs: default_allowed_cidrs(),
             max_auth_failures_per_min: default_max_auth_failures(),
             max_concurrent_streams: default_max_concurrent_streams(),
+            read_only: true,
+            policy_authority: "proxy".to_string(),
+            max_request_body_size_mb: default_max_request_body_size_mb(),
+            max_active_requests_per_server: default_max_active_requests_per_server(),
+            max_requests_per_min: default_max_requests_per_min(),
+            connection_timeout_sec: default_connection_timeout_sec(),
         }
     }
 }
@@ -172,14 +230,17 @@ pub struct ProxyTlsSection {
     pub mode: String,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
+    #[serde(default)]
+    pub allow_broken_certs: bool,
 }
 
 impl Default for ProxyTlsSection {
     fn default() -> Self {
         Self {
             mode: default_tls_mode(),
-            cert_path: None,
-            key_path: None,
+            cert_path: Some("~/.olp/tls/cert.pem".to_string()),
+            key_path: Some("~/.olp/tls/key.pem".to_string()),
+            allow_broken_certs: false,
         }
     }
 }
@@ -200,7 +261,7 @@ fn default_max_concurrent_streams() -> usize {
     128
 }
 fn default_tls_mode() -> String {
-    "off".to_string()
+    "manual".to_string()
 }
 
 impl ProxyConfig {
@@ -273,7 +334,7 @@ pub struct ServerConfig {
     pub server: ServerSection,
     #[serde(default)]
     pub reconnect: ReconnectSection,
-    #[serde(default)]
+    #[serde(default = "default_maintenance_for_existing_deployments")]
     pub maintenance: MaintenanceSection,
 }
 
@@ -289,27 +350,16 @@ pub struct ServerSection {
     pub remote_port: Option<u16>,
     #[serde(default)]
     pub tls_verify: Option<bool>,
+    #[serde(default)]
+    pub read_only: Option<bool>,
 }
 
 impl ServerSection {
     /// Determines whether to verify the proxy's TLS certificate using Mozilla WebPKI root certificates.
-    /// If explicitly set in server.toml (`tls_verify = true/false`), uses that value.
-    /// Otherwise auto-detects: returns `true` for public domain names, and `false` for raw IP / 127.0.0.1 / localhost.
+    /// Strict CA verification is ENABLED by default for all connections. Broken or self-signed certificates
+    /// are rejected unless explicitly overridden by `tls_verify = false` (not recommended).
     pub fn should_verify_ca(&self) -> bool {
-        if let Some(explicit) = self.tls_verify {
-            return explicit;
-        }
-
-        let host = crate::protocol::extract_host(&self.proxy_addr);
-        if host == "localhost"
-            || host == "127.0.0.1"
-            || host == "::1"
-            || host.parse::<std::net::IpAddr>().is_ok()
-        {
-            false
-        } else {
-            true
-        }
+        self.tls_verify.unwrap_or(true)
     }
 }
 
@@ -366,6 +416,7 @@ impl ServerConfig {
                 passkey_user: generate_random_passkey(),
                 remote_port: None,
                 tls_verify: None,
+                read_only: None,
             },
             reconnect: ReconnectSection::default(),
             maintenance: MaintenanceSection::default(),
@@ -418,13 +469,19 @@ pub struct MaintenanceSection {
 impl Default for MaintenanceSection {
     fn default() -> Self {
         Self {
-            auto_git_pull: default_auto_git_pull(),
+            auto_git_pull: false,
         }
     }
 }
 
 fn default_auto_git_pull() -> bool {
     true
+}
+
+fn default_maintenance_for_existing_deployments() -> MaintenanceSection {
+    MaintenanceSection {
+        auto_git_pull: true,
+    }
 }
 
 /// Accepts TOML booleans as well as the strings "yes"/"no", "true"/"false", "on"/"off", "1"/"0".
@@ -534,8 +591,11 @@ pub struct ProxyCliOverrides {
     pub tls_mode: Option<String>,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
+    pub allow_broken_certs: Option<bool>,
+    pub insecure_no_tls: bool,
     pub access_log: Option<String>,
     pub auto_git_pull: Option<bool>,
+    pub read_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -547,7 +607,9 @@ pub struct ServerCliOverrides {
     pub olp_server_id: Option<String>,
     pub passkey_user: Option<String>,
     pub tls_verify: Option<bool>,
+    pub insecure_skip_tls_verify: bool,
     pub auto_git_pull: Option<bool>,
+    pub read_only: Option<bool>,
 }
 
 /// Ensures `~/.olp/proxy.toml` and `~/.olp/config/` exist.
@@ -613,6 +675,18 @@ pub fn ensure_proxy_initialized(
         }
         if let Some(val) = overrides.auto_git_pull {
             cfg.maintenance.auto_git_pull = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.read_only {
+            cfg.security.read_only = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.allow_broken_certs {
+            cfg.tls.allow_broken_certs = val;
+            modified = true;
+        }
+        if overrides.insecure_no_tls {
+            cfg.tls.mode = "off".to_string();
             modified = true;
         }
 
@@ -707,6 +781,15 @@ pub fn ensure_proxy_initialized(
     if let Some(val) = overrides.auto_git_pull {
         cfg.maintenance.auto_git_pull = val;
     }
+    if let Some(val) = overrides.read_only {
+        cfg.security.read_only = val;
+    }
+    if let Some(val) = overrides.allow_broken_certs {
+        cfg.tls.allow_broken_certs = val;
+    }
+    if overrides.insecure_no_tls {
+        cfg.tls.mode = "off".to_string();
+    }
 
     let all_keys = match overrides.olp_api_keys {
         Some(k) if !k.is_empty() => k,
@@ -784,6 +867,14 @@ pub fn ensure_server_initialized(
         }
         if let Some(val) = overrides.auto_git_pull {
             cfg.maintenance.auto_git_pull = val;
+            modified = true;
+        }
+        if let Some(val) = overrides.read_only {
+            cfg.server.read_only = Some(val);
+            modified = true;
+        }
+        if overrides.insecure_skip_tls_verify {
+            cfg.server.tls_verify = Some(false);
             modified = true;
         }
 
@@ -885,6 +976,12 @@ pub fn ensure_server_initialized(
     if let Some(val) = overrides.auto_git_pull {
         cfg.maintenance.auto_git_pull = val;
     }
+    if let Some(val) = overrides.read_only {
+        cfg.server.read_only = Some(val);
+    }
+    if overrides.insecure_skip_tls_verify {
+        cfg.server.tls_verify = Some(false);
+    }
 
     if cfg.server.olp_api_key.is_empty() {
         cfg.server.olp_api_key = "change-me-to-your-olp-api-key".to_string();
@@ -948,9 +1045,11 @@ mod tests {
                 port: 12345,
                 reserved: true,
                 passkey_user: "user-pass-123".to_string(),
+                passkey_user_hash: None,
                 allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
                 allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
                 created_at: Some("2026-11-06T12:00:00Z".to_string()),
+                read_only: Some(true),
             },
         );
 
@@ -976,10 +1075,10 @@ mod tests {
     }
 
     #[test]
-    fn new_configs_write_auto_git_pull_true() {
+    fn new_configs_write_auto_git_pull_false() {
         let s = toml::to_string_pretty(&ProxyConfig::default_config()).unwrap();
-        assert!(s.contains("[maintenance]") && s.contains("auto_git_pull = true"), "{}", s);
+        assert!(s.contains("[maintenance]") && s.contains("auto_git_pull = false"), "{}", s);
         let s = toml::to_string_pretty(&ServerConfig::default_config()).unwrap();
-        assert!(s.contains("[maintenance]") && s.contains("auto_git_pull = true"), "{}", s);
+        assert!(s.contains("[maintenance]") && s.contains("auto_git_pull = false"), "{}", s);
     }
 }

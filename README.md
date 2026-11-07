@@ -170,18 +170,37 @@ access_log = "~/.olp/access.log" # Apache-style access log (set to "off" to disa
 olp_api_keys = ["admin_key_abc123"]
 
 [security]
+# Read-only mode disallows sensitive mutating Ollama operations:
+# (POST /api/pull, DELETE /api/delete, POST /api/create, POST /api/push, POST /api/copy, raw blobs)
+# Safe inference and read operations are permitted (generate, chat, embeddings, embed, tags, version, show, ps).
+# Enabled by default (read_only = true) to prevent public or untrusted clients from modifying models.
+read_only = true
+
+# Policy Authority determines whether proxy or server controls sensitive operation permissions:
+# - "proxy" (default): olp-proxy dictates read-only policy. olp-servers are prohibited from specifying read_only.
+# - "server": olp-proxy delegates policy enforcement to individual connecting olp-servers.
+policy_authority = "proxy"
+
 allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
 allowed_user_cidrs = ["0.0.0.0/0", "::/0"]
 max_auth_failures_per_min = 60
 max_concurrent_streams = 128
+max_request_body_size_mb = 32         # Cap incoming requests to 32MB (413 if exceeded)
+max_active_requests_per_server = 4   # GPU VRAM throttle: max concurrent inference requests (429 if busy)
+max_requests_per_min = 300           # Authenticated request rate limiter (429 if exceeded)
+connection_timeout_sec = 120         # Slowloris connection timeout
 
 [tls]
-mode = "manual" # "off" (plain HTTP), "manual" (Let's Encrypt / custom PEM), or "self-signed"
-cert_path = "~/.olp/tls/cert.pem"
-key_path = "~/.olp/tls/key.pem"
+mode = "manual" # "manual" (default), "self-signed", or "off"
+# cert_path = "~/.olp/tls/cert.pem"
+# key_path = "~/.olp/tls/key.pem"
+allow_broken_certs = false # default: false (refuses startup if certificates are missing or invalid)
 
 [maintenance]
-auto_git_pull = true
+# Automatic git updates on daily restart / startup.
+# Defaults to false for new deployments. When false, olp-proxy checks for updates and displays
+# a warning banner with a 15-second delayed start if your version is out of sync with remote.
+auto_git_pull = false
 ```
 
 ### `~/.olp/config/<olp_api_key>.toml` (Per-User Profile)
@@ -195,7 +214,7 @@ disabled = false
 [servers.srv_Bc9bOUPj]
 port = 10000
 reserved = false
-passkey_user = "bobiscrazy!!"
+passkey_user_hash = "$blake3$zl77O1CIXmtaaXJ9X200Blf6A258Fe467ZSYgyCPFyk=$6YWrxHckT0ezytY2DpD0Q+ETerdIWSbDx8PAgP055FE="
 allowed_user_cidrs = ["0.0.0.0/0", "::/0"]
 allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
 created_at = "07/Nov/2026:04:25:24 +0000"
@@ -224,9 +243,10 @@ heartbeat_interval_sec = 15
 heartbeat_timeout_sec = 5
 
 [maintenance]
-# Daily scheduled restart runs `git pull --ff-only` (+ rebuild) when installed from a git checkout.
-# Set to false (or "no") to pin the current version. Applies to proxy.toml as well.
-auto_git_pull = true
+# Automatic git updates on daily restart / startup.
+# Defaults to false for new deployments. When false, olp-server checks for updates and displays
+# a warning banner with a 15-second delayed start if your version is out of sync with remote.
+auto_git_pull = false
 ```
 
 ---
@@ -254,16 +274,20 @@ Cline connects cleanly through `olp-proxy`:
 
 `olp-proxy` features built-in high-performance asynchronous HTTP access logging for auditability and abuse analysis.
 
-### Log Format
-Each HTTP inference request appends a single structured entry to `~/.olp/access.log`:
+### Log Format & Privacy Sanitization
+Logs are strictly sanitized to prevent credential and prompt/response leakage:
+- Passkeys and bearer tokens are **never logged** (only the authorization scheme is recorded: `auth=bearer`, `auth=basic`, `auth=api_key`, or `auth=-`).
+- Request and response body text snippets are **never logged**, ensuring zero exposure of private prompt inputs, personal data, or AI-generated output.
+
 ```text
-<Client_IP> - <Token_Preview> [<Timestamp>] "<Method> <Path> <Proto>" <Status> <Resp_Bytes> <Duration_ms>ms model="<Model>" req_bytes=<Req_Size> req="<Req_Snippet>" resp="<Resp_Snippet>"
+<Client_IP> - auth=<Scheme> [<Timestamp>] "<Method> <Path> <Proto>" <Status> <Resp_Bytes> <Duration_ms>ms model="<Model>" req_bytes=<Req_Size>
 ```
 
 ### Example Log Lines
 ```text
-127.0.0.1 - Bearer:bobiscrazy!! [07/Nov/2026:04:43:23 +0000] "GET /api/version HTTP/1.1" 200 20 4ms model="-" req_bytes=0 req="-" resp="{\"version\":\"0.32.6\"}"
-67.180.155.189 - Bearer:bobiscrazy!! [07/Nov/2026:04:45:10 +0000] "POST /api/chat HTTP/1.1" 200 3421 842ms model="qwen3.5" req_bytes=128 req="{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}" resp="{\"message\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}"
+127.0.0.1 - auth=bearer [07/Nov/2026:04:43:23 +0000] "GET /api/tags HTTP/1.1" 200 20 4ms model="-" req_bytes=0
+67.180.155.189 - auth=bearer [07/Nov/2026:04:45:10 +0000] "POST /api/chat HTTP/1.1" 200 3421 842ms model="qwen3.5" req_bytes=128
+67.180.155.189 - auth=basic [07/Nov/2026:04:46:02 +0000] "POST /api/pull HTTP/1.1" 403 98 1ms model="-" req_bytes=34
 ```
 
 Set `access_log = "off"` under `[proxy]` in `proxy.toml` if you wish to disable request logging.
@@ -310,6 +334,59 @@ When multiple users query the same proxied Ollama instance:
   ```bash
   export OLLAMA_NUM_PARALLEL=2  # or 4, depending on GPU VRAM
   ```
+
+---
+
+## Security Architecture & Policy Enforcement
+
+### 1. Read-Only Mode & Sensitive Operations Filter
+By default, `olp-proxy` enforces strict **read-only mode** (`read_only = true`), permitting only safe inference and inspection endpoints:
+- **Permitted Safe Operations**:
+  - `POST /api/generate`, `POST /api/chat`
+  - `POST /api/embeddings`, `POST /api/embed`
+  - `GET /api/tags`, `GET /api/version`, `GET /api/ps`, `POST /api/show`
+- **Blocked Sensitive Mutating Operations** (rejected with `403 Forbidden`):
+  - Model pulling: `POST /api/pull`
+  - Model deletion: `DELETE /api/delete`
+  - Model creation / customization: `POST /api/create`
+  - Model pushing: `POST /api/push`
+  - Model copying: `POST /api/copy`
+  - Raw blob uploads / inspections: `POST /api/blobs/*`, `HEAD /api/blobs/*`
+
+To allow sensitive operations in controlled environments:
+- On `olp-proxy`: launch with `--allow-sensitive-ops` or set `read_only = false` in `proxy.toml`.
+
+### 2. Control Hierarchy & Mutual Exclusion
+To eliminate split-brain security policies across distributed clusters, security policy is governed by a **strict mutual exclusion rule**:
+- **Proxy Authority (Default)**: `policy_authority = "proxy"` in `proxy.toml`. The proxy is the single source of truth. Connecting `olp-server` instances are **strictly prohibited** from specifying `read_only` policy. If an `olp-server` attempts to override policy, tunnel registration fails immediately with `CRITICAL CONFIG CONFLICT`, and the server process halts.
+- **Server Authority**: If `policy_authority = "server"` is configured in `proxy.toml`, the proxy delegates policy to individual connecting servers. In this mode, `olp-server` instances control policy via `--read-only` / `--allow-sensitive-ops` or `read_only` in `server.toml`.
+- Both controls **cannot coexist**. Startup will abort with critical warnings if conflicting configurations are detected.
+
+### 3. Strict TLS & Broken Certificate Defense
+- **TLS by Default**: Unencrypted plain HTTP public endpoints are disabled by default (`tls.mode = "manual"`).
+- **Broken Certificates Rejected**: Startup aborts with `CRITICAL TLS ERROR` if certificates are missing, unreadable, or invalid.
+- **Strict WebPKI CA Verification**: `olp-server` strictly verifies proxy certificates against Mozilla WebPKI CA roots by default, preventing active Man-in-the-Middle (MITM) attacks.
+- **Insecure Bypass Flags (Optional, Not Recommended)**:
+  - `--allow-broken-certs`: Permit self-signed or broken certificates on `olp-proxy`.
+  - `--insecure-no-tls`: Run `olp-proxy` with plain HTTP.
+  - `--insecure-skip-tls-verify`: Bypass CA verification on `olp-server`.
+
+### 4. Log Privacy & Sanitization
+Access logs strictly omit sensitive data:
+- Passkeys, bearer tokens, and API keys are **never** logged (`auth=bearer`, `auth=basic`, `auth=api_key`, or `auth=-`).
+- Request and response body text snippets are **never** logged, completely eliminating prompt, PII, and output leakage.
+
+### 5. Pre-Auth Body Defense & Memory Exhaustion Protection
+- **Pre-Auth Validation**: Client IP CIDR, HTTP method (`CONNECT`), and passkey authentication headers are validated **before** any request body bytes are read into memory. Unauthenticated or malformed requests are rejected immediately with zero body buffering.
+- **Request Body Limits (`max_request_body_size_mb`)**: Incoming request bodies are capped (default: 32 MB). Requests exceeding this limit receive `413 Payload Too Large` immediately.
+
+### 6. Backend GPU Concurrency Throttling & Rate Limiting
+- **Concurrency Throttling (`max_active_requests_per_server`)**: Caps concurrent inference requests per backend Ollama worker (default: 4) to protect GPU VRAM from saturation and out-of-memory crashes. Excess concurrent requests receive `429 Too Many Requests` with a `Retry-After: 5` header.
+- **Authenticated Request Rate Limiting (`max_requests_per_min`)**: Limits inference requests from authorized clients (default: 300 req/min) to prevent accidental loops or resource hogging.
+- **Connection Timeout (`connection_timeout_sec`)**: Idle and slowloris connections are closed after 120 seconds.
+
+### 7. Salted One-Way Hash Storage on Disk
+- In `~/.olp/config/<olp_api_key>.toml`, client credentials are saved as salted BLAKE3 one-way hashes (`passkey_user_hash = "$blake3$<salt>$<hash>"`). Plaintext passkeys are **never** persisted to disk on `olp-proxy`.
 
 ---
 

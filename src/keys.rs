@@ -87,6 +87,70 @@ impl PasskeyVerifier {
         let candidate_hash = Self::compute_hash(&self.salt, candidate);
         self.hash.ct_eq(&candidate_hash).into()
     }
+
+    /// Serializes the salt and hash into a portable `$blake3$<salt_b64>$<hash_b64>` string.
+    pub fn to_encoded_hash(&self) -> String {
+        use base64::prelude::*;
+        let s = BASE64_STANDARD.encode(self.salt);
+        let h = BASE64_STANDARD.encode(self.hash);
+        format!("$blake3${}${}", s, h)
+    }
+
+    /// Deserializes a `$blake3$<salt_b64>$<hash_b64>` encoded string.
+    pub fn from_encoded_hash(encoded: &str) -> Option<Self> {
+        use base64::prelude::*;
+        let parts: Vec<&str> = encoded.split('$').collect();
+        if parts.len() == 4 && parts[1] == "blake3" {
+            let salt_bytes = BASE64_STANDARD.decode(parts[2]).ok()?;
+            let hash_bytes = BASE64_STANDARD.decode(parts[3]).ok()?;
+            if salt_bytes.len() == 32 && hash_bytes.len() == 32 {
+                let mut salt = [0u8; 32];
+                let mut hash = [0u8; 32];
+                salt.copy_from_slice(&salt_bytes);
+                hash.copy_from_slice(&hash_bytes);
+                return Some(Self { salt, hash });
+            }
+        }
+        None
+    }
+}
+
+/// Tracks sliding-window request rates for authenticated requests per server/endpoint.
+#[derive(Debug)]
+pub struct RequestRateLimiter {
+    max_requests_per_min: u32,
+    window_duration: Duration,
+    requests: Mutex<HashMap<u16, Vec<Instant>>>,
+}
+
+impl RequestRateLimiter {
+    pub fn new(max_requests_per_min: u32) -> Self {
+        Self {
+            max_requests_per_min,
+            window_duration: Duration::from_secs(60),
+            requests: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Checks if a request on `port` is permitted. Returns true if allowed, false if limit exceeded.
+    pub fn check_and_record(&self, port: u16) -> bool {
+        if self.max_requests_per_min == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let window_start = now.checked_sub(self.window_duration).unwrap_or(now);
+
+        let mut reqs = self.requests.lock().unwrap();
+        let entry = reqs.entry(port).or_default();
+        entry.retain(|&time| time > window_start);
+
+        if entry.len() >= self.max_requests_per_min as usize {
+            false
+        } else {
+            entry.push(now);
+            true
+        }
+    }
 }
 
 /// Tracks per-IP authentication failures and applies temporary lockouts.
@@ -155,5 +219,36 @@ mod tests {
         assert!(verifier.verify("correct-horse-battery-staple"));
         assert!(!verifier.verify("wrong-passkey"));
         assert!(!verifier.verify(""));
+    }
+
+    #[test]
+    fn test_passkey_verifier_encoded_hash_roundtrip() {
+        let verifier = PasskeyVerifier::from_passkey("my_secure_passkey_123");
+        let encoded = verifier.to_encoded_hash();
+        assert!(encoded.starts_with("$blake3$"));
+
+        let restored = PasskeyVerifier::from_encoded_hash(&encoded).expect("must parse encoded hash");
+        assert_eq!(verifier.salt, restored.salt);
+        assert_eq!(verifier.hash, restored.hash);
+        assert!(restored.verify("my_secure_passkey_123"));
+        assert!(!restored.verify("wrong_passkey"));
+
+        // Malformed hash strings must fail gracefully
+        assert!(PasskeyVerifier::from_encoded_hash("invalid").is_none());
+        assert!(PasskeyVerifier::from_encoded_hash("$unknown$aaa$bbb").is_none());
+        assert!(PasskeyVerifier::from_encoded_hash("$blake3$short$short").is_none());
+    }
+
+    #[test]
+    fn test_request_rate_limiter_window() {
+        let limiter = RequestRateLimiter::new(3);
+        assert!(limiter.check_and_record(10001));
+        assert!(limiter.check_and_record(10001));
+        assert!(limiter.check_and_record(10001));
+        // 4th request in the same window must be rejected
+        assert!(!limiter.check_and_record(10001));
+
+        // Different port has independent limit
+        assert!(limiter.check_and_record(10002));
     }
 }

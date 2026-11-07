@@ -12,6 +12,19 @@ Restart=always
 RestartSec=5s
 LimitNOFILE=65535
 
+# Linux Process Isolation & Security Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ollama/.olp
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=yes
+
 [Install]
 WantedBy=multi-user.target
 

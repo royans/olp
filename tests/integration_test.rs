@@ -29,6 +29,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio_rustls::TlsConnector;
 
+fn test_proxy_tls() -> ProxyTlsSection {
+    ProxyTlsSection {
+        mode: "off".to_string(),
+        cert_path: None,
+        key_path: None,
+        allow_broken_certs: true,
+    }
+}
+
 /// Starts a mock local Ollama HTTP server that verifies request sanitization and supports chunked token streaming.
 async fn start_mock_ollama() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -162,8 +171,9 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             allowed_user_cidrs: vec!["127.0.0.1/32".to_string()],
             max_auth_failures_per_min: 3,
             max_concurrent_streams: 64,
+            ..Default::default()
         },
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -179,7 +189,8 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             olp_server_id: "srv_integration_1".to_string(),
             passkey_user: passkey_user.to_string(),
             remote_port: Some(remote_port),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection {
             strategy: "fibonacci".to_string(),
@@ -307,8 +318,9 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             allowed_user_cidrs: vec!["192.168.99.0/24".to_string()], // 127.0.0.1 will NOT be allowed for user HTTP
             max_auth_failures_per_min: 60,
             max_concurrent_streams: 64,
+            ..Default::default()
         },
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -325,7 +337,8 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             olp_server_id: "srv_wrong".to_string(),
             passkey_user: "some_user_pass".to_string(),
             remote_port: Some(18450),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -347,7 +360,8 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             olp_server_id: "srv_correct".to_string(),
             passkey_user: "legit-user-passkey".to_string(),
             remote_port: Some(18451),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -470,8 +484,9 @@ async fn test_model_auto_mapping_and_cors() {
             allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
             max_auth_failures_per_min: 60,
             max_concurrent_streams: 64,
+            ..Default::default()
         },
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -486,7 +501,8 @@ async fn test_model_auto_mapping_and_cors() {
             olp_server_id: "srv_model1".to_string(),
             passkey_user: "test-user-passkey".to_string(),
             remote_port: Some(18550),
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -593,8 +609,9 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
             allowed_user_cidrs: vec!["127.0.0.1/32".to_string()],
             max_auth_failures_per_min: 60,
             max_concurrent_streams: 64,
+            ..Default::default()
         },
-        tls: ProxyTlsSection::default(),
+        tls: test_proxy_tls(),
         maintenance: Default::default(),
     };
 
@@ -609,7 +626,8 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
             olp_server_id: "srv_alice_1".to_string(),
             passkey_user: "alice_pass_1".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -629,7 +647,8 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
             olp_server_id: "srv_alice_2".to_string(),
             passkey_user: "alice_pass_2".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -649,7 +668,8 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
             olp_server_id: "srv_bob_1".to_string(),
             passkey_user: "bob_pass_1".to_string(),
             remote_port: None,
-            tls_verify: None,
+            tls_verify: Some(false),
+            read_only: None,
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),

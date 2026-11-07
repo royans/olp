@@ -49,6 +49,18 @@ struct Args {
     #[arg(long)]
     auto_git_pull: Option<bool>,
 
+    /// Enforce read-only mode locally on olp-server (cannot coexist with proxy policy)
+    #[arg(long)]
+    read_only: bool,
+
+    /// Explicitly allow sensitive Ollama operations locally on olp-server (cannot coexist with proxy policy)
+    #[arg(long, conflicts_with = "read_only")]
+    allow_sensitive_ops: bool,
+
+    /// Skip TLS certificate verification (NOT RECOMMENDED: permits broken/untrusted certs)
+    #[arg(long)]
+    insecure_skip_tls_verify: bool,
+
     /// Initialize ~/.olp/server.toml, then exit without connecting
     #[arg(long)]
     init_only: bool,
@@ -95,7 +107,15 @@ async fn main() -> Result<()> {
         olp_server_id: args.server_id,
         passkey_user: args.passkey_user,
         tls_verify: args.tls_verify,
+        insecure_skip_tls_verify: args.insecure_skip_tls_verify,
         auto_git_pull: args.auto_git_pull,
+        read_only: if args.read_only {
+            Some(true)
+        } else if args.allow_sensitive_ops {
+            Some(false)
+        } else {
+            None
+        },
     };
 
     let cfg = ensure_server_initialized(&config_path, args.non_interactive, overrides)?;

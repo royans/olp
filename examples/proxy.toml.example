@@ -24,6 +24,18 @@ access_log = "~/.olp/access.log"
 olp_api_keys = ["admin_key_abc123"]
 
 [security]
+# Read-only mode disallows sensitive mutating Ollama operations:
+# (POST /api/pull, DELETE /api/delete, POST /api/create, POST /api/push, POST /api/copy, raw blobs)
+# Safe inference and read operations are permitted (generate, chat, embeddings, embed, tags, version, show, ps).
+# Enabled by default (read_only = true) to prevent public or untrusted clients from pulling or deleting models.
+read_only = true
+
+# Policy Authority determines whether proxy or server controls sensitive operation permissions:
+# - "proxy" (default): olp-proxy dictates read-only policy. olp-servers are prohibited from specifying read_only
+#                      (handshake will abort with CRITICAL CONFIG CONFLICT if both attempt control).
+# - "server": olp-proxy delegates policy enforcement to individual connecting olp-servers.
+policy_authority = "proxy"
+
 # Default CIDR blocks for tunnel connections from olp-server (defaults to all: ["0.0.0.0/0", "::/0"])
 # Individual servers can also specify their own allowed_server_cidrs in ~/.olp/config/<olp_api_key>.toml
 allowed_server_cidrs = ["0.0.0.0/0", "::/0"]
@@ -37,18 +49,41 @@ max_auth_failures_per_min = 60
 # Maximum concurrent multiplexed HTTP streams per reverse tunnel
 max_concurrent_streams = 128
 
+# Maximum request body size in megabytes (defaults to 32 MB).
+# Requests exceeding this cap are rejected with 413 Payload Too Large.
+max_request_body_size_mb = 32
+
+# Backend concurrency throttling: maximum active concurrent requests per Ollama backend (default: 4).
+# Protects Ollama from GPU VRAM exhaustion. Excess requests receive 429 Too Many Requests (Retry-After: 5).
+# Set to 0 to disable concurrency limits.
+max_active_requests_per_server = 4
+
+# Maximum authenticated HTTP inference requests per minute per server (default: 300).
+# Set to 0 to disable rate limiting for authorized users.
+max_requests_per_min = 300
+
+# Connection idle timeout in seconds (default: 120). Stalled or slowloris connections are closed after this duration.
+connection_timeout_sec = 120
+
 [tls]
-# Public Ollama endpoint TLS mode: "off" (plain HTTP), "manual" (Let's Encrypt / custom PEM), or "self-signed"
-# NOTE: The reverse tunnel connection between olp-server and olp-proxy (:4443) is ALWAYS encrypted with TLS 1.3.
+# Public Ollama endpoint TLS mode: "manual" (Let's Encrypt / custom PEM), "self-signed", or "off"
+# NOTE: Non-TLS connections are disabled by default ("manual").
+# The reverse tunnel connection between olp-server and olp-proxy (:4443) is ALWAYS encrypted with TLS 1.3.
 # When mode is set to "manual" with valid cert_path and key_path (e.g. provisioned via ./renew-tls.sh),
 # the trusted CA certificate is also bound to control port :4443, enabling connecting olp-servers to verify
 # the proxy against Mozilla WebPKI CA roots (preventing MITM attacks).
-mode = "off"
-# If mode = "manual":
+mode = "manual"
 # cert_path = "~/.olp/tls/cert.pem"
 # key_path = "~/.olp/tls/key.pem"
 
+# Allow broken or missing certificates (defaults to false).
+# If false, olp-proxy will abort startup with a critical error if certificates are missing or untrusted.
+# Set to true only for temporary development environments via --allow-broken-certs (NOT RECOMMENDED).
+allow_broken_certs = false
+
 [maintenance]
-# Daily scheduled restart runs `git pull --ff-only` (+ rebuild) when installed from a git checkout.
-# Set to false (or "no") to pin the current version.
-auto_git_pull = true
+# Automatic git updates on daily restart / startup.
+# Defaults to false for new deployments. When false, olp-proxy checks git for updates and displays
+# a prominent warning banner with a 15-second delayed start if your version is out of sync with remote.
+# Set to true to enable automated git pull and rebuild on restarts.
+auto_git_pull = false

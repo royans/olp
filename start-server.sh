@@ -118,18 +118,100 @@ find_compiled_binary() {
 # ------------------------------------------------------------------------------
 # 2. Git Auto-Update Logic
 # ------------------------------------------------------------------------------
+# 2. Git Auto-Update Logic
+# ------------------------------------------------------------------------------
 # Reads `auto_git_pull` from the [maintenance] section of the config file.
-# Missing file/key => enabled (default). "false"/"no"/"off"/"0" => disabled.
+# For existing deployments, missing key => enabled. Going forward / new => disabled.
 git_pull_enabled() {
     if [ ! -f "$CONFIG_FILE" ]; then
-        return 0
+        return 1
     fi
     local val
     val=$(sed -n -E 's/^[[:space:]]*auto_git_pull[[:space:]]*=[[:space:]]*["'\'']?([A-Za-z0-9]+).*/\1/p' "$CONFIG_FILE" 2>/dev/null | tail -n 1 | tr '[:upper:]' '[:lower:]')
     case "$val" in
         false|no|n|off|0) return 1 ;;
+        true|yes|y|on|1) return 0 ;;
     esac
+    # For existing deployments where auto_git_pull was omitted, leave autoupdate on:
     return 0
+}
+
+# Checks if local git repository is behind upstream and warns with a 15-second delayed start
+check_git_updates_and_warn() {
+    if [ ! -d ".git" ] || ! command -v git >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! git remote get-url origin >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "[olp-server] Checking for repository updates from git (autoupdate is OFF)..."
+    local fetch_ok=0
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout 5 git fetch -q origin 2>/dev/null; then
+            fetch_ok=1
+        fi
+    else
+        if git fetch -q origin 2>/dev/null; then
+            fetch_ok=1
+        fi
+    fi
+
+    if [ "$fetch_ok" -eq 0 ]; then
+        echo "[olp-server] Note: Could not check remote git updates (network unreachable or offline)."
+        return 0
+    fi
+
+    local LOCAL UPSTREAM
+    LOCAL=$(git rev-parse HEAD 2>/dev/null || true)
+    UPSTREAM=$(git rev-parse '@{u}' 2>/dev/null || git rev-parse 'origin/main' 2>/dev/null || true)
+
+    if [ -z "$LOCAL" ] || [ -z "$UPSTREAM" ]; then
+        return 0
+    fi
+
+    local BEHIND_COUNT
+    BEHIND_COUNT=$(git rev-list --count "HEAD..$UPSTREAM" 2>/dev/null || echo "0")
+
+    if [ "$LOCAL" != "$UPSTREAM" ] && [ "$BEHIND_COUNT" -gt 0 ]; then
+        local LOCAL_SHORT="${LOCAL:0:7}"
+        local UPSTREAM_SHORT="${UPSTREAM:0:7}"
+        local LAST_COMMIT_MSG
+        LAST_COMMIT_MSG=$(git log -1 --pretty=format:"%s (%cr)" "$UPSTREAM" 2>/dev/null || true)
+
+        echo ""
+        echo "================================================================================"
+        echo "  [WARNING: VERSION OUT OF SYNC - UPDATE AVAILABLE]"
+        echo "================================================================================"
+        echo "  Your olp-server is running an OUTDATED version of the codebase!"
+        echo "  Current local commit : $LOCAL_SHORT"
+        echo "  Latest remote commit: $UPSTREAM_SHORT ($BEHIND_COUNT commit(s) behind origin/main)"
+        if [ -n "$LAST_COMMIT_MSG" ]; then
+            echo "  Latest change       : $LAST_COMMIT_MSG"
+        fi
+        echo ""
+        echo "  Automatic git updates are currently turned OFF in your configuration."
+        echo "  To update to the latest version now, run:"
+        echo "      ./start-server.sh update"
+        echo ""
+        echo "  To re-enable automatic daily updates, set:"
+        echo "      [maintenance]"
+        echo "      auto_git_pull = true"
+        echo "  in $CONFIG_FILE"
+        echo ""
+        echo "  DELAYING STARTUP BY 15 SECONDS to ensure this warning is noticed..."
+        echo "================================================================================"
+        echo ""
+
+        for i in {15..1}; do
+            printf "\r[olp-server] Continuing startup in %2d seconds (press Ctrl+C to cancel)... " "$i"
+            sleep 1
+        done
+        echo ""
+        echo "[olp-server] Resuming startup with version $LOCAL_SHORT..."
+    else
+        echo "[olp-server] Code is in sync with remote (${LOCAL:0:7})."
+    fi
 }
 
 # Usage: auto_update_from_git [force]
@@ -140,7 +222,7 @@ auto_update_from_git() {
             return 0
         fi
         if [ -d ".git" ] && ! git_pull_enabled; then
-            echo "[olp-server] auto_git_pull is disabled in $CONFIG_FILE; skipping git pull."
+            check_git_updates_and_warn
             return 0
         fi
     fi

@@ -56,6 +56,22 @@ struct Args {
     #[arg(long)]
     auto_git_pull: Option<bool>,
 
+    /// Enforce read-only mode (disable sensitive Ollama operations like pull/delete/create)
+    #[arg(long)]
+    read_only: bool,
+
+    /// Allow sensitive Ollama operations (pull, delete, create, push, copy)
+    #[arg(long, conflicts_with = "read_only")]
+    allow_sensitive_ops: bool,
+
+    /// Allow broken or ephemeral self-signed certificates on proxy (NOT RECOMMENDED)
+    #[arg(long)]
+    allow_broken_certs: bool,
+
+    /// Disable TLS completely and run plaintext HTTP (NOT RECOMMENDED)
+    #[arg(long)]
+    insecure_no_tls: bool,
+
     /// Initialize ~/.olp/proxy.toml with passkeys and settings, then exit without starting listener
     #[arg(long)]
     init_only: bool,
@@ -118,8 +134,17 @@ async fn main() -> Result<()> {
         tls_mode: args.tls_mode,
         tls_cert_path: args.tls_cert,
         tls_key_path: args.tls_key,
+        allow_broken_certs: if args.allow_broken_certs { Some(true) } else { None },
+        insecure_no_tls: args.insecure_no_tls,
         access_log: args.access_log,
         auto_git_pull: args.auto_git_pull,
+        read_only: if args.read_only {
+            Some(true)
+        } else if args.allow_sensitive_ops {
+            Some(false)
+        } else {
+            None
+        },
     };
 
     let cfg = ensure_proxy_initialized(&config_path, args.non_interactive, overrides)?;

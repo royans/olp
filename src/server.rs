@@ -2,8 +2,8 @@ use crate::backoff::FibonacciBackoff;
 use crate::config::ServerConfig;
 use crate::mux::{spawn_mux_session, CompatYamuxStream};
 use crate::protocol::{
-    configure_tunnel_socket, create_tunnel_tls_client_config, extract_host, read_frame, write_frame,
-    ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished,
+    configure_tunnel_socket, create_tunnel_tls_client_config, extract_host, is_sensitive_ollama_op,
+    read_frame, write_frame, ProxyHelloChallenge, ServerAuthRegister, TunnelEstablished,
 };
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -94,7 +94,16 @@ pub async fn run_server_with_shutdown(
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("ERR_UNAUTHORIZED_KEY") || err_str.contains("ERR_INVALID_AUTH_TOKEN") {
+                if err_str.contains("CRITICAL CONFIG CONFLICT") || err_str.contains("CRITICAL CONFIG ERROR") {
+                    error!(
+                        "\n================================================================================\n\
+                         [CRITICAL CONFIG CONFLICT] Tunnel registration rejected!\n\
+                         {}\n\
+                         ================================================================================",
+                        err_str
+                    );
+                    return Err(e);
+                } else if err_str.contains("ERR_UNAUTHORIZED_KEY") || err_str.contains("ERR_INVALID_AUTH_TOKEN") {
                     if backoff.attempt() == 1 || backoff.attempt() % 5 == 0 {
                         error!(
                             "\n================================================================================\n\
@@ -179,13 +188,14 @@ pub async fn run_single_tunnel_session(
     .await
     .context("Timed out waiting for ProxyHelloChallenge")??;
 
-    // Step 2: Send ServerAuthRegister with auth token computed from olp_api_key
-    let register = ServerAuthRegister::new(
+    // Step 2: Send ServerAuthRegister with auth token computed from olp_api_key and optional policy override
+    let register = ServerAuthRegister::with_policy(
         &config.server.olp_api_key,
         &config.server.olp_server_id,
         config.server.remote_port,
         &config.server.passkey_user,
         &challenge.proxy_nonce,
+        config.server.read_only,
     );
 
     tokio::time::timeout(
@@ -237,6 +247,7 @@ pub async fn run_single_tunnel_session(
     let hb_timeout = Duration::from_secs(config.reconnect.heartbeat_timeout_sec.max(1));
     let ollama_addr = config.server.ollama_addr.clone();
     let model_tracker = Arc::new(ActiveModelTracker::new(ollama_addr.clone()));
+    let server_read_only = config.server.read_only.unwrap_or(false);
 
     let mut ticker = tokio::time::interval(hb_interval);
     ticker.tick().await;
@@ -255,7 +266,7 @@ pub async fn run_single_tunnel_session(
                         let target = ollama_addr.clone();
                         let tracker = model_tracker.clone();
                         tokio::spawn(async move {
-                            serve_proxied_ollama_stream(yamux_stream, target, tracker).await;
+                            serve_proxied_ollama_stream(yamux_stream, target, tracker, server_read_only).await;
                         });
                     }
                     None => {
@@ -419,11 +430,12 @@ async fn serve_proxied_ollama_stream(
     yamux_stream: CompatYamuxStream,
     ollama_addr: String,
     model_tracker: Arc<ActiveModelTracker>,
+    server_read_only: bool,
 ) {
     let service = service_fn(move |req: Request<Incoming>| {
         let target_addr = ollama_addr.clone();
         let tracker = model_tracker.clone();
-        async move { forward_to_local_ollama(req, &target_addr, &tracker).await }
+        async move { forward_to_local_ollama(req, &target_addr, &tracker, server_read_only).await }
     });
 
     let _ = server_http1::Builder::new()
@@ -437,6 +449,7 @@ async fn forward_to_local_ollama(
     req: Request<Incoming>,
     ollama_addr: &str,
     model_tracker: &ActiveModelTracker,
+    server_read_only: bool,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
     if req.method() == Method::CONNECT {
         let mut resp = Response::new(full_body(r#"{"error":"CONNECT method is forbidden"}"#));
@@ -450,6 +463,18 @@ async fn forward_to_local_ollama(
         .map(|pq| pq.as_str())
         .unwrap_or("/")
         .to_string();
+
+    if server_read_only && is_sensitive_ollama_op(req.method(), &path_and_query) {
+        warn!(
+            "[POLICY] Blocked sensitive Ollama operation '{} {}' on server (read-only mode active)",
+            req.method(), path_and_query
+        );
+        let mut resp = Response::new(full_body(
+            r#"{"error":"operation forbidden: sensitive Ollama operations are disabled on server (read-only mode active)"}"#,
+        ));
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        return Ok(resp);
+    }
 
     let (mut parts, incoming_body) = req.into_parts();
 
