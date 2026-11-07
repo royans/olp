@@ -659,12 +659,36 @@ pub async fn start_proxy_server(
                 );
                 TlsAcceptor::from(Arc::new(server_cfg))
             } else {
+                warn!(
+                    "\n================================================================================\n\
+                     [TLS WARNING] Configured TLS certificate/key not found:\n  cert: {}\n  key:  {}\n\
+                     Falling back to ephemeral self-signed TLS certificate on control port (:4443).\n\
+                     Connecting olp-servers using public domains enforce Mozilla WebPKI CA verification\n\
+                     and will REJECT this certificate with 'TLS handshake failed'.\n\
+                     Run ./renew-tls.sh to issue Let's Encrypt certificates, or configure `tls_verify = false`\n\
+                     on clients for internal testing only.\n\
+                     ================================================================================",
+                    cert_path.display(),
+                    key_path.display()
+                );
                 TlsAcceptor::from(create_tunnel_tls_server_config()?)
             }
         } else {
+            warn!(
+                "\n================================================================================\n\
+                 [TLS WARNING] No TLS cert_path/key_path configured in proxy.toml [tls].\n\
+                 Proxy is using an ephemeral self-signed TLS certificate on control port (:4443).\n\
+                 Connecting olp-servers using public domain names enforce CA verification and will\n\
+                 FAIL with 'TLS handshake failed'. Run ./renew-tls.sh to setup Let's Encrypt.\n\
+                 ================================================================================"
+            );
             TlsAcceptor::from(create_tunnel_tls_server_config()?)
         }
     } else {
+        warn!(
+            "[TLS NOTICE] TLS mode is '{}'. Tunnel control port (:4443) is using ephemeral self-signed TLS.",
+            config.tls.mode
+        );
         TlsAcceptor::from(create_tunnel_tls_server_config()?)
     };
 
@@ -714,7 +738,15 @@ pub async fn start_proxy_server(
                             handle_incoming_tunnel(tcp_stream, peer_addr, acceptor, state_clone)
                                 .await
                         {
-                            warn!("Tunnel connection from {} ended: {}", peer_addr, e);
+                            let err_msg = format!("{:#}", e);
+                            if err_msg.contains("TLS handshake failed") || err_msg.contains("Handshake") || err_msg.contains("AlertReceived") {
+                                warn!(
+                                    "Tunnel connection from {} ended: {}. (Note: If connecting via domain name, client requires valid CA/Let's Encrypt certificates on proxy. Run ./renew-tls.sh if certificates are missing or expired).",
+                                    peer_addr, err_msg
+                                );
+                            } else {
+                                warn!("Tunnel connection from {} ended: {}", peer_addr, err_msg);
+                            }
                         }
                     });
                 }

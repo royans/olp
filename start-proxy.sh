@@ -516,6 +516,20 @@ if [ ! -f "$CONFIG_FILE" ]; then
     fi
 fi
 
+# TLS Certificate Presence Check & Warning
+if [ -f "$CONFIG_FILE" ]; then
+    CERT_SETTING=$(grep -E '^[[:space:]]*cert_path[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' "' || true)
+    if [ -n "$CERT_SETTING" ]; then
+        CERT_EXPANDED="${CERT_SETTING/#\~/$HOME}"
+        if [ ! -f "$CERT_EXPANDED" ]; then
+            echo "[olp-proxy] [WARN] TLS certificate '$CERT_EXPANDED' not found on disk!"
+            echo "[olp-proxy] [WARN] Without a valid certificate, olp-proxy will fall back to an untrusted self-signed certificate."
+            echo "[olp-proxy] [WARN] Remote olp-servers connecting via domain names enforce CA verification and will FAIL with 'TLS handshake failed'."
+            echo "[olp-proxy] [WARN] Please run: ./renew-tls.sh to generate a Let's Encrypt certificate."
+        fi
+    fi
+fi
+
 # ------------------------------------------------------------------------------
 # 6. Install / upgrade cronjobs (watchdog + daily restart)
 # ------------------------------------------------------------------------------

@@ -104,6 +104,23 @@ pub async fn run_server_with_shutdown(
                              ================================================================================"
                         );
                     }
+                } else if err_str.contains("TLS 1.3 handshake failed") || err_str.contains("certificate") {
+                    if backoff.attempt() == 1 || backoff.attempt() % 5 == 0 {
+                        error!(
+                            "\n================================================================================\n\
+                             [TLS ERROR] TLS 1.3 handshake failed connecting to {}!\n\
+                             CA verification: {}\n\
+                             Broken, missing, or self-signed TLS certificates on the proxy are rejected by\n\
+                             Mozilla WebPKI CA roots to prevent MITM attacks.\n\
+                             Solutions:\n\
+                             1. On olp-proxy: Generate a valid Let's Encrypt certificate (run ./renew-tls.sh).\n\
+                             2. For testing/internal environments: Add `tls_verify = false` under [server] in\n\
+                                ~/.olp/server.toml to bypass CA verification.\n\
+                             ================================================================================",
+                            config.server.proxy_addr,
+                            if verify_ca { "ENABLED (enforced for domain names)" } else { "DISABLED" }
+                        );
+                    }
                 }
                 warn!(
                     "Tunnel error ({}); retrying in {:.1}s (Fibonacci attempt #{})",

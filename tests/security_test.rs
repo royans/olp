@@ -2,8 +2,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use hyper::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use olp::cidr::{CidrBlock, IpFilter};
 use olp::config::{
-    ProxyAuthSection, ProxyConfig, ProxySection, ProxySecuritySection, ProxyTlsSection,
-    ReconnectSection, ServerConfig, ServerSection,
+    olp_config_dir, ProxyAuthSection, ProxyConfig, ProxySection, ProxySecuritySection,
+    ProxyTlsSection, ReconnectSection, ServerConfig, ServerSection, UserProfile, UserServerConfig,
 };
 use olp::keys::{enforce_private_file_permissions, IpRateLimiter, PasskeyVerifier};
 use olp::protocol::{
@@ -633,4 +633,438 @@ async fn test_apache_access_log_file_logging() {
     assert!(content.contains("req=\"{\\\"model\\\":\\\"llama3\\\",\\\"prompt\\\":\\\"hello\\\"}\""));
     assert!(content.contains("OPTIONS /api/tags HTTP/1.1"));
     assert!(content.contains("204"));
+}
+
+// ============================================================================
+// 6. MULTI-TENANT, ACL & BOUNDARY ATTACK TESTS
+// ============================================================================
+
+#[tokio::test]
+async fn test_handshake_rejects_path_traversal_identifiers() {
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "17200-17300".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec!["valid_user_key".to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    // Case A: Traversal in olp_api_key
+    let mut server_traversal_key = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: "../../../etc/shadow".to_string(),
+            olp_server_id: "srv_valid".to_string(),
+            passkey_user: "user_pass".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx1, mut rx1) = watch::channel(false);
+    let res1 = run_single_tunnel_session(&mut server_traversal_key, &connector, &mut rx1).await;
+    assert!(res1.is_err());
+    let err1 = res1.unwrap_err().to_string();
+    assert!(err1.contains("ERR_INVALID_IDENTIFIER"), "Expected ERR_INVALID_IDENTIFIER, got: {}", err1);
+
+    // Case B: Traversal in olp_server_id
+    let mut server_traversal_id = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: "valid_user_key".to_string(),
+            olp_server_id: "srv/../../evil".to_string(),
+            passkey_user: "user_pass".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx2, mut rx2) = watch::channel(false);
+    let res2 = run_single_tunnel_session(&mut server_traversal_id, &connector, &mut rx2).await;
+    assert!(res2.is_err());
+    let err2 = res2.unwrap_err().to_string();
+    assert!(err2.contains("ERR_INVALID_IDENTIFIER"), "Expected ERR_INVALID_IDENTIFIER, got: {}", err2);
+}
+
+#[tokio::test]
+async fn test_user_disabled_account_rejection() {
+    let user_key = "disabled_user_account";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "17300-17400".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    // Manually create user profile with disabled = true
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    let mut profile = UserProfile::new(user_key);
+    profile.user.disabled = true;
+    profile.save_atomic(&profile_path).unwrap();
+
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_disabled_test".to_string(),
+            passkey_user: "user_pass".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    let res = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("ERR_USER_DISABLED"), "Expected ERR_USER_DISABLED, got: {}", err);
+
+    let _ = std::fs::remove_file(&profile_path);
+}
+
+#[tokio::test]
+async fn test_user_max_servers_limit_enforcement() {
+    let user_key = "quota_limited_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "17400-17450".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    // Set max_servers = 1
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    let mut profile = UserProfile::new(user_key);
+    profile.user.max_servers = 1;
+    profile.save_atomic(&profile_path).unwrap();
+
+    // 1st server -> succeeds
+    let mut server1 = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_slot1".to_string(),
+            passkey_user: "user_pass".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (tx1, mut rx1) = watch::channel(false);
+    let conn1 = connector.clone();
+    let handle1 = tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut server1, &conn1, &mut rx1).await;
+        server1
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 2nd server -> exceeds max_servers (1), must be rejected with ERR_MAX_SERVERS_EXCEEDED
+    let mut server2 = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_slot2_overflow".to_string(),
+            passkey_user: "user_pass".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx2, mut rx2) = watch::channel(false);
+    let res2 = run_single_tunnel_session(&mut server2, &connector, &mut rx2).await;
+    assert!(res2.is_err());
+    let err2 = res2.unwrap_err().to_string();
+    assert!(err2.contains("ERR_MAX_SERVERS_EXCEEDED"), "Expected ERR_MAX_SERVERS_EXCEEDED, got: {}", err2);
+
+    let _ = tx1.send(true);
+    let _ = handle1.await;
+    let _ = std::fs::remove_file(&profile_path);
+}
+
+#[tokio::test]
+async fn test_cross_user_port_stealing_prevention() {
+    let alice_key = "cross_user_alice";
+    let bob_key = "cross_user_bob";
+
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "17500-17600".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![alice_key.to_string(), bob_key.to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    // Pre-allocate port 17500 to Alice
+    let config_dir = olp_config_dir().unwrap();
+    let alice_profile_path = config_dir.join(format!("{}.toml", alice_key));
+    let mut alice_profile = UserProfile::new(alice_key);
+    alice_profile.servers.insert(
+        "srv_alice_box".to_string(),
+        UserServerConfig {
+            port: 17500,
+            reserved: true,
+            passkey_user: "alice_pass".to_string(),
+            allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
+            allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
+            created_at: None,
+        },
+    );
+    alice_profile.save_atomic(&alice_profile_path).unwrap();
+
+    // Bob tries to connect recommending port 17500
+    let mut bob_server = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: bob_key.to_string(),
+            olp_server_id: "srv_bob_box".to_string(),
+            passkey_user: "bob_pass".to_string(),
+            remote_port: Some(17500), // recommending Alice's port!
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (tx_bob, mut rx_bob) = watch::channel(false);
+    let conn_bob = connector.clone();
+    let handle_bob = tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut bob_server, &conn_bob, &mut rx_bob).await;
+        bob_server
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = tx_bob.send(true);
+    let res_bob = handle_bob.await.unwrap();
+
+    // Verify Bob was assigned a free port that is NOT Alice's port (17500)
+    let assigned = res_bob.server.remote_port.unwrap();
+    assert_ne!(assigned, 17500, "Proxy must NOT assign another user's assigned port");
+    assert!(assigned >= 17500 && assigned <= 17600);
+
+    let _ = std::fs::remove_file(&alice_profile_path);
+    let bob_profile_path = config_dir.join(format!("{}.toml", bob_key));
+    let _ = std::fs::remove_file(&bob_profile_path);
+}
+
+#[tokio::test]
+async fn test_port_exhaustion_returns_clean_error() {
+    let user_key = "exhaustion_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "17700-17701".to_string(), // Only 2 ports available!
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    // 1st server -> gets 17700
+    let mut srv1 = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_ex1".to_string(),
+            passkey_user: "pass".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+    let (tx1, mut rx1) = watch::channel(false);
+    let conn1 = connector.clone();
+    let h1 = tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut srv1, &conn1, &mut rx1).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 2nd server -> gets 17701
+    let mut srv2 = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_ex2".to_string(),
+            passkey_user: "pass".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+    let (tx2, mut rx2) = watch::channel(false);
+    let conn2 = connector.clone();
+    let h2 = tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut srv2, &conn2, &mut rx2).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 3rd server -> range exhausted! Must fail with ERR_NO_PORTS_AVAILABLE
+    let mut srv3 = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_ex3".to_string(),
+            passkey_user: "pass".to_string(),
+            remote_port: None,
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+    let (_tx3, mut rx3) = watch::channel(false);
+    let res3 = run_single_tunnel_session(&mut srv3, &connector, &mut rx3).await;
+    assert!(res3.is_err());
+    let err3 = res3.unwrap_err().to_string();
+    assert!(err3.contains("ERR_NO_PORTS_AVAILABLE"), "Expected ERR_NO_PORTS_AVAILABLE, got: {}", err3);
+
+    let _ = tx1.send(true);
+    let _ = tx2.send(true);
+    let _ = h1.await;
+    let _ = h2.await;
+
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    let _ = std::fs::remove_file(&profile_path);
+}
+
+#[tokio::test]
+async fn test_server_specific_cidr_restrictions() {
+    let user_key = "per_server_cidr_user";
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "17800-17900".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection::default(),
+        tls: ProxyTlsSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    // Save server profile where allowed_server_cidrs is restricted to an IP different from 127.0.0.1
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    let mut profile = UserProfile::new(user_key);
+    profile.servers.insert(
+        "srv_restricted_cidr".to_string(),
+        UserServerConfig {
+            port: 17850,
+            reserved: false,
+            passkey_user: "user_pass".to_string(),
+            allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
+            allowed_server_cidrs: vec!["192.168.254.1/32".to_string()], // 127.0.0.1 disallowed!
+            created_at: None,
+        },
+    );
+    profile.save_atomic(&profile_path).unwrap();
+
+    let mut server = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_restricted_cidr".to_string(),
+            passkey_user: "user_pass".to_string(),
+            remote_port: Some(17850),
+            tls_verify: None,
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    let res = run_single_tunnel_session(&mut server, &connector, &mut rx).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("ERR_SERVER_IP_FORBIDDEN"),
+        "Expected ERR_SERVER_IP_FORBIDDEN, got: {}",
+        err
+    );
+
+    let _ = std::fs::remove_file(&profile_path);
 }
