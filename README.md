@@ -202,8 +202,9 @@ allow_broken_certs = false # default: false (refuses startup if certificates are
 
 [maintenance]
 # Automatic git updates on daily restart / startup.
-# Defaults to false for new deployments. When false, olp-proxy checks for updates and displays
-# a warning banner with a 15-second delayed start if your version is out of sync with remote.
+# Defaults to false (disabled). When false or omitted, olp-proxy does not automatically pull from git.
+# If your version is out of sync with remote, it checks updates and displays a prominent warning banner
+# with a 15-second delayed start so you are always notified of updates.
 auto_git_pull = false
 ```
 
@@ -238,6 +239,12 @@ olp_server_id = "srv_my_ollama_box"
 passkey_user = "your-client-passkey-for-this-server"
 # remote_port = 10000 # optional recommended port; proxy allocates dynamically if omitted
 
+# Read-Only Policy (optional):
+# Stricter setting wins! A GPU server can always restrict itself to read-only mode (read_only = true)
+# even if connected to a proxy with read_only = false. Mutating operations (pull/delete/create/push/copy/blobs)
+# will be blocked both on the proxy's worker port and locally on the server.
+# read_only = true
+
 # TLS CA Certificate Verification (optional, auto-detected)
 # Defaults to true for public domain names, false for localhost / 127.0.0.1.
 # Enforces Mozilla WebPKI root verification (e.g. Let's Encrypt) to protect against MITM.
@@ -252,8 +259,9 @@ heartbeat_timeout_sec = 5
 
 [maintenance]
 # Automatic git updates on daily restart / startup.
-# Defaults to false for new deployments. When false, olp-server checks for updates and displays
-# a warning banner with a 15-second delayed start if your version is out of sync with remote.
+# Defaults to false (disabled). When false or omitted, olp-server does not automatically pull from git.
+# If your version is out of sync with remote, it checks updates and displays a prominent warning banner
+# with a 15-second delayed start so you are always notified of updates.
 auto_git_pull = false
 ```
 
@@ -416,7 +424,7 @@ Access logs strictly omit sensitive data:
 
 The same set is installed for `start-server.sh`. The watchdog minute offset and the daily restart time (between 01:00 and 05:59 local time) are randomized per host at install time, so a fleet doesn't restart or pull all at once. The chosen times are kept on later runs. A lock file (`~/.olp/olp-<proxy|server>.lock`, requires `flock`) stops the watchdog from starting a second copy while a restart is pulling or compiling.
 
-To stop the daily restart from pulling new code, set `auto_git_pull = false` under `[maintenance]` in `~/.olp/proxy.toml` / `~/.olp/server.toml`. Running `./start-proxy.sh update` explicitly always pulls.
+Automated git updates are disabled by default (`auto_git_pull = false`). When false or omitted, the daily restart does not pull code. To enable automated updates, set `auto_git_pull = true` under `[maintenance]` in `~/.olp/proxy.toml` / `~/.olp/server.toml`. Running `./start-proxy.sh update` explicitly always pulls.
 
 Logs are written automatically to `~/.olp/proxy.log` and `~/.olp/server.log`.
 

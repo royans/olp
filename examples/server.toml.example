@@ -32,13 +32,13 @@ passkey_user = "change-me-to-a-secure-user-passkey"
 # tls_verify = true
 
 # Sensitive operations / Read-Only Policy control:
-# NOTE: Policy controls CANNOT coexist on both proxy and server!
-# By default, olp-proxy dictates read-only policy (policy_authority = "proxy").
-# Leave this unset/commented out when using proxy authority.
-# If olp-proxy sets policy_authority = "server", you can configure:
-# read_only = true   # Blocks pull/delete/create on local Ollama
-# read_only = false  # Permits sensitive operations on local Ollama
-# Attempting to specify read_only when proxy is authority will abort startup with CRITICAL CONFIG CONFLICT.
+# Stricter setting wins!
+# - A server can always restrict itself further: setting `read_only = true` ensures mutating
+#   operations (pull/delete/create/push/copy/blobs) are blocked both on the proxy and locally on the server,
+#   even if the proxy is running with `read_only = false`.
+# - Both proxy and server can configure policy as long as they are aligned.
+# - Only an attempt by a server to loosen a proxy's stricter policy (proxy RO=true, server RO=false)
+#   will abort tunnel registration with CRITICAL CONFIG CONFLICT.
 # read_only = true
 
 [reconnect]
