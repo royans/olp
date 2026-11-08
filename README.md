@@ -1,6 +1,6 @@
 # Ollama Proxy (`olp-proxy` & `olp-server`)
 
-[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-60%20passing-brightgreen.svg)]()
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
 [![Memory Footprint](https://img.shields.io/badge/memory-%3C5MB%20RAM-success.svg)]()
@@ -25,7 +25,28 @@ A lightweight, failure-resilient reverse proxy and reverse-tunneling daemon in *
 
 ---
 
-## Quick Start (2 Steps)
+## Quick Start (30 Seconds)
+
+### 1. On your Publicly Accessible Server:
+```bash
+git clone https://github.com/royans/olp.git && cd olp && ./start-proxy.sh
+```
+*(Copy the generated `olp_api_key` displayed on the screen)*
+
+### 2. On your GPU / Ollama Machine:
+```bash
+git clone https://github.com/royans/olp.git && cd olp && ./start-server.sh
+```
+*(Enter your proxy host e.g. `proxy.example.com:4443` and paste your `olp_api_key` when prompted)*
+
+### 3. Done! Query your Ollama from anywhere:
+```bash
+curl -H "Authorization: Bearer <your-passkey>" https://<proxy-host>:<assigned-port>/api/tags
+```
+
+---
+
+## Detailed Setup & Lifecycle Guide
 
 ### Step 1: On the Publicly Accessible Server (`olp-proxy`)
 
