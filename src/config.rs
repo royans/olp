@@ -211,10 +211,15 @@ impl UserServerConfig {
         if !list.iter().any(|k| k.label == "default")
             && (!self.passkey_user.is_empty() || self.passkey_user_hash.is_some())
         {
+            let scope = if self.read_only.unwrap_or(false) {
+                KeyScope::Inference
+            } else {
+                KeyScope::Manage
+            };
             list.push(ResolvedKey {
                 label: "default".to_string(),
                 verifier: self.get_verifier(),
-                scope: KeyScope::Inference,
+                scope,
             });
         }
         list
@@ -536,10 +541,15 @@ impl ServerSection {
             }
         }
         if !list.iter().any(|k| k.label == "default") && !self.passkey_user.is_empty() {
+            let scope = if self.read_only.unwrap_or(false) {
+                KeyScope::Inference
+            } else {
+                KeyScope::Manage
+            };
             list.push(ResolvedKey {
                 label: "default".to_string(),
                 verifier: crate::keys::PasskeyVerifier::from_passkey(&self.passkey_user),
-                scope: KeyScope::Inference,
+                scope,
             });
         }
         list

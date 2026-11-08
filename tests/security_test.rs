@@ -1610,6 +1610,146 @@ async fn test_sensitive_operations_blocked_by_default_on_proxy() {
 }
 
 #[tokio::test]
+async fn test_dynamic_policy_reload_on_disk_update() {
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = mock_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await;
+                });
+            }
+        }
+    });
+
+    let user_key = "dynamic_policy_user";
+    let config_dir = olp_config_dir().unwrap();
+    let profile_path = config_dir.join(format!("{}.toml", user_key));
+    let _ = std::fs::remove_file(&profile_path);
+
+    let proxy_cfg = ProxyConfig {
+        proxy: ProxySection {
+            listen_addr: "127.0.0.1:0".to_string(),
+            allowed_ports: "18600-18700".to_string(),
+            listener_grace_period_sec: 10,
+            access_log: None,
+        },
+        auth: ProxyAuthSection {
+            olp_api_keys: vec![user_key.to_string()],
+        },
+        security: ProxySecuritySection {
+            read_only: false, // Default is RW
+            ..Default::default()
+        },
+        tls: test_proxy_tls(),
+        maintenance: Default::default(),
+    };
+
+    let (proxy_control_addr, _proxy_handle) = start_proxy_server(proxy_cfg).await.unwrap();
+    let tls_client_cfg = create_tunnel_tls_client_config(false).unwrap();
+    let connector = TlsConnector::from(tls_client_cfg);
+
+    // Start with read_only = false in profile
+    let mut profile = UserProfile::new(user_key);
+    let mut server = UserServerConfig {
+        port: 18650,
+        reserved: false,
+        passkey_user: "dyn_user_pass".to_string(),
+        passkey_user_hash: None,
+        allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
+        allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
+        created_at: None,
+        keys: Default::default(),
+        read_only: Some(false),
+    };
+    profile.servers.insert("srv_dyn".to_string(), server.clone());
+    profile.save_atomic(&profile_path).unwrap();
+
+    let mut server_cfg = ServerConfig {
+        server: ServerSection {
+            proxy_addr: proxy_control_addr.to_string(),
+            ollama_addr: mock_addr.to_string(),
+            olp_api_key: user_key.to_string(),
+            olp_server_id: "srv_dyn".to_string(),
+            passkey_user: "dyn_user_pass".to_string(),
+            remote_port: Some(18650),
+            tls_verify: Some(false),
+            read_only: None,
+            ..Default::default()
+        },
+        reconnect: ReconnectSection::default(),
+        maintenance: Default::default(),
+    };
+
+    let (_tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = run_single_tunnel_session(&mut server_cfg, &connector, &mut rx).await;
+    });
+
+    for _ in 0..40 {
+        if tokio::net::TcpStream::connect("127.0.0.1:18650").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let auth_header = "Bearer dyn_user_pass".to_string();
+    let pull_body = "{\"name\":\"test_model\"}";
+
+    // Step 1: When read_only is false, POST /api/pull is allowed through (200 OK from mock Ollama)
+    let mut tcp1 = tokio::net::TcpStream::connect("127.0.0.1:18650").await.unwrap();
+    let req1 = format!(
+        "POST /api/pull HTTP/1.1\r\nHost: 127.0.0.1:18650\r\nAuthorization: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        auth_header, pull_body.len(), pull_body
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut tcp1, req1.as_bytes()).await.unwrap();
+    let mut resp_buf = vec![0u8; 1024];
+    let n1 = tokio::io::AsyncReadExt::read(&mut tcp1, &mut resp_buf).await.unwrap();
+    let resp1 = String::from_utf8_lossy(&resp_buf[..n1]);
+    println!("DEBUG resp1: {}", resp1);
+    assert!(resp1.contains("200 OK"), "Initially RW mode must permit /api/pull");
+
+    // Step 2: Dynamically toggle read_only = true on disk (simulating UI toggle in olpweb)
+    server.read_only = Some(true);
+    profile.servers.insert("srv_dyn".to_string(), server.clone());
+    profile.save_atomic(&profile_path).unwrap();
+
+    // Step 3: Next POST /api/pull is IMMEDIATELY blocked with 403 Forbidden without reconnect!
+    let mut tcp2 = tokio::net::TcpStream::connect("127.0.0.1:18650").await.unwrap();
+    let req2 = format!(
+        "POST /api/pull HTTP/1.1\r\nHost: 127.0.0.1:18650\r\nAuthorization: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        auth_header, pull_body.len(), pull_body
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut tcp2, req2.as_bytes()).await.unwrap();
+    let n2 = tokio::io::AsyncReadExt::read(&mut tcp2, &mut resp_buf).await.unwrap();
+    let resp2 = String::from_utf8_lossy(&resp_buf[..n2]);
+    assert!(resp2.contains("403 Forbidden"), "After UI flip to Read-Only, /api/pull must be blocked with 403");
+    assert!(resp2.contains("model downloads are disabled on this server (read-only mode)"));
+
+    // Step 4: Dynamically toggle back to read_only = false on disk
+    server.read_only = Some(false);
+    profile.servers.insert("srv_dyn".to_string(), server);
+    profile.save_atomic(&profile_path).unwrap();
+
+    // Step 5: Next POST /api/pull is IMMEDIATELY allowed through again!
+    let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:18650").await.unwrap();
+    let req3 = format!(
+        "POST /api/pull HTTP/1.1\r\nHost: 127.0.0.1:18650\r\nAuthorization: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        auth_header, pull_body.len(), pull_body
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut tcp3, req3.as_bytes()).await.unwrap();
+    let n3 = tokio::io::AsyncReadExt::read(&mut tcp3, &mut resp_buf).await.unwrap();
+    let resp3 = String::from_utf8_lossy(&resp_buf[..n3]);
+    assert!(resp3.contains("200 OK"), "After UI flip back to Read-Write, /api/pull must be permitted again");
+
+    let _ = std::fs::remove_file(&profile_path);
+}
+
+#[tokio::test]
 async fn test_policy_coexistence_conflict_fails_tunnel() {
     let user_key = "conflict_policy_user";
     let proxy_cfg = ProxyConfig {

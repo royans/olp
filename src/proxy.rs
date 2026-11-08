@@ -150,6 +150,7 @@ pub struct PortWorker {
     pub user_ip_filter: RwLock<Arc<IpFilter>>,
     pub assigned_server_id: RwLock<Option<String>>,
     pub assigned_api_key: RwLock<Option<String>>,
+    pub server_policy_override: RwLock<Option<bool>>,
     pub read_only: AtomicBool,
     pub concurrency_semaphore: Arc<tokio::sync::Semaphore>,
     pub request_rate_limiter: Arc<crate::keys::RequestRateLimiter>,
@@ -1122,6 +1123,7 @@ async fn handle_incoming_tunnel(
             Arc::new(IpFilter::new(&server_cfg.allowed_user_cidrs)?);
         *worker.assigned_server_id.write().unwrap() = Some(register.olp_server_id.clone());
         *worker.assigned_api_key.write().unwrap() = Some(register.olp_api_key.clone());
+        *worker.server_policy_override.write().unwrap() = register.policy_override;
     }
 
     // Step 8b: Policy enforcement and conflict checking
@@ -1303,6 +1305,7 @@ fn get_or_create_port_worker(state: &Arc<ProxyState>, port: u16) -> Result<Arc<P
         user_ip_filter: RwLock::new(default_user_filter),
         assigned_server_id: RwLock::new(None),
         assigned_api_key: RwLock::new(None),
+        server_policy_override: RwLock::new(None),
         read_only: AtomicBool::new(state.config.security.read_only),
         concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(max_active)),
         request_rate_limiter: Arc::new(crate::keys::RequestRateLimiter::new(
@@ -1617,8 +1620,41 @@ async fn handle_public_http_request(
     }
 
     // 6. Enforce read-only policy for sensitive Ollama operations
+    // If a sensitive mutating operation is attempted, refresh server policy from disk
+    // so dynamically toggled read-only settings in the UI take effect immediately.
+    if is_sensitive_ollama_op(&method, &uri) {
+        let ids = {
+            let s_id = worker.assigned_server_id.read().unwrap().clone();
+            let a_key = worker.assigned_api_key.read().unwrap().clone();
+            match (s_id, a_key) {
+                (Some(s), Some(k)) => Some((s, k)),
+                _ => None,
+            }
+        };
+        if let Some((server_id, api_key)) = ids {
+            if let Ok(profile) = state.load_user_profile(&api_key) {
+                if let Some(srv_cfg) = profile.servers.get(&server_id) {
+                    if let Some(fresh_ro) = srv_cfg.read_only {
+                        let client_locked_ro = *worker.server_policy_override.read().unwrap() == Some(true);
+                        let effective = if client_locked_ro { true } else { fresh_ro };
+                        worker.read_only.store(effective, Ordering::Relaxed);
+                        *worker.resolved_keys.write().unwrap() = srv_cfg.get_resolved_keys();
+                    }
+                }
+            }
+        }
+    }
+
     let is_proxy_ro = worker.read_only.load(Ordering::Relaxed);
-    let is_inference_only = is_proxy_ro || matched_info.scope == crate::config::KeyScope::Inference;
+    let active_scope = worker
+        .resolved_keys
+        .read()
+        .unwrap()
+        .iter()
+        .find(|k| k.label == matched_info.label)
+        .map(|k| k.scope)
+        .unwrap_or(matched_info.scope);
+    let is_inference_only = is_proxy_ro || active_scope == crate::config::KeyScope::Inference;
     if is_inference_only && is_sensitive_ollama_op(&method, &uri) {
         let (err_json, reason) = crate::protocol::format_read_only_error(&uri, &method);
         let clean_path = uri.split('?').next().unwrap_or(&uri);
