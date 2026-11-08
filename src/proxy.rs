@@ -206,8 +206,8 @@ pub fn verify_http_headers_with_keys(
             if let Ok(decoded_bytes) = BASE64.decode(b64.trim()) {
                 if let Ok(decoded_str) = std::str::from_utf8(&decoded_bytes) {
                     let candidate = match decoded_str.split_once(':') {
-                        Some((_user, pass)) => pass,
-                        None => decoded_str,
+                        Some((_user, pass)) => pass.trim(),
+                        None => decoded_str.trim(),
                     };
                     candidate_tokens.push(candidate.to_string());
                 }
@@ -745,8 +745,8 @@ pub fn verify_http_headers_auth(headers: &hyper::HeaderMap, verifier: &PasskeyVe
             if let Ok(decoded_bytes) = BASE64.decode(b64.trim()) {
                 if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
                     let candidate = match decoded_str.split_once(':') {
-                        Some((_user, pass)) => pass,
-                        None => decoded_str.as_str(),
+                        Some((_user, pass)) => pass.trim(),
+                        None => decoded_str.trim(),
                     };
                     if verifier.verify(candidate) {
                         return true;

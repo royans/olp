@@ -119,6 +119,10 @@ fn test_verify_http_request_auth_schemes() {
     assert!(check(Some(&format!("Basic {}", creds1))));
     assert!(check(Some(&format!("basic {}", creds1))));
 
+    // Test Basic Auth with trailing newline (e.g. from echo without -n)
+    let creds_newline = BASE64.encode(format!("root:{}\n", pass));
+    assert!(check(Some(&format!("Basic {}", creds_newline))));
+
     let creds_no_user = BASE64.encode(format!(":{}", pass));
     assert!(check(Some(&format!("Basic {}", creds_no_user))));
 
