@@ -1635,7 +1635,8 @@ async fn handle_public_http_request(
             if let Ok(profile) = state.load_user_profile(&api_key) {
                 if let Some(srv_cfg) = profile.servers.get(&server_id) {
                     if let Some(fresh_ro) = srv_cfg.read_only {
-                        let client_locked_ro = *worker.server_policy_override.read().unwrap() == Some(true);
+                        let client_locked_ro =
+                            *worker.server_policy_override.read().unwrap() == Some(true);
                         let effective = if client_locked_ro { true } else { fresh_ro };
                         worker.read_only.store(effective, Ordering::Relaxed);
                         *worker.resolved_keys.write().unwrap() = srv_cfg.get_resolved_keys();

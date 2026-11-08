@@ -40,6 +40,19 @@ if [ -z "$STAGED_FILES" ]; then
     exit 0
 fi
 
+# Automatically format staged Rust code with cargo fmt and re-stage
+if [ -f "Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    if echo "$STAGED_FILES" | grep -q '\.rs$'; then
+        echo -e "[git-pre-commit] Automatically formatting Rust code with cargo fmt..."
+        cargo fmt
+        while IFS= read -r file; do
+            if [[ "$file" =~ \.rs$ && -f "$file" ]]; then
+                git add "$file"
+            fi
+        done <<< "$STAGED_FILES"
+    fi
+fi
+
 while IFS= read -r file; do
     [ -z "$file" ] && continue
 
