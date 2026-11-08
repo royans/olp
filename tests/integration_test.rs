@@ -195,6 +195,7 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             remote_port: Some(remote_port),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection {
             strategy: "fibonacci".to_string(),
@@ -325,6 +326,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             remote_port: Some(18450),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -348,6 +350,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
             remote_port: Some(18451),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -496,6 +499,7 @@ async fn test_model_auto_mapping_and_cors() {
             remote_port: Some(18550),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -633,6 +637,7 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -640,7 +645,10 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
 
     let (tx1, rx1) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = run_server_with_shutdown(alice_srv1, rx1).await;
+        let res = run_server_with_shutdown(alice_srv1, rx1).await;
+        if let Err(e) = res {
+            eprintln!("alice_srv1 error: {:#}", e);
+        }
     });
 
     // Alice Server 2: dynamic port allocation (remote_port = None)
@@ -654,6 +662,7 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -661,7 +670,10 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
 
     let (tx2, rx2) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = run_server_with_shutdown(alice_srv2, rx2).await;
+        let res = run_server_with_shutdown(alice_srv2, rx2).await;
+        if let Err(e) = res {
+            eprintln!("alice_srv2 error: {:#}", e);
+        }
     });
 
     // Bob Server 1: dynamic port allocation (remote_port = None)
@@ -675,6 +687,7 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -682,7 +695,10 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
 
     let (tx3, rx3) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = run_server_with_shutdown(bob_srv1, rx3).await;
+        let res = run_server_with_shutdown(bob_srv1, rx3).await;
+        if let Err(e) = res {
+            eprintln!("bob_srv1 error: {:#}", e);
+        }
     });
 
     // Ports should be sequentially allocated: 19100, 19101, 19102

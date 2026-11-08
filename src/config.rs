@@ -92,6 +92,58 @@ fn default_max_servers() -> usize {
     10
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyScope {
+    #[default]
+    Inference,
+    Manage,
+}
+
+impl std::fmt::Display for KeyScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyScope::Inference => write!(f, "inference"),
+            KeyScope::Manage => write!(f, "manage"),
+        }
+    }
+}
+
+pub fn default_key_scope_inference() -> KeyScope {
+    KeyScope::Inference
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedKeyConfig {
+    #[serde(default)]
+    pub passkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    #[serde(default = "default_key_scope_inference")]
+    pub scope: KeyScope,
+}
+
+impl ScopedKeyConfig {
+    pub fn get_verifier(&self) -> Option<crate::keys::PasskeyVerifier> {
+        if !self.passkey.is_empty() {
+            return Some(crate::keys::PasskeyVerifier::from_passkey(&self.passkey));
+        }
+        if let Some(ref h) = self.hash {
+            if let Some(v) = crate::keys::PasskeyVerifier::from_encoded_hash(h) {
+                return Some(v);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone)]
+pub struct ResolvedKey {
+    pub label: String,
+    pub verifier: crate::keys::PasskeyVerifier,
+    pub scope: KeyScope,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserServerConfig {
     pub port: u16,
@@ -109,6 +161,24 @@ pub struct UserServerConfig {
     pub created_at: Option<String>,
     #[serde(default)]
     pub read_only: Option<bool>,
+    #[serde(default)]
+    pub keys: HashMap<String, ScopedKeyConfig>,
+}
+
+impl Default for UserServerConfig {
+    fn default() -> Self {
+        Self {
+            port: 0,
+            reserved: false,
+            passkey_user: String::new(),
+            passkey_user_hash: None,
+            allowed_user_cidrs: default_allowed_cidrs(),
+            allowed_server_cidrs: default_allowed_cidrs(),
+            created_at: None,
+            read_only: None,
+            keys: HashMap::new(),
+        }
+    }
 }
 
 impl UserServerConfig {
@@ -124,6 +194,30 @@ impl UserServerConfig {
             }
         }
         crate::keys::PasskeyVerifier::from_passkey(&self.passkey_user)
+    }
+
+    pub fn get_resolved_keys(&self) -> Vec<ResolvedKey> {
+        let mut list = Vec::new();
+        for (label, kcfg) in &self.keys {
+            if let Some(verifier) = kcfg.get_verifier() {
+                list.push(ResolvedKey {
+                    label: label.clone(),
+                    verifier,
+                    scope: kcfg.scope,
+                });
+            }
+        }
+        // Backward compatibility: If no "default" key was defined in keys, map passkey_user
+        if !list.iter().any(|k| k.label == "default")
+            && (!self.passkey_user.is_empty() || self.passkey_user_hash.is_some())
+        {
+            list.push(ResolvedKey {
+                label: "default".to_string(),
+                verifier: self.get_verifier(),
+                scope: KeyScope::Inference,
+            });
+        }
+        list
     }
 }
 
@@ -353,13 +447,14 @@ pub struct ServerConfig {
     pub maintenance: MaintenanceSection,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSection {
     pub proxy_addr: String,
     pub ollama_addr: String,
     pub olp_api_key: String,
     #[serde(default)]
     pub olp_server_id: String,
+    #[serde(default)]
     pub passkey_user: String,
     #[serde(default)]
     pub remote_port: Option<u16>,
@@ -367,6 +462,58 @@ pub struct ServerSection {
     pub tls_verify: Option<bool>,
     #[serde(default)]
     pub read_only: Option<bool>,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    #[serde(default)]
+    pub default_model: String,
+    #[serde(default = "default_max_num_ctx")]
+    pub max_num_ctx: usize,
+    #[serde(default = "default_max_num_predict")]
+    pub max_num_predict: usize,
+    #[serde(default = "default_keep_alive_min")]
+    pub keep_alive_min: String,
+    #[serde(default = "default_keep_alive_max")]
+    pub keep_alive_max: String,
+    #[serde(default)]
+    pub keys: HashMap<String, ScopedKeyConfig>,
+}
+
+pub fn default_max_num_ctx() -> usize {
+    32768
+}
+
+pub fn default_max_num_predict() -> usize {
+    4096
+}
+
+pub fn default_keep_alive_min() -> String {
+    "1m".to_string()
+}
+
+pub fn default_keep_alive_max() -> String {
+    "30m".to_string()
+}
+
+impl Default for ServerSection {
+    fn default() -> Self {
+        Self {
+            proxy_addr: "127.0.0.1:4443".to_string(),
+            ollama_addr: "127.0.0.1:11434".to_string(),
+            olp_api_key: String::new(),
+            olp_server_id: String::new(),
+            passkey_user: String::new(),
+            remote_port: None,
+            tls_verify: None,
+            read_only: None,
+            allowed_models: Vec::new(),
+            default_model: String::new(),
+            max_num_ctx: default_max_num_ctx(),
+            max_num_predict: default_max_num_predict(),
+            keep_alive_min: default_keep_alive_min(),
+            keep_alive_max: default_keep_alive_max(),
+            keys: HashMap::new(),
+        }
+    }
 }
 
 impl ServerSection {
@@ -375,6 +522,27 @@ impl ServerSection {
     /// are rejected unless explicitly overridden by `tls_verify = false` (not recommended).
     pub fn should_verify_ca(&self) -> bool {
         self.tls_verify.unwrap_or(true)
+    }
+
+    pub fn get_resolved_keys(&self) -> Vec<ResolvedKey> {
+        let mut list = Vec::new();
+        for (label, kcfg) in &self.keys {
+            if let Some(verifier) = kcfg.get_verifier() {
+                list.push(ResolvedKey {
+                    label: label.clone(),
+                    verifier,
+                    scope: kcfg.scope,
+                });
+            }
+        }
+        if !list.iter().any(|k| k.label == "default") && !self.passkey_user.is_empty() {
+            list.push(ResolvedKey {
+                label: "default".to_string(),
+                verifier: crate::keys::PasskeyVerifier::from_passkey(&self.passkey_user),
+                scope: KeyScope::Inference,
+            });
+        }
+        list
     }
 }
 
@@ -432,6 +600,13 @@ impl ServerConfig {
                 remote_port: None,
                 tls_verify: None,
                 read_only: None,
+                allowed_models: Vec::new(),
+                default_model: String::new(),
+                max_num_ctx: default_max_num_ctx(),
+                max_num_predict: default_max_num_predict(),
+                keep_alive_min: default_keep_alive_min(),
+                keep_alive_max: default_keep_alive_max(),
+                keys: HashMap::new(),
             },
             reconnect: ReconnectSection::default(),
             maintenance: MaintenanceSection::default(),
@@ -566,6 +741,51 @@ pub fn generate_random_passkey() -> String {
         .take(24)
         .map(char::from)
         .collect()
+}
+
+/// Enforces a minimum length of 16 characters for user-supplied keys.
+pub fn validate_passkey_length(passkey: &str, field_name: &str) -> Result<()> {
+    if !passkey.is_empty() && passkey.len() < 16 {
+        return Err(anyhow!(
+            "Passkey for '{}' is too short ({} chars). User-supplied keys must be at least 16 characters long.",
+            field_name,
+            passkey.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Parses human duration strings like "30s", "1m", "30m", "1h", "2h30m", or pure integer seconds into seconds.
+pub fn parse_duration_seconds(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(val) = s.parse::<i64>() {
+        return Some(val);
+    }
+    let mut total_secs: i64 = 0;
+    let mut current_num = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() || (c == '-' && current_num.is_empty()) {
+            current_num.push(c);
+        } else {
+            let num: i64 = current_num.parse().ok()?;
+            current_num.clear();
+            match c {
+                's' | 'S' => total_secs += num,
+                'm' | 'M' => total_secs += num * 60,
+                'h' | 'H' => total_secs += num * 3600,
+                'd' | 'D' => total_secs += num * 86400,
+                _ => return None,
+            }
+        }
+    }
+    if !current_num.is_empty() {
+        let num: i64 = current_num.parse().ok()?;
+        total_secs += num;
+    }
+    Some(total_secs)
 }
 
 // ============================================================================
@@ -900,6 +1120,7 @@ pub fn ensure_server_initialized(
             modified = true;
         }
         if let Some(val) = overrides.passkey_user {
+            validate_passkey_length(&val, "passkey_user")?;
             cfg.server.passkey_user = val;
             modified = true;
         }
@@ -931,6 +1152,9 @@ pub fn ensure_server_initialized(
     }
 
     let mut cfg = ServerConfig::default_config();
+    if let Some(ref p) = overrides.passkey_user {
+        validate_passkey_length(p, "passkey_user")?;
+    }
     cfg.server.olp_server_id = overrides
         .olp_server_id
         .unwrap_or_else(generate_random_server_id);
@@ -999,6 +1223,7 @@ pub fn ensure_server_initialized(
             "",
         )?;
         if !custom_passkey_user.is_empty() {
+            validate_passkey_length(&custom_passkey_user, "passkey_user")?;
             cfg.server.passkey_user = custom_passkey_user;
         }
     }
@@ -1093,12 +1318,13 @@ mod tests {
             UserServerConfig {
                 port: 12345,
                 reserved: true,
-                passkey_user: "user-pass-123".to_string(),
+                passkey_user: "user-pass-123-secure-key".to_string(),
                 passkey_user_hash: None,
                 allowed_user_cidrs: vec!["0.0.0.0/0".to_string()],
                 allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
                 created_at: Some("2026-11-06T12:00:00Z".to_string()),
                 read_only: Some(true),
+                keys: HashMap::new(),
             },
         );
 
@@ -1109,7 +1335,7 @@ mod tests {
         let srv = loaded.servers.get("srv_abc").unwrap();
         assert_eq!(srv.port, 12345);
         assert!(srv.reserved);
-        assert_eq!(srv.passkey_user, "user-pass-123");
+        assert_eq!(srv.passkey_user, "user-pass-123-secure-key");
 
         let _ = fs::remove_dir_all(&dir);
     }

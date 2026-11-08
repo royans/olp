@@ -54,6 +54,18 @@ pub struct ServerAuthRegister {
     pub auth_token: [u8; 32],
     #[serde(default)]
     pub policy_override: Option<bool>,
+    #[serde(default)]
+    pub keys: std::collections::HashMap<String, ScopedKeyRegistration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedKeyRegistration {
+    #[serde(default)]
+    pub passkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub scope: String,
 }
 
 impl ServerAuthRegister {
@@ -90,9 +102,39 @@ impl ServerAuthRegister {
             passkey_user: passkey_user.to_string(),
             auth_token,
             policy_override,
+            keys: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn with_keys(
+        olp_api_key: &str,
+        olp_server_id: &str,
+        recommended_port: Option<u16>,
+        passkey_user: &str,
+        proxy_nonce: &[u8; 32],
+        policy_override: Option<bool>,
+        keys: std::collections::HashMap<String, ScopedKeyRegistration>,
+    ) -> Self {
+        let auth_token = compute_server_auth_token(proxy_nonce, olp_server_id, olp_api_key);
+        Self {
+            olp_api_key: olp_api_key.to_string(),
+            olp_server_id: olp_server_id.to_string(),
+            recommended_port,
+            passkey_user: passkey_user.to_string(),
+            auth_token,
+            policy_override,
+            keys,
         }
     }
 }
+
+// Targeted Ollama version: 0.5.x - 0.6.x
+//
+// Endpoint allowlist for read-only inference scope:
+//   GET/HEAD /, /api, /api/version, /api/tags, /api/ps, /v1/models, /v1/models/{id}
+//   POST /api/generate, /api/chat, /api/embed, /api/embeddings, /api/show,
+//        /v1/chat/completions, /v1/completions, /v1/embeddings
+// Everything else is denied under inference scope (pull, push, create, copy, delete, blobs, etc.).
 
 /// Returns true if the HTTP method and path target a sensitive or mutating Ollama operation
 /// (such as downloading/pulling models, deleting models, creating custom models, copying, or pushing).
@@ -124,6 +166,59 @@ pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
         // POST /api/create, POST /api/copy, /api/blobs/*, etc.) or unknown verbs are sensitive.
         _ => true,
     }
+}
+
+/// Returns protocol-correct HTTP 403 error body and human-readable reason string.
+/// - Paths starting with `/v1/` return OpenAI-compatible JSON:
+///   `{"error":{"message":"<reason>","type":"permission_error","code":"forbidden"}}`
+/// - Other paths return native Ollama-compatible JSON:
+///   `{"error":"<reason>"}`
+pub fn format_read_only_error(path: &str, method: &hyper::Method) -> (String, &'static str) {
+    let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    let normalized = if clean_path.is_empty() {
+        "/"
+    } else {
+        clean_path
+    };
+
+    let reason: &'static str = match (method, normalized) {
+        (&hyper::Method::POST, p) if p.ends_with("/pull") => {
+            "model downloads are disabled on this server (read-only mode)"
+        }
+        (&hyper::Method::DELETE, _) => "model deletion is disabled on this server (read-only mode)",
+        (&hyper::Method::POST, p) if p.ends_with("/push") => {
+            "model pushing is disabled on this server (read-only mode)"
+        }
+        (&hyper::Method::POST, p) if p.ends_with("/create") => {
+            "model creation is disabled on this server (read-only mode)"
+        }
+        (&hyper::Method::POST, p) if p.ends_with("/copy") => {
+            "model copying is disabled on this server (read-only mode)"
+        }
+        (&hyper::Method::POST, p) if p.starts_with("/api/blobs") => {
+            "blob uploads are disabled on this server (read-only mode)"
+        }
+        _ => "operation forbidden: sensitive Ollama operations are disabled (read-only mode)",
+    };
+
+    let is_openai = normalized.starts_with("/v1/") || normalized == "/v1";
+    let body = if is_openai {
+        serde_json::json!({
+            "error": {
+                "message": reason,
+                "type": "permission_error",
+                "code": "forbidden"
+            }
+        })
+        .to_string()
+    } else {
+        serde_json::json!({
+            "error": reason
+        })
+        .to_string()
+    };
+
+    (body, reason)
 }
 
 /// Step 3 of Handshake: Sent from `olp-proxy` to `olp-server` to confirm or reject registration.
@@ -417,5 +512,30 @@ mod tests {
             "/api/blobs/sha256:1234"
         ));
         assert!(is_sensitive_ollama_op(&Method::POST, "/unknown/endpoint"));
+    }
+
+    #[test]
+    fn test_format_read_only_error() {
+        use hyper::Method;
+
+        // OpenAI routes get OpenAI JSON structure with permission_error
+        let (body, reason) = format_read_only_error("/v1/models/custom", &Method::DELETE);
+        assert_eq!(
+            reason,
+            "model deletion is disabled on this server (read-only mode)"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], "forbidden");
+        assert_eq!(v["error"]["type"], "permission_error");
+        assert_eq!(v["error"]["message"], reason);
+
+        // Native Ollama routes get {"error": "<reason>"}
+        let (body2, reason2) = format_read_only_error("/api/pull", &Method::POST);
+        assert_eq!(
+            reason2,
+            "model downloads are disabled on this server (read-only mode)"
+        );
+        let v2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(v2["error"], reason2);
     }
 }

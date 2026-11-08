@@ -192,13 +192,25 @@ pub async fn run_single_tunnel_session(
             .context("Timed out waiting for ProxyHelloChallenge")??;
 
     // Step 2: Send ServerAuthRegister with auth token computed from olp_api_key and optional policy override
-    let register = ServerAuthRegister::with_policy(
+    let mut reg_keys = std::collections::HashMap::new();
+    for (label, kcfg) in &config.server.keys {
+        reg_keys.insert(
+            label.clone(),
+            crate::protocol::ScopedKeyRegistration {
+                passkey: kcfg.passkey.clone(),
+                hash: kcfg.hash.clone(),
+                scope: kcfg.scope.to_string(),
+            },
+        );
+    }
+    let register = ServerAuthRegister::with_keys(
         &config.server.olp_api_key,
         &config.server.olp_server_id,
         config.server.remote_port,
         &config.server.passkey_user,
         &challenge.proxy_nonce,
         config.server.read_only,
+        reg_keys,
     );
 
     tokio::time::timeout(
@@ -252,7 +264,7 @@ pub async fn run_single_tunnel_session(
     let hb_timeout = Duration::from_secs(config.reconnect.heartbeat_timeout_sec.max(1));
     let ollama_addr = config.server.ollama_addr.clone();
     let model_tracker = Arc::new(ActiveModelTracker::new(ollama_addr.clone()));
-    let server_read_only = config.server.read_only.unwrap_or(false);
+    let cfg_arc = Arc::new(config.clone());
 
     let mut ticker = tokio::time::interval(hb_interval);
     ticker.tick().await;
@@ -268,10 +280,10 @@ pub async fn run_single_tunnel_session(
             maybe_stream = inbound_rx.recv() => {
                 match maybe_stream {
                     Some(yamux_stream) => {
-                        let target = ollama_addr.clone();
+                        let cfg = cfg_arc.clone();
                         let tracker = model_tracker.clone();
                         tokio::spawn(async move {
-                            serve_proxied_ollama_stream(yamux_stream, target, tracker, server_read_only).await;
+                            serve_proxied_ollama_stream(yamux_stream, cfg, tracker).await;
                         });
                     }
                     None => {
@@ -433,14 +445,13 @@ async fn query_ollama_json(ollama_addr: &str, path: &str) -> Result<serde_json::
 
 async fn serve_proxied_ollama_stream(
     yamux_stream: CompatYamuxStream,
-    ollama_addr: String,
+    config: Arc<ServerConfig>,
     model_tracker: Arc<ActiveModelTracker>,
-    server_read_only: bool,
 ) {
     let service = service_fn(move |req: Request<Incoming>| {
-        let target_addr = ollama_addr.clone();
+        let cfg = config.clone();
         let tracker = model_tracker.clone();
-        async move { forward_to_local_ollama(req, &target_addr, &tracker, server_read_only).await }
+        async move { forward_to_local_ollama(req, &cfg, &tracker).await }
     });
 
     let _ = server_http1::Builder::new()
@@ -452,9 +463,8 @@ async fn serve_proxied_ollama_stream(
 
 async fn forward_to_local_ollama(
     req: Request<Incoming>,
-    ollama_addr: &str,
+    config: &ServerConfig,
     model_tracker: &ActiveModelTracker,
-    server_read_only: bool,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
     if req.method() == Method::CONNECT {
         let mut resp = Response::new(full_body(r#"{"error":"CONNECT method is forbidden"}"#));
@@ -469,16 +479,51 @@ async fn forward_to_local_ollama(
         .unwrap_or("/")
         .to_string();
 
-    if server_read_only && is_sensitive_ollama_op(req.method(), &path_and_query) {
+    let clean_path = path_and_query.split('?').next().unwrap_or(&path_and_query);
+
+    // Stricter-wins determination of inference scope:
+    // 1. If server config specifies read_only = true, authoritative defense-in-depth enforces inference scope.
+    // 2. Otherwise check x-olp-scope header from proxy.
+    // 3. If x-olp-scope is "manage", check if server's configured keys allow manage for x-olp-key-label.
+    let server_read_only = config.server.read_only.unwrap_or(false);
+    let proxy_scope_header = req
+        .headers()
+        .get("x-olp-scope")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("inference");
+    let key_label_header = req
+        .headers()
+        .get("x-olp-key-label")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("default");
+
+    let is_inference_scope = if server_read_only || proxy_scope_header != "manage" {
+        true
+    } else if let Some(key_cfg) = config.server.keys.get(key_label_header) {
+        key_cfg.scope == crate::config::KeyScope::Inference
+    } else {
+        false
+    };
+
+    if is_inference_scope && is_sensitive_ollama_op(req.method(), &path_and_query) {
+        let (err_json, reason) =
+            crate::protocol::format_read_only_error(&path_and_query, req.method());
         warn!(
-            "[POLICY] Blocked sensitive Ollama operation '{} {}' on server (read-only mode active)",
+            "[POLICY BLOCKED] Blocked sensitive Ollama operation '{} {}' on server (read-only mode active: {})",
             req.method(),
-            path_and_query
+            clean_path,
+            reason
         );
-        let mut resp = Response::new(full_body(
-            r#"{"error":"operation forbidden: sensitive Ollama operations are disabled on server (read-only mode active)"}"#,
-        ));
+        let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::FORBIDDEN;
+        resp.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_static("*"),
+        );
         return Ok(resp);
     }
 
@@ -489,11 +534,14 @@ async fn forward_to_local_ollama(
     }
 
     parts.headers.remove(AUTHORIZATION);
+    parts.headers.remove("x-olp-scope");
+    parts.headers.remove("x-olp-key-label");
+    let ollama_addr = &config.server.ollama_addr;
     if let Ok(host_val) = hyper::header::HeaderValue::from_str(ollama_addr) {
         parts.headers.insert(HOST, host_val);
     }
 
-    // Determine outgoing request body. For POST/PUT with JSON, auto-map the requested model to active loaded model.
+    // Determine outgoing request body. For inference requests, normalize options, keep_alive, and model.
     let outgoing_body: BoxHttpBody = if parts.method == Method::GET || parts.method == Method::HEAD
     {
         full_body(Bytes::new())
@@ -506,59 +554,189 @@ async fn forward_to_local_ollama(
         let mut final_bytes = body_bytes.clone();
         if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
             if let Some(obj) = json_val.as_object_mut() {
-                if let Some(active_model) = model_tracker.resolve_active_model().await {
-                    let mut rewritten = false;
+                // Perform body normalization if in inference scope:
+                if is_inference_scope {
+                    // 1. keep_alive: clamp to range [keep_alive_min, keep_alive_max], never forward 0 or negative
+                    let min_secs =
+                        crate::config::parse_duration_seconds(&config.server.keep_alive_min)
+                            .unwrap_or(60)
+                            .max(1);
+                    let max_secs =
+                        crate::config::parse_duration_seconds(&config.server.keep_alive_max)
+                            .unwrap_or(1800)
+                            .max(min_secs);
 
-                    // 1. Rewrite or inject "model" field
-                    if let Some(model_entry) = obj.get_mut("model") {
-                        let current_requested = model_entry.as_str().unwrap_or_default();
-                        if current_requested != active_model {
-                            info!(
-                                "[Auto-Model] Rewriting requested model '{}' -> active loaded model '{}' for {}",
-                                current_requested, active_model, path_and_query
-                            );
-                            *model_entry = serde_json::Value::String(active_model.clone());
-                            rewritten = true;
-                        }
-                    } else if path_and_query.starts_with("/api/chat")
-                        || path_and_query.starts_with("/api/generate")
-                        || path_and_query.starts_with("/api/embeddings")
-                        || path_and_query.starts_with("/api/embed")
-                        || path_and_query.starts_with("/v1/chat/completions")
-                        || path_and_query.starts_with("/v1/completions")
-                        || path_and_query.starts_with("/v1/embeddings")
-                    {
-                        info!(
-                            "[Auto-Model] Injecting active loaded model '{}' into request for {}",
-                            active_model, path_and_query
-                        );
-                        obj.insert(
-                            "model".to_string(),
-                            serde_json::Value::String(active_model.clone()),
-                        );
-                        rewritten = true;
-                    }
-
-                    // 2. Rewrite "name" field for Ollama /api/show
-                    if path_and_query.starts_with("/api/show") {
-                        if let Some(name_entry) = obj.get_mut("name") {
-                            let current_name = name_entry.as_str().unwrap_or_default();
-                            if current_name != active_model {
-                                info!(
-                                    "[Auto-Model] Rewriting /api/show name '{}' -> active loaded model '{}'",
-                                    current_name, active_model
-                                );
-                                *name_entry = serde_json::Value::String(active_model.clone());
-                                rewritten = true;
+                    if let Some(ka) = obj.get_mut("keep_alive") {
+                        if let Some(num) = ka.as_i64() {
+                            if num < 0 {
+                                *ka = serde_json::json!(max_secs);
+                            } else if num == 0 || num < min_secs {
+                                *ka = serde_json::json!(min_secs);
+                            } else if num > max_secs {
+                                *ka = serde_json::json!(max_secs);
+                            }
+                        } else if let Some(s) = ka.as_str() {
+                            if s == "-1" || s.starts_with('-') {
+                                *ka = serde_json::json!(config.server.keep_alive_max);
+                            } else {
+                                let parsed = crate::config::parse_duration_seconds(s).unwrap_or(0);
+                                if parsed == 0 || parsed < min_secs {
+                                    *ka = serde_json::json!(config.server.keep_alive_min);
+                                } else if parsed > max_secs {
+                                    *ka = serde_json::json!(config.server.keep_alive_max);
+                                }
                             }
                         }
                     }
 
-                    if rewritten {
-                        if let Ok(serialized) = serde_json::to_vec(&json_val) {
-                            final_bytes = Bytes::from(serialized);
+                    // 2. options: cap num_ctx and num_predict, strip hardware placement options
+                    let max_ctx = config.server.max_num_ctx;
+                    let max_predict = config.server.max_num_predict;
+
+                    const HARDWARE_OPTS: &[&str] = &[
+                        "num_gpu",
+                        "main_gpu",
+                        "num_thread",
+                        "use_mmap",
+                        "use_mlock",
+                        "low_vram",
+                        "numa",
+                    ];
+                    for hw in HARDWARE_OPTS {
+                        obj.remove(*hw);
+                    }
+
+                    if let Some(options) = obj.get_mut("options").and_then(|v| v.as_object_mut()) {
+                        for hw in HARDWARE_OPTS {
+                            options.remove(*hw);
+                        }
+                        if let Some(ctx) = options.get_mut("num_ctx") {
+                            if let Some(c) = ctx.as_u64() {
+                                if c > max_ctx as u64 {
+                                    *ctx = serde_json::json!(max_ctx);
+                                }
+                            }
+                        }
+                        if let Some(predict) = options.get_mut("num_predict") {
+                            if let Some(p) = predict.as_i64() {
+                                if p == -1 || p > max_predict as i64 {
+                                    *predict = serde_json::json!(max_predict);
+                                }
+                            }
                         }
                     }
+
+                    // Cap /v1 max_tokens and max_completion_tokens
+                    if clean_path.starts_with("/v1/chat/completions")
+                        || clean_path.starts_with("/v1/completions")
+                    {
+                        if let Some(mt) = obj.get_mut("max_tokens") {
+                            if mt.is_null() {
+                                *mt = serde_json::json!(max_predict);
+                            } else if let Some(p) = mt.as_i64() {
+                                if p == -1 || p > max_predict as i64 {
+                                    *mt = serde_json::json!(max_predict);
+                                }
+                            }
+                        } else {
+                            obj.insert("max_tokens".to_string(), serde_json::json!(max_predict));
+                        }
+
+                        if let Some(mct) = obj.get_mut("max_completion_tokens") {
+                            if let Some(p) = mct.as_i64() {
+                                if p == -1 || p > max_predict as i64 {
+                                    *mct = serde_json::json!(max_predict);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Model selection & rewriting
+                let allowed = &config.server.allowed_models;
+                let default_model = &config.server.default_model;
+
+                if !allowed.is_empty() {
+                    // Explicit allowed_models list
+                    let req_model = obj.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                    let is_allowed = allowed
+                        .iter()
+                        .any(|m| m == req_model || m == &format!("{}:latest", req_model));
+                    if !is_allowed {
+                        let fallback = if !default_model.is_empty() {
+                            default_model.clone()
+                        } else if let Some(loaded) = model_tracker.resolve_active_model().await {
+                            loaded
+                        } else {
+                            allowed[0].clone()
+                        };
+                        info!(
+                            "[Model-Filter] Disallowed model '{}' rewritten to fallback '{}' for {}",
+                            req_model, fallback, path_and_query
+                        );
+                        obj.insert("model".to_string(), serde_json::Value::String(fallback));
+                    }
+
+                    if clean_path.starts_with("/api/show") {
+                        let req_name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let is_allowed_name = allowed
+                            .iter()
+                            .any(|m| m == req_name || m == &format!("{}:latest", req_name));
+                        if !is_allowed_name {
+                            let fallback = if !default_model.is_empty() {
+                                default_model.clone()
+                            } else if let Some(loaded) = model_tracker.resolve_active_model().await
+                            {
+                                loaded
+                            } else {
+                                allowed[0].clone()
+                            };
+                            obj.insert("name".to_string(), serde_json::Value::String(fallback));
+                        }
+                    }
+                } else {
+                    // allowed_models is empty: auto-map to active loaded model if present
+                    if let Some(active_model) = model_tracker.resolve_active_model().await {
+                        if let Some(model_entry) = obj.get_mut("model") {
+                            let current_requested = model_entry.as_str().unwrap_or_default();
+                            if current_requested != active_model {
+                                info!(
+                                    "[Auto-Model] Rewriting requested model '{}' -> active loaded model '{}' for {}",
+                                    current_requested, active_model, path_and_query
+                                );
+                                *model_entry = serde_json::Value::String(active_model.clone());
+                            }
+                        } else if clean_path.starts_with("/api/chat")
+                            || clean_path.starts_with("/api/generate")
+                            || clean_path.starts_with("/api/embeddings")
+                            || clean_path.starts_with("/api/embed")
+                            || clean_path.starts_with("/v1/chat/completions")
+                            || clean_path.starts_with("/v1/completions")
+                            || clean_path.starts_with("/v1/embeddings")
+                        {
+                            info!(
+                                "[Auto-Model] Injecting active loaded model '{}' into request for {}",
+                                active_model, path_and_query
+                            );
+                            obj.insert(
+                                "model".to_string(),
+                                serde_json::Value::String(active_model.clone()),
+                            );
+                        }
+
+                        if clean_path.starts_with("/api/show") {
+                            if let Some(name_entry) = obj.get_mut("name") {
+                                let current_name = name_entry.as_str().unwrap_or_default();
+                                if current_name != active_model {
+                                    *name_entry = serde_json::Value::String(active_model.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Ok(serialized) = serde_json::to_vec(&json_val) {
+                    final_bytes = Bytes::from(serialized);
                 }
             }
         }
@@ -604,9 +782,114 @@ async fn forward_to_local_ollama(
 
     match client_sender.send_request(outgoing_req).await {
         Ok(upstream_resp) => {
-            let (u_parts, u_body) = upstream_resp.into_parts();
-            let boxed_body = u_body.map_err(|e| e).boxed();
-            Ok(Response::from_parts(u_parts, boxed_body))
+            let (mut u_parts, u_body) = upstream_resp.into_parts();
+            // Check if discovery filtering or context clamping is required
+            if (clean_path == "/api/tags" || clean_path == "/api/ps")
+                && !config.server.allowed_models.is_empty()
+            {
+                match u_body.collect().await {
+                    Ok(resp_bytes) => {
+                        let mut b = resp_bytes.to_bytes();
+                        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&b) {
+                            if let Some(models) =
+                                json.get_mut("models").and_then(|v| v.as_array_mut())
+                            {
+                                models.retain(|m| {
+                                    let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let model =
+                                        m.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                                    config
+                                        .server
+                                        .allowed_models
+                                        .iter()
+                                        .any(|am| am == name || am == model)
+                                });
+                            }
+                            if let Ok(s) = serde_json::to_vec(&json) {
+                                b = Bytes::from(s);
+                            }
+                        }
+                        u_parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+                        u_parts.headers.insert(
+                            hyper::header::CONTENT_LENGTH,
+                            hyper::header::HeaderValue::from(b.len()),
+                        );
+                        Ok(Response::from_parts(u_parts, full_body(b)))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else if clean_path == "/v1/models" && !config.server.allowed_models.is_empty() {
+                match u_body.collect().await {
+                    Ok(resp_bytes) => {
+                        let mut b = resp_bytes.to_bytes();
+                        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&b) {
+                            if let Some(data) = json.get_mut("data").and_then(|v| v.as_array_mut())
+                            {
+                                data.retain(|m| {
+                                    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    config.server.allowed_models.iter().any(|am| am == id)
+                                });
+                            }
+                            if let Ok(s) = serde_json::to_vec(&json) {
+                                b = Bytes::from(s);
+                            }
+                        }
+                        u_parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+                        u_parts.headers.insert(
+                            hyper::header::CONTENT_LENGTH,
+                            hyper::header::HeaderValue::from(b.len()),
+                        );
+                        Ok(Response::from_parts(u_parts, full_body(b)))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else if clean_path == "/api/show" {
+                match u_body.collect().await {
+                    Ok(resp_bytes) => {
+                        let mut b = resp_bytes.to_bytes();
+                        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&b) {
+                            let max_ctx = config.server.max_num_ctx;
+                            if let Some(model_info) =
+                                json.get_mut("model_info").and_then(|v| v.as_object_mut())
+                            {
+                                for (k, v) in model_info.iter_mut() {
+                                    if k.ends_with(".context_length") {
+                                        if let Some(num) = v.as_u64() {
+                                            if num > max_ctx as u64 {
+                                                *v = serde_json::json!(max_ctx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(details) =
+                                json.get_mut("details").and_then(|v| v.as_object_mut())
+                            {
+                                if let Some(v) = details.get_mut("context_length") {
+                                    if let Some(num) = v.as_u64() {
+                                        if num > max_ctx as u64 {
+                                            *v = serde_json::json!(max_ctx);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Ok(s) = serde_json::to_vec(&json) {
+                                b = Bytes::from(s);
+                            }
+                        }
+                        u_parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+                        u_parts.headers.insert(
+                            hyper::header::CONTENT_LENGTH,
+                            hyper::header::HeaderValue::from(b.len()),
+                        );
+                        Ok(Response::from_parts(u_parts, full_body(b)))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                let boxed_body = u_body.map_err(|e| e).boxed();
+                Ok(Response::from_parts(u_parts, boxed_body))
+            }
         }
         Err(_) => {
             let mut resp = Response::new(full_body(

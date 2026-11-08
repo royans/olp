@@ -343,6 +343,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             remote_port: Some(80), // privileged port!
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -375,6 +376,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
             remote_port: Some(25000), // outside allowed 15000-16000
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -425,6 +427,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             remote_port: Some(17101),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -440,6 +443,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
             remote_port: Some(17102),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -555,6 +559,7 @@ fn test_server_should_verify_ca_auto_detection() {
         remote_port: Some(18434),
         tls_verify: None,
         read_only: None,
+        ..Default::default()
     };
     // Strict CA root verification is enabled by default for all hosts
     assert!(s.should_verify_ca());
@@ -664,6 +669,7 @@ async fn test_apache_access_log_file_logging() {
             remote_port: Some(19150),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -788,6 +794,7 @@ async fn test_plain_http_to_https_port_returns_helpful_bad_request() {
             remote_port: Some(19350),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -968,6 +975,7 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -994,6 +1002,7 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1049,6 +1058,7 @@ async fn test_user_disabled_account_rejection() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1107,6 +1117,7 @@ async fn test_user_max_servers_limit_enforcement() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1131,6 +1142,7 @@ async fn test_user_max_servers_limit_enforcement() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1190,6 +1202,7 @@ async fn test_cross_user_port_stealing_prevention() {
             allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
             created_at: None,
             read_only: None,
+            ..Default::default()
         },
     );
     alice_profile.save_atomic(&alice_profile_path).unwrap();
@@ -1205,6 +1218,7 @@ async fn test_cross_user_port_stealing_prevention() {
             remote_port: Some(17500), // recommending Alice's port!
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1266,6 +1280,7 @@ async fn test_port_exhaustion_returns_clean_error() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1288,6 +1303,7 @@ async fn test_port_exhaustion_returns_clean_error() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1310,6 +1326,7 @@ async fn test_port_exhaustion_returns_clean_error() {
             remote_port: None,
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1371,6 +1388,7 @@ async fn test_server_specific_cidr_restrictions() {
             allowed_server_cidrs: vec!["192.168.254.1/32".to_string()], // 127.0.0.1 disallowed!
             created_at: None,
             read_only: None,
+            ..Default::default()
         },
     );
     profile.save_atomic(&profile_path).unwrap();
@@ -1385,6 +1403,7 @@ async fn test_server_specific_cidr_restrictions() {
             remote_port: Some(17850),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1460,7 +1479,8 @@ async fn test_sensitive_operations_blocked_by_default_on_proxy() {
             passkey_user: "ro_user_pass".to_string(),
             remote_port: Some(18150),
             tls_verify: Some(false),
-            read_only: None, // Controlled by proxy!
+            read_only: None,
+            ..Default::default() // Controlled by proxy!
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1524,7 +1544,7 @@ async fn test_sensitive_operations_blocked_by_default_on_proxy() {
         resp2.contains("403 Forbidden"),
         "POST /api/pull must be blocked with 403 Forbidden"
     );
-    assert!(resp2.contains("sensitive Ollama operations are disabled"));
+    assert!(resp2.contains("model downloads are disabled on this server (read-only mode)"));
 
     // 3. Sensitive request (DELETE /api/delete) -> 403 Forbidden
     let mut tcp3 = tokio::net::TcpStream::connect("127.0.0.1:18150")
@@ -1625,7 +1645,8 @@ async fn test_policy_coexistence_conflict_fails_tunnel() {
             passkey_user: "user_pass".to_string(),
             remote_port: None,
             tls_verify: Some(false),
-            read_only: Some(false), // Attempting to configure on server when proxy is authority!
+            read_only: Some(false),
+            ..Default::default() // Attempting to configure on server when proxy is authority!
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1683,7 +1704,8 @@ async fn test_policy_aligned_both_sides_succeeds() {
             passkey_user: "user_pass".to_string(),
             remote_port: Some(20150),
             tls_verify: Some(false),
-            read_only: Some(true), // Aligned with proxy!
+            read_only: Some(true),
+            ..Default::default() // Aligned with proxy!
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1758,7 +1780,8 @@ async fn test_policy_server_restricts_itself_stricter_wins() {
             passkey_user: "stricter_pass".to_string(),
             remote_port: Some(20250),
             tls_verify: Some(false),
-            read_only: Some(true), // Server restricts itself to read-only!
+            read_only: Some(true),
+            ..Default::default() // Server restricts itself to read-only!
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1908,6 +1931,7 @@ async fn test_unauthenticated_request_rejects_without_buffering_large_body() {
             remote_port: Some(19250),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -1994,6 +2018,7 @@ async fn test_max_request_body_size_rejection() {
             remote_port: Some(19850),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -2091,6 +2116,7 @@ async fn test_backend_concurrency_throttling_returns_429() {
             remote_port: Some(19450),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -2206,6 +2232,7 @@ async fn test_authenticated_request_rate_limiting() {
             remote_port: Some(19550),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -2329,6 +2356,7 @@ async fn test_user_profile_salted_hash_passkey_verification() {
             remote_port: Some(19650),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
@@ -2434,6 +2462,7 @@ async fn test_user_profile_default_plaintext_passkey_manual_editing() {
             remote_port: Some(19750),
             tls_verify: Some(false),
             read_only: None,
+            ..Default::default()
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),

@@ -153,6 +153,85 @@ pub struct PortWorker {
     pub read_only: AtomicBool,
     pub concurrency_semaphore: Arc<tokio::sync::Semaphore>,
     pub request_rate_limiter: Arc<crate::keys::RequestRateLimiter>,
+    pub resolved_keys: RwLock<Vec<crate::config::ResolvedKey>>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct BlockedPathTracker {
+    counters: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+}
+
+impl BlockedPathTracker {
+    pub fn new() -> Self {
+        Self {
+            counters: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn record(&self, path: &str) {
+        let clean = path.split('?').next().unwrap_or(path);
+        if let Ok(mut map) = self.counters.write() {
+            *map.entry(clean.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    pub fn get_counts(&self) -> HashMap<String, u64> {
+        self.counters.read().map(|m| m.clone()).unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MatchedKey {
+    pub label: String,
+    pub scope: crate::config::KeyScope,
+}
+
+pub fn verify_http_headers_with_keys(
+    headers: &hyper::HeaderMap,
+    keys: &[crate::config::ResolvedKey],
+) -> Option<MatchedKey> {
+    let mut candidate_tokens: Vec<String> = Vec::new();
+    if let Some(auth_header) = headers.get(AUTHORIZATION).and_then(|h| h.to_str().ok()) {
+        let auth_header = auth_header.trim();
+        if let Some(token) = auth_header
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_header.strip_prefix("bearer "))
+        {
+            candidate_tokens.push(token.trim().to_string());
+        } else if let Some(b64) = auth_header
+            .strip_prefix("Basic ")
+            .or_else(|| auth_header.strip_prefix("basic "))
+        {
+            if let Ok(decoded_bytes) = BASE64.decode(b64.trim()) {
+                if let Ok(decoded_str) = std::str::from_utf8(&decoded_bytes) {
+                    let candidate = match decoded_str.split_once(':') {
+                        Some((_user, pass)) => pass,
+                        None => decoded_str,
+                    };
+                    candidate_tokens.push(candidate.to_string());
+                }
+            }
+        }
+    }
+
+    for header_name in &["x-api-key", "api-key", "ollama-api-key", "x-auth-token"] {
+        if let Some(val) = headers.get(*header_name).and_then(|h| h.to_str().ok()) {
+            candidate_tokens.push(val.trim().to_string());
+        }
+    }
+
+    for candidate in &candidate_tokens {
+        for key in keys {
+            if key.verifier.verify(candidate) {
+                return Some(MatchedKey {
+                    label: key.label.clone(),
+                    scope: key.scope,
+                });
+            }
+        }
+    }
+
+    None
 }
 
 impl PortWorker {
@@ -414,6 +493,7 @@ pub struct ProxyState {
     pub rate_limiter: Arc<IpRateLimiter>,
     pub public_tls_acceptor: Option<TlsAcceptor>,
     pub access_logger: Arc<AccessLogger>,
+    pub blocked_paths: BlockedPathTracker,
 }
 
 impl ProxyState {
@@ -454,6 +534,7 @@ impl ProxyState {
         server_id: &str,
         recommended_port: Option<u16>,
         passkey_user: &str,
+        keys: &std::collections::HashMap<String, crate::protocol::ScopedKeyRegistration>,
     ) -> Result<u16> {
         let _guard = self.allocation_lock.lock().await;
 
@@ -479,6 +560,33 @@ impl ProxyState {
                 };
                 if !in_use_by_other {
                     existing_srv.passkey_user = passkey_user.to_string();
+                    for (label, reg_key) in keys {
+                        if !existing_srv.keys.contains_key(label) {
+                            let (passkey_val, hash_val) = if self.config.security.hash_passkeys {
+                                (
+                                    "".to_string(),
+                                    Some(
+                                        PasskeyVerifier::from_passkey(&reg_key.passkey)
+                                            .to_encoded_hash(),
+                                    ),
+                                )
+                            } else {
+                                (reg_key.passkey.clone(), reg_key.hash.clone())
+                            };
+                            let scope = match reg_key.scope.as_str() {
+                                "manage" => crate::config::KeyScope::Manage,
+                                _ => crate::config::KeyScope::Inference,
+                            };
+                            existing_srv.keys.insert(
+                                label.clone(),
+                                crate::config::ScopedKeyConfig {
+                                    passkey: passkey_val,
+                                    hash: hash_val,
+                                    scope,
+                                },
+                            );
+                        }
+                    }
                     self.save_user_profile(&profile)?;
                     return Ok(p);
                 }
@@ -559,6 +667,34 @@ impl ProxyState {
         } else {
             (passkey_user.to_string(), None)
         };
+        let mut keys_map = existing
+            .as_ref()
+            .map(|s| s.keys.clone())
+            .unwrap_or_default();
+        for (label, reg_key) in keys {
+            if !keys_map.contains_key(label) {
+                let (passkey_val, hash_val) = if self.config.security.hash_passkeys {
+                    (
+                        "".to_string(),
+                        Some(PasskeyVerifier::from_passkey(&reg_key.passkey).to_encoded_hash()),
+                    )
+                } else {
+                    (reg_key.passkey.clone(), reg_key.hash.clone())
+                };
+                let scope = match reg_key.scope.as_str() {
+                    "manage" => crate::config::KeyScope::Manage,
+                    _ => crate::config::KeyScope::Inference,
+                };
+                keys_map.insert(
+                    label.clone(),
+                    crate::config::ScopedKeyConfig {
+                        passkey: passkey_val,
+                        hash: hash_val,
+                        scope,
+                    },
+                );
+            }
+        }
         profile.servers.insert(
             server_id.to_string(),
             UserServerConfig {
@@ -579,6 +715,7 @@ impl ProxyState {
                     .and_then(|s| s.created_at.clone())
                     .or_else(|| Some(format_apache_timestamp(std::time::SystemTime::now()))),
                 read_only: existing.as_ref().and_then(|s| s.read_only),
+                keys: keys_map,
             },
         );
 
@@ -759,6 +896,7 @@ pub async fn start_proxy_server(
         allocation_lock: tokio::sync::Mutex::new(()),
         public_tls_acceptor,
         access_logger,
+        blocked_paths: BlockedPathTracker::new(),
     });
 
     info!(
@@ -911,6 +1049,7 @@ async fn handle_incoming_tunnel(
             &register.olp_server_id,
             register.recommended_port,
             &register.passkey_user,
+            &register.keys,
         )
         .await
     {
@@ -978,6 +1117,7 @@ async fn handle_incoming_tunnel(
     // Configure worker credentials & ACL specifically for this server
     {
         *worker.user_verifier.write().unwrap() = server_cfg.get_verifier();
+        *worker.resolved_keys.write().unwrap() = server_cfg.get_resolved_keys();
         *worker.user_ip_filter.write().unwrap() =
             Arc::new(IpFilter::new(&server_cfg.allowed_user_cidrs)?);
         *worker.assigned_server_id.write().unwrap() = Some(register.olp_server_id.clone());
@@ -1168,6 +1308,7 @@ fn get_or_create_port_worker(state: &Arc<ProxyState>, port: u16) -> Result<Arc<P
         request_rate_limiter: Arc::new(crate::keys::RequestRateLimiter::new(
             state.config.security.max_requests_per_min,
         )),
+        resolved_keys: RwLock::new(Vec::new()),
     });
 
     guard.insert(port, worker.clone());
@@ -1301,10 +1442,14 @@ async fn handle_public_http_request(
         let method = method.clone();
         let uri = uri.clone();
         let version = version.clone();
-        move |status: StatusCode, resp_bytes: usize, req_size: usize, model: &str| {
+        move |status: StatusCode,
+              resp_bytes: usize,
+              req_size: usize,
+              model: &str,
+              key_label: &str| {
             let duration_ms = start_time.elapsed().as_millis();
             let line = format!(
-                r#"{ip} - {auth_scheme} [{timestamp}] "{method} {uri} {version}" {status} {resp_bytes} {duration_ms}ms model="{model}" req_bytes={req_bytes}"#,
+                r#"{ip} - {auth_scheme} [{timestamp}] "{method} {uri} {version}" {status} {resp_bytes} {duration_ms}ms key="{key_label}" model="{model}" req_bytes={req_bytes}"#,
                 ip = client_ip,
                 auth_scheme = auth_scheme,
                 timestamp = timestamp_str,
@@ -1314,6 +1459,7 @@ async fn handle_public_http_request(
                 status = status.as_u16(),
                 resp_bytes = resp_bytes,
                 duration_ms = duration_ms,
+                key_label = key_label,
                 model = model,
                 req_bytes = req_size,
             );
@@ -1324,7 +1470,7 @@ async fn handle_public_http_request(
     // 0. Reject CONNECT method immediately with 405 Method Not Allowed
     if method == Method::CONNECT {
         let err_json = r#"{"error":"CONNECT method is forbidden"}"#;
-        log_event(StatusCode::METHOD_NOT_ALLOWED, err_json.len(), 0, "-");
+        log_event(StatusCode::METHOD_NOT_ALLOWED, err_json.len(), 0, "-", "-");
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
         return Ok(resp);
@@ -1332,7 +1478,7 @@ async fn handle_public_http_request(
 
     // 1. Handle CORS preflight without requiring authentication
     if method == Method::OPTIONS {
-        log_event(StatusCode::NO_CONTENT, 0, 0, "-");
+        log_event(StatusCode::NO_CONTENT, 0, 0, "-", "-");
         let mut resp = Response::new(full_body(Bytes::new()));
         *resp.status_mut() = StatusCode::NO_CONTENT;
         resp.headers_mut().insert(
@@ -1362,7 +1508,7 @@ async fn handle_public_http_request(
             client_ip, worker.port
         );
         let err_json = r#"{"error":"forbidden: IP address not allowed by proxy filter"}"#;
-        log_event(StatusCode::FORBIDDEN, err_json.len(), 0, "-");
+        log_event(StatusCode::FORBIDDEN, err_json.len(), 0, "-", "-");
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::FORBIDDEN;
         resp.headers_mut().insert(
@@ -1375,7 +1521,7 @@ async fn handle_public_http_request(
     // 3. Check pre-tunnel IP brute-force rate limiter
     if state.rate_limiter.is_locked_out(&client_ip).is_some() {
         let err_json = r#"{"error":"too many failed authentication attempts, try again later"}"#;
-        log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-");
+        log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-", "-");
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         resp.headers_mut()
@@ -1387,15 +1533,15 @@ async fn handle_public_http_request(
         return Ok(resp);
     }
 
-    // 4. Verify passkey_user using Basic Auth or Bearer Token in constant time BEFORE body collection
-    let mut is_auth_valid = {
-        let verifier = worker.user_verifier.read().unwrap();
-        verify_http_headers_auth(req.headers(), &verifier)
+    // 4. Verify credentials against scoped keys in constant time BEFORE body collection
+    let mut matched_key: Option<MatchedKey> = {
+        let keys = worker.resolved_keys.read().unwrap();
+        verify_http_headers_with_keys(req.headers(), &keys)
     };
 
     // If initial verification failed against in-memory cache, reload profile from disk
     // in case the user manually edited ~/.olp/config/<api_key>.toml
-    if !is_auth_valid {
+    if matched_key.is_none() {
         let ids = {
             let s_id = worker.assigned_server_id.read().unwrap().clone();
             let a_key = worker.assigned_api_key.read().unwrap().clone();
@@ -1407,37 +1553,42 @@ async fn handle_public_http_request(
         if let Some((server_id, api_key)) = ids {
             if let Ok(profile) = state.load_user_profile(&api_key) {
                 if let Some(fresh_server_cfg) = profile.servers.get(&server_id) {
-                    let fresh_verifier = fresh_server_cfg.get_verifier();
-                    if verify_http_headers_auth(req.headers(), &fresh_verifier) {
-                        *worker.user_verifier.write().unwrap() = fresh_verifier;
+                    let fresh_keys = fresh_server_cfg.get_resolved_keys();
+                    if let Some(m) = verify_http_headers_with_keys(req.headers(), &fresh_keys) {
+                        *worker.resolved_keys.write().unwrap() = fresh_keys;
+                        *worker.user_verifier.write().unwrap() = fresh_server_cfg.get_verifier();
                         if let Ok(new_filter) = IpFilter::new(&fresh_server_cfg.allowed_user_cidrs)
                         {
                             *worker.user_ip_filter.write().unwrap() = Arc::new(new_filter);
                         }
-                        is_auth_valid = true;
+                        matched_key = Some(m);
                     }
                 }
             }
         }
     }
 
-    if !is_auth_valid {
-        state.rate_limiter.record_failure(client_ip);
-        let err_json = r#"{"error":"unauthorized: valid Basic Auth (username:passkey_user) or Bearer passkey_user required"}"#;
-        log_event(StatusCode::UNAUTHORIZED, err_json.len(), 0, "-");
-        let mut resp = Response::new(full_body(err_json));
-        *resp.status_mut() = StatusCode::UNAUTHORIZED;
-        resp.headers_mut().insert(
-            WWW_AUTHENTICATE,
-            hyper::header::HeaderValue::from_static(r#"Basic realm="Ollama Proxy""#),
-        );
-        resp.headers_mut().insert(
-            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            hyper::header::HeaderValue::from_static("*"),
-        );
-        return Ok(resp);
-    }
+    let matched_info = match matched_key {
+        Some(m) => m,
+        None => {
+            state.rate_limiter.record_failure(client_ip);
+            let err_json = r#"{"error":"unauthorized: valid Basic Auth (username:passkey_user) or Bearer passkey_user required"}"#;
+            log_event(StatusCode::UNAUTHORIZED, err_json.len(), 0, "-", "-");
+            let mut resp = Response::new(full_body(err_json));
+            *resp.status_mut() = StatusCode::UNAUTHORIZED;
+            resp.headers_mut().insert(
+                WWW_AUTHENTICATE,
+                hyper::header::HeaderValue::from_static(r#"Basic realm="Ollama Proxy""#),
+            );
+            resp.headers_mut().insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                hyper::header::HeaderValue::from_static("*"),
+            );
+            return Ok(resp);
+        }
+    };
 
+    let active_key_label = matched_info.label.clone();
     state.rate_limiter.record_success(&client_ip);
 
     // 5. Check authenticated request rate limiter
@@ -1447,7 +1598,13 @@ async fn handle_public_http_request(
             worker.port, state.config.security.max_requests_per_min
         );
         let err_json = r#"{"error":"rate limit exceeded: too many requests per minute"}"#;
-        log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-");
+        log_event(
+            StatusCode::TOO_MANY_REQUESTS,
+            err_json.len(),
+            0,
+            "-",
+            &active_key_label,
+        );
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         resp.headers_mut()
@@ -1460,16 +1617,29 @@ async fn handle_public_http_request(
     }
 
     // 6. Enforce read-only policy for sensitive Ollama operations
-    let is_read_only = worker.read_only.load(Ordering::Relaxed);
-    if is_read_only && is_sensitive_ollama_op(&method, &uri) {
+    let is_proxy_ro = worker.read_only.load(Ordering::Relaxed);
+    let is_inference_only = is_proxy_ro || matched_info.scope == crate::config::KeyScope::Inference;
+    if is_inference_only && is_sensitive_ollama_op(&method, &uri) {
+        let (err_json, reason) = crate::protocol::format_read_only_error(&uri, &method);
+        let clean_path = uri.split('?').next().unwrap_or(&uri);
+        state.blocked_paths.record(clean_path);
         warn!(
-            "[POLICY] Blocked sensitive Ollama operation '{} {}' on port {} (read-only mode active)",
-            method, uri, worker.port
+            "[POLICY BLOCKED] method={} path={} status=403 key_label={} reason=\"{}\"",
+            method, clean_path, active_key_label, reason
         );
-        let err_json = r#"{"error":"operation forbidden: sensitive Ollama operations are disabled (read-only mode active)"}"#;
-        log_event(StatusCode::FORBIDDEN, err_json.len(), 0, "-");
+        log_event(
+            StatusCode::FORBIDDEN,
+            err_json.len(),
+            0,
+            "-",
+            &active_key_label,
+        );
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::FORBIDDEN;
+        resp.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
         resp.headers_mut().insert(
             hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
             hyper::header::HeaderValue::from_static("*"),
@@ -1489,7 +1659,13 @@ async fn handle_public_http_request(
                             cl, max_bytes, worker.port
                         );
                         let err_json = r#"{"error":"payload too large: request body exceeds maximum allowed size"}"#;
-                        log_event(StatusCode::PAYLOAD_TOO_LARGE, err_json.len(), cl, "-");
+                        log_event(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            err_json.len(),
+                            cl,
+                            "-",
+                            &active_key_label,
+                        );
                         let mut resp = Response::new(full_body(err_json));
                         *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
                         resp.headers_mut().insert(
@@ -1513,7 +1689,13 @@ async fn handle_public_http_request(
             );
             let err_json =
                 r#"{"error":"server busy: maximum concurrent requests reached for this backend"}"#;
-            log_event(StatusCode::TOO_MANY_REQUESTS, err_json.len(), 0, "-");
+            log_event(
+                StatusCode::TOO_MANY_REQUESTS,
+                err_json.len(),
+                0,
+                "-",
+                &active_key_label,
+            );
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
             resp.headers_mut()
@@ -1561,6 +1743,7 @@ async fn handle_public_http_request(
             err_json.len(),
             collected.len(),
             "-",
+            &active_key_label,
         );
         let mut resp = Response::new(full_body(err_json));
         *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
@@ -1591,6 +1774,7 @@ async fn handle_public_http_request(
                 err_json.len(),
                 req_size,
                 &model,
+                &active_key_label,
             );
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
@@ -1607,7 +1791,13 @@ async fn handle_public_http_request(
         Ok(s) => s,
         Err(_) => {
             let err_json = r#"{"error":"failed to open substream to olp-server"}"#;
-            log_event(StatusCode::BAD_GATEWAY, err_json.len(), req_size, &model);
+            log_event(
+                StatusCode::BAD_GATEWAY,
+                err_json.len(),
+                req_size,
+                &model,
+                &active_key_label,
+            );
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             resp.headers_mut().insert(
@@ -1618,13 +1808,19 @@ async fn handle_public_http_request(
         }
     };
 
-    // 12. Forward HTTP request with stripped auth headers
+    // 12. Forward HTTP request with stripped auth headers and injected scope headers
     let (mut client_sender, conn) =
         match hyper::client::conn::http1::handshake(TokioIo::new(mux_stream)).await {
             Ok(pair) => pair,
             Err(_) => {
                 let err_json = r#"{"error":"failed HTTP handshake over tunnel substream"}"#;
-                log_event(StatusCode::BAD_GATEWAY, err_json.len(), req_size, &model);
+                log_event(
+                    StatusCode::BAD_GATEWAY,
+                    err_json.len(),
+                    req_size,
+                    &model,
+                    &active_key_label,
+                );
                 let mut resp = Response::new(full_body(err_json));
                 *resp.status_mut() = StatusCode::BAD_GATEWAY;
                 resp.headers_mut().insert(
@@ -1644,6 +1840,20 @@ async fn handle_public_http_request(
     parts.headers.remove("api-key");
     parts.headers.remove("ollama-api-key");
     parts.headers.remove("x-auth-token");
+
+    let scope_str = if is_inference_only {
+        "inference"
+    } else {
+        "manage"
+    };
+    parts.headers.insert(
+        "x-olp-scope",
+        hyper::header::HeaderValue::from_static(scope_str),
+    );
+    if let Ok(label_val) = hyper::header::HeaderValue::from_str(&active_key_label) {
+        parts.headers.insert("x-olp-key-label", label_val);
+    }
+
     let forward_req = Request::from_parts(parts, full_body(body_bytes));
 
     match client_sender.send_request(forward_req).await {
@@ -1656,15 +1866,22 @@ async fn handle_public_http_request(
             let status = u_parts.status;
             let boxed_upstream = u_body.map_err(|e| e).boxed();
             let model_for_log = model.clone();
+            let key_for_log = active_key_label.clone();
             let logging_body = LoggingBody::new(boxed_upstream, move |resp_bytes| {
                 let _hold_permit_until_stream_finished = permit;
-                log_event(status, resp_bytes, req_size, &model_for_log);
+                log_event(status, resp_bytes, req_size, &model_for_log, &key_for_log);
             });
             Ok(Response::from_parts(u_parts, logging_body.boxed()))
         }
         Err(_) => {
             let err_json = r#"{"error":"upstream olp-server failed to respond"}"#;
-            log_event(StatusCode::BAD_GATEWAY, err_json.len(), req_size, &model);
+            log_event(
+                StatusCode::BAD_GATEWAY,
+                err_json.len(),
+                req_size,
+                &model,
+                &active_key_label,
+            );
             let mut resp = Response::new(full_body(err_json));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             resp.headers_mut().insert(

@@ -239,11 +239,28 @@ olp_server_id = "srv_my_ollama_box"
 passkey_user = "your-client-passkey-for-this-server"
 # remote_port = 10000 # optional recommended port; proxy allocates dynamically if omitted
 
-# Read-Only Policy (optional):
+# Read-Only Policy & Inference Protection:
 # Stricter setting wins! A GPU server can always restrict itself to read-only mode (read_only = true)
 # even if connected to a proxy with read_only = false. Mutating operations (pull/delete/create/push/copy/blobs)
 # will be blocked both on the proxy's worker port and locally on the server.
-# read_only = true
+# read_only = false
+
+# Allowed models list (empty = automatically use the loaded model)
+# allowed_models = ["llama3:8b", "mistral:7b"]
+# default_model = "llama3:8b"
+# max_num_ctx = 32768
+# max_num_predict = 4096
+# keep_alive_min = "1m"
+# keep_alive_max = "30m"
+
+# Scoped client keys:
+# [server.keys.laptop]
+# passkey = "laptop_inference_key_secure_123"
+# scope   = "inference"
+#
+# [server.keys.admin]
+# passkey = "admin_remote_management_key_456"
+# scope   = "manage"
 
 # TLS CA Certificate Verification (optional, auto-detected)
 # Defaults to true for public domain names, false for localhost / 127.0.0.1.
@@ -343,7 +360,7 @@ ollama run default
 
 When multiple users query the same proxied Ollama instance:
 
-* **Privacy in Transit & Zero Prompt Logging**: Prompts pass through the gateway encrypted in transit (TLS 1.3) and are never logged or stored on disk. The proxy only inspects HTTP headers in memory to verify authentication and route requests. For zero trust, you can easily run your own self-hosted `olp-proxy` on your own VPS.
+* **Privacy in Transit & Zero Prompt Logging**: Prompts pass through the gateway encrypted in transit (TLS 1.3) and are never logged or stored on disk. The proxy decrypts traffic in memory solely to route requests, enforce rate limits, and verify authentication. Nothing is persisted. For zero trust, you can run your own self-hosted `olp-proxy` on your own VPS.
 * **No Cache Pollution or PII Leakage**: `olp` is strictly stateless. It does not cache prompts, conversation histories, or response bodies. Ollama's attention KV cache evaluates token prefixes strictly per sequence; attention tensors from one user are never injected into another user's generation.
 * **Independent IP Rate Limiting**: Brute-force protection tracks failures per IP address. One user's authentication mistakes will never lock out another user.
 * **Parallel Processing**: To allow Ollama to generate responses for multiple users concurrently (rather than queuing sequentially), set `OLLAMA_NUM_PARALLEL` on the Ollama host before starting Ollama:
@@ -355,20 +372,36 @@ When multiple users query the same proxied Ollama instance:
 
 ## Security Architecture & Policy Enforcement
 
-### 1. Read-Only Mode & Sensitive Operations Filter
-When read-only mode is active, only safe inference and inspection endpoints are permitted:
-- **Permitted Safe Operations**:
-  - Native Ollama: `POST /api/generate`, `POST /api/chat`, `POST /api/embeddings`, `POST /api/embed`, `GET /api/tags`, `GET /api/version`, `GET /api/ps`, `POST /api/show`
-  - OpenAI-Compatible: `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `GET /v1/models` (and `GET /v1/models/*`)
-- **Blocked Sensitive Mutating Operations** (rejected with `403 Forbidden`):
+### 1. Read-Only Mode, Endpoint Allowlist & Silent Normalization
+When read-only mode or an `inference` scope key is active, OLP enforces strict hardware and state protection without breaking OpenAI or Ollama-compatible clients (OpenAI SDK, Open WebUI, Cline, Continue, Roo Code):
+- **Allowed Inference Endpoints**:
+  - Native Ollama: `GET/HEAD /, /api, /api/version, /api/tags, /api/ps`, `POST /api/generate, /api/chat, /api/embed, /api/embeddings, /api/show`
+  - OpenAI-Compatible: `GET /v1/models, /v1/models/{id}`, `POST /v1/chat/completions, /v1/completions, /v1/embeddings`
+- **Blocked Sensitive Mutating Operations** (rejected with protocol-correct `403 Forbidden` and CORS headers):
   - Model pulling: `POST /api/pull`
   - Model deletion: `DELETE /api/delete`
   - Model creation / customization: `POST /api/create`
   - Model pushing: `POST /api/push`
   - Model copying: `POST /api/copy`
   - Raw blob uploads / inspections: `POST /api/blobs/*`, `HEAD /api/blobs/*`
+- **Protocol-Correct Error Formats**:
+  - Paths under `/v1/*` return OpenAI-format JSON: `{"error":{"message":"<reason>","type":"permission_error","code":"forbidden"}}`.
+  - All other paths return standard Ollama-format JSON: `{"error":"<reason>"}`.
+- **Silent Request-Body Normalization**:
+  - `keep_alive`: Clamped to `keep_alive_min` (default: 1m) and `keep_alive_max` (default: 30m). Client attempts to unload (`keep_alive: 0`) or pin forever (`keep_alive: -1`) are silently clamped.
+  - Context & Predict Caps: `options.num_ctx` is capped at `max_num_ctx` (default: 32768). `options.num_predict` and `/v1` `max_tokens` are capped at `max_num_predict` (default: 4096).
+  - Hardware Stripping: Hardware placement fields (`num_gpu`, `main_gpu`, `num_thread`, `use_mmap`, `use_mlock`, `low_vram`, `numa`) are stripped before forwarding.
+  - Model Selection & Rewriting: When `allowed_models` is set, requests for unapproved models are rewritten to `default_model` (or the loaded model) to prevent forced VRAM eviction.
+  - Discovery Filtering: `/api/tags`, `/api/ps`, and `/v1/models` responses are filtered to only expose models in `allowed_models`. Context length reported in `/api/show` is clamped to `max_num_ctx`.
 
-### 2. Policy Alignment & Stricter-Setting-Wins Resolution
+### 2. Scoped Client Keys (`inference` vs `manage`)
+Each server can define multiple client keys with granular scopes:
+- **`inference` scope (default)**: Safe inference allowlist and body normalization active. Mutating operations are forbidden.
+- **`manage` scope**: Allows administrative operations (`pull`, `delete`, `push`, `create`, `copy`) when allowed by proxy policy.
+- **Security & Logging**: User-supplied passkeys require a minimum length of 16 characters. Generated passkeys are 24+ random alphanumeric characters. Proxy access logs record the key label (e.g. `key="laptop"` or `key="admin"`), never the passkey or hash.
+- **Backward Compatibility**: Existing single `passkey_user` configurations automatically map to an inference-scoped key.
+
+### 3. Policy Alignment & Stricter-Setting-Wins Resolution
 To protect both the public proxy and private GPU owners without split-brain security policies:
 - **Default (Not Enforced as RO by Default)**: By default, `read_only = false` in `proxy.toml`.
 - **Policy Alignment**: Both proxy and server are permitted to set policy as long as they are aligned (e.g., both set `read_only = true` or both set `read_only = false`).

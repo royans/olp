@@ -39,7 +39,48 @@ passkey_user = "change-me-to-a-secure-user-passkey"
 # - Both proxy and server can configure policy as long as they are aligned.
 # - Only an attempt by a server to loosen a proxy's stricter policy (proxy RO=true, server RO=false)
 #   will abort tunnel registration with CRITICAL CONFIG CONFLICT.
-# read_only = true
+# Defaults to false for now, can be enabled when read-only mode is required.
+# read_only = false
+
+# Allowed models list (empty = automatically use the loaded model)
+# If non-empty, requests for models in this list pass through unchanged. Requests for any other
+# model are rewritten to `default_model` (or loaded model), protecting VRAM from unexpected evictions.
+# Discovery endpoints (/api/tags, /api/ps, /v1/models) are also filtered to show only these models.
+# allowed_models = ["llama3:8b", "mistral:7b"]
+
+# Default fallback model when an unapproved model is requested (empty = use loaded model)
+# default_model = "llama3:8b"
+
+# Maximum context length to forward or report in /api/show (default: 32768)
+# Excess `options.num_ctx` values are silently clamped.
+# max_num_ctx = 32768
+
+# Maximum tokens to predict (default: 4096)
+# `options.num_predict` and /v1 `max_tokens` are clamped to this cap (and -1 is replaced by this cap).
+# max_num_predict = 4096
+
+# Keep-alive range limits:
+# Clamps client keep_alive to prevent unloading (keep_alive: 0 clamped to keep_alive_min)
+# or pinning models in VRAM indefinitely (keep_alive: -1 clamped to keep_alive_max).
+# Hardware options (num_gpu, main_gpu, num_thread, use_mmap, use_mlock, low_vram, numa) are stripped.
+# keep_alive_min = "1m"
+# keep_alive_max = "30m"
+
+# Scoped Client Keys:
+# Each server can have multiple client keys with distinct permissions:
+# - "inference" (default): safe endpoint allowlist + request body normalization (clamps keep_alive,
+#   caps num_ctx/num_predict, strips hardware options, rewrites unapproved models).
+# - "manage": inference capabilities plus remote model management (pull, delete, push, create, copy).
+# User-supplied keys require a minimum length of 16 characters (or 24+ alphanumeric for generated keys).
+# Access logs record the key label (e.g. "laptop"), never the raw passkey or hash.
+#
+# [server.keys.laptop]
+# passkey = "laptop_inference_key_secure_123"
+# scope   = "inference"
+#
+# [server.keys.admin]
+# passkey = "admin_remote_management_key_456"
+# scope   = "manage"
 
 [reconnect]
 # Strategy: "fibonacci" (Fibonacci sequence: 1, 1, 2, 3, 5, 8... up to max_delay_sec with ±10% jitter)
