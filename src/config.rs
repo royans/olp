@@ -314,7 +314,7 @@ fn default_max_requests_per_min() -> u32 {
 }
 
 fn default_connection_timeout_sec() -> u64 {
-    120
+    1800 // 30 minutes for long LLM generation and streaming completions
 }
 
 impl Default for ProxySecuritySection {
