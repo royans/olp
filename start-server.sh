@@ -152,6 +152,45 @@ check_missing_auto_git_pull_notice() {
     fi
 }
 
+# Checks if local git repository is behind upstream tracking branch
+has_git_updates() {
+    if [ ! -d ".git" ] || ! command -v git >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! git remote get-url origin >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local fetch_ok=0
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout 10 git fetch -q origin 2>/dev/null; then
+            fetch_ok=1
+        fi
+    else
+        if git fetch -q origin 2>/dev/null; then
+            fetch_ok=1
+        fi
+    fi
+
+    [ "$fetch_ok" -eq 1 ] || return 1
+
+    local LOCAL UPSTREAM
+    LOCAL=$(git rev-parse HEAD 2>/dev/null || true)
+    UPSTREAM=$(git rev-parse '@{u}' 2>/dev/null || git rev-parse "origin/$(git branch --show-current 2>/dev/null || echo main)" 2>/dev/null || git rev-parse 'origin/main' 2>/dev/null || true)
+
+    if [ -z "$LOCAL" ] || [ -z "$UPSTREAM" ]; then
+        return 1
+    fi
+
+    local BEHIND_COUNT
+    BEHIND_COUNT=$(git rev-list --count "HEAD..$UPSTREAM" 2>/dev/null || echo "0")
+
+    if [ "$LOCAL" != "$UPSTREAM" ] && [ "$BEHIND_COUNT" -gt 0 ]; then
+        return 0
+    fi
+    return 1
+}
+
 # Checks if local git repository is behind upstream and warns with a 15-second delayed start
 check_git_updates_and_warn() {
     if [ ! -d ".git" ] || ! command -v git >/dev/null 2>&1; then
@@ -332,7 +371,7 @@ acquire_lock() {
 # Cron management. Managed entries carry a marker comment so they can be found,
 # left alone (keeping their randomized times) or upgraded in place.
 #   @reboot              start on boot
-#   every 15 min         `ensure`: start only if not running (no git pull)
+#   every 15 min         `ensure`: start if not running; restart if updates available & auto_git_pull=true
 #   once a day           `restart`: full restart, git pull if auto_git_pull=true
 # Minutes/hour are randomized per host at install time to spread load.
 # ------------------------------------------------------------------------------
@@ -426,8 +465,8 @@ manage_cronjob() {
         echo "================================================================================"
         echo "  No crontab jobs were found for olp-server. Recommended schedule:"
         echo "    - start on reboot"
-        echo "    - every 15 minutes: start it if it is not running"
-        echo "    - once a day (random time 01:00-05:59): full restart, incl. git pull"
+        echo "    - every 15 minutes: start if down; auto-update & restart if new version available (when auto_git_pull=true)"
+        echo "    - once a day (random time 01:00-05:59): daily maintenance restart"
         echo "      (disable the pull with 'auto_git_pull = false' under [maintenance] in"
         echo "       $CONFIG_FILE)"
         echo ""
@@ -473,12 +512,19 @@ elif [ "$ACTION" = "uninstall-cron" ]; then
 fi
 
 if [ "$ACTION" = "ensure" ]; then
-    if is_running >/dev/null; then
+    if git_pull_enabled && has_git_updates; then
+        echo "[olp-server] $(date '+%Y-%m-%d %H:%M:%S') Watchdog: new update available and auto_git_pull is enabled. Updating and restarting..."
+        DAEMON_MODE=1
+        ACTION="restart"
+    elif is_running >/dev/null; then
         exit 0
+    else
+        echo "[olp-server] $(date '+%Y-%m-%d %H:%M:%S') Watchdog: process not running; starting it..."
+        DAEMON_MODE=1
+        if ! git_pull_enabled; then
+            OLP_SKIP_GIT_PULL=1
+        fi
     fi
-    echo "[olp-server] $(date '+%Y-%m-%d %H:%M:%S') Watchdog: process not running; starting it..."
-    DAEMON_MODE=1
-    OLP_SKIP_GIT_PULL=1
 fi
 
 if [ "$ACTION" = "stop" ]; then
@@ -498,8 +544,15 @@ elif [ "$ACTION" = "update" ]; then
         echo "[olp-server] Compiling release binary..."
         cargo build --release --bin olp-server
     fi
-    echo "[olp-server] Update complete."
-    exit 0
+    if pid=$(is_running); then
+        echo "[olp-server] Restarting running process (PID: $pid) with updated binary..."
+        stop_process
+        DAEMON_MODE=1
+        CLEAN_ARGS+=("--daemon")
+    else
+        echo "[olp-server] Update complete."
+        exit 0
+    fi
 fi
 
 # Informational query commands do not terminate a running daemon
@@ -524,8 +577,13 @@ if [ "$NEED_RECOMPILE" -eq 1 ] && [ "${OLP_SKIP_GIT_PULL:-0}" != "1" ] && [ "${O
     # The pull may have changed this script; restart it so the new version runs.
     echo "[olp-server] Re-executing updated start-server.sh..."
     exec 9>&-
+    reexec_args=()
+    if [ "$DAEMON_MODE" -eq 1 ]; then
+        reexec_args+=("--daemon")
+    fi
+    reexec_args+=(${CLEAN_ARGS[@]+"${CLEAN_ARGS[@]}"})
     exec env OLP_REEXECED=1 OLP_SKIP_GIT_PULL=1 OLP_FORCE_RECOMPILE=1 \
-        "$SCRIPT_DIR/start-server.sh" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+        "$SCRIPT_DIR/start-server.sh" ${reexec_args[@]+"${reexec_args[@]}"}
 fi
 
 # ------------------------------------------------------------------------------

@@ -469,7 +469,7 @@ Access logs strictly omit sensitive data:
 # Start on boot
 @reboot cd "/path/to/olp" && ./start-proxy.sh --daemon >> "~/.olp/proxy.log" 2>&1 # olp-proxy-managed:/path/to/olp
 
-# Watchdog every 15 minutes: start it only if it is not running (no git pull)
+# Watchdog every 15 minutes: start if down; auto-update & restart if new code available (when auto_git_pull = true)
 7,22,37,52 * * * * cd "/path/to/olp" && ./start-proxy.sh ensure >> "~/.olp/proxy.log" 2>&1 # olp-proxy-managed:/path/to/olp
 
 # Daily full restart (git pull + rebuild if auto_git_pull = true)
@@ -478,7 +478,7 @@ Access logs strictly omit sensitive data:
 
 The same set is installed for `start-server.sh`. The watchdog minute offset and the daily restart time (between 01:00 and 05:59 local time) are randomized per host at install time, so a fleet doesn't restart or pull all at once. The chosen times are kept on later runs. A lock file (`~/.olp/olp-<proxy|server>.lock`, requires `flock`) stops the watchdog from starting a second copy while a restart is pulling or compiling.
 
-Automated git updates are disabled by default (`auto_git_pull = false`). When false or omitted, the daily restart does not pull code. To enable automated updates, set `auto_git_pull = true` under `[maintenance]` in `~/.olp/proxy.toml` / `~/.olp/server.toml`. Running `./start-proxy.sh update` explicitly always pulls.
+Automated git updates are disabled by default (`auto_git_pull = false`). When false or omitted, the watchdog and daily restart do not pull code. To enable automated updates, set `auto_git_pull = true` under `[maintenance]` in `~/.olp/proxy.toml` / `~/.olp/server.toml`. When enabled, the 15-minute watchdog checks for new upstream commits and automatically updates and restarts the server with the new version. Running `./start-proxy.sh update` explicitly always pulls and restarts.
 
 Logs are written automatically to `~/.olp/proxy.log` and `~/.olp/server.log`.
 
