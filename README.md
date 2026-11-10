@@ -419,7 +419,7 @@ When read-only mode or an `inference` scope key is active, OLP enforces strict h
 Each server can define multiple client keys with granular scopes:
 - **`inference` scope (default)**: Safe inference allowlist and body normalization active. Mutating operations are forbidden.
 - **`manage` scope**: Allows administrative operations (`pull`, `delete`, `push`, `create`, `copy`) when allowed by proxy policy.
-- **Security & Logging**: User-supplied passkeys require a minimum length of 16 characters. Generated passkeys are 24+ random alphanumeric characters. Proxy access logs record the key label (e.g. `key="laptop"` or `key="admin"`), never the passkey or hash.
+- **Security & Logging**: User-supplied passkeys require a minimum length of 12 characters. Generated passkeys are 24+ random alphanumeric characters. Proxy access logs record the key label (e.g. `key="laptop"` or `key="admin"`), never the passkey or hash.
 - **Backward Compatibility**: Existing single `passkey_user` configurations automatically map to an inference-scoped key.
 
 ### 3. Policy Alignment & Stricter-Setting-Wins Resolution

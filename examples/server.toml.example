@@ -71,7 +71,7 @@ passkey_user = "change-me-to-a-secure-user-passkey"
 # - "inference" (default): safe endpoint allowlist + request body normalization (clamps keep_alive,
 #   caps num_ctx/num_predict, strips hardware options, rewrites unapproved models).
 # - "manage": inference capabilities plus remote model management (pull, delete, push, create, copy).
-# User-supplied keys require a minimum length of 16 characters (or 24+ alphanumeric for generated keys).
+# User-supplied keys require a minimum length of 12 characters (or 24+ alphanumeric for generated keys).
 # Access logs record the key label (e.g. "laptop"), never the raw passkey or hash.
 #
 # [server.keys.laptop]

@@ -753,11 +753,11 @@ pub fn generate_random_passkey() -> String {
         .collect()
 }
 
-/// Enforces a minimum length of 16 characters for user-supplied keys.
+/// Enforces a minimum length of 12 characters for user-supplied keys.
 pub fn validate_passkey_length(passkey: &str, field_name: &str) -> Result<()> {
-    if !passkey.is_empty() && passkey.len() < 16 {
+    if !passkey.is_empty() && passkey.len() < 12 {
         return Err(anyhow!(
-            "Passkey for '{}' is too short ({} chars). User-supplied keys must be at least 16 characters long.",
+            "Passkey for '{}' is too short ({} chars). User-supplied keys must be at least 12 characters long.",
             field_name,
             passkey.len()
         ));
@@ -1379,5 +1379,15 @@ mod tests {
             "{}",
             s
         );
+    }
+
+    #[test]
+    fn test_validate_passkey_length() {
+        assert!(validate_passkey_length("", "passkey_user").is_ok());
+        assert!(validate_passkey_length("pk_225e90cc875c", "passkey_user").is_ok()); // 15 chars
+        assert!(validate_passkey_length("123456789012", "passkey_user").is_ok()); // 12 chars
+        assert!(validate_passkey_length("short_key", "passkey_user").is_err()); // 9 chars
+        assert!(validate_passkey_length("12345678901", "passkey_user").is_err());
+        // 11 chars
     }
 }
