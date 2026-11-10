@@ -606,7 +606,11 @@ async fn forward_to_local_ollama(
                         obj.remove(*hw);
                     }
 
-                    if let Some(options) = obj.get_mut("options").and_then(|v| v.as_object_mut()) {
+                    let options = obj
+                        .entry("options")
+                        .or_insert_with(|| serde_json::json!({}))
+                        .as_object_mut();
+                    if let Some(options) = options {
                         for hw in HARDWARE_OPTS {
                             options.remove(*hw);
                         }
@@ -616,6 +620,8 @@ async fn forward_to_local_ollama(
                                     *ctx = serde_json::json!(max_ctx);
                                 }
                             }
+                        } else {
+                            options.insert("num_ctx".to_string(), serde_json::json!(max_ctx));
                         }
                         if let Some(predict) = options.get_mut("num_predict") {
                             if let Some(p) = predict.as_i64() {
