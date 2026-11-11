@@ -123,8 +123,10 @@ Brand new instances can be completely scripted via CLI without interactive promp
   --olp-api-key "my-user-api-key" \
   --passkey-user "my-client-passkey" \
   --remote-port 10000 \
+  --max-num-ctx 65536 \
   --non-interactive
 ```
+`--max-num-ctx` is optional (default 32768). Passing it later on an existing install updates `server.toml`. No proxy-side change is needed: olp-server enforces the cap and reports it via `/api/show`.
 
 ---
 
@@ -269,7 +271,7 @@ passkey_user = "your-client-passkey-for-this-server"
 # Allowed models list (empty = automatically use the loaded model)
 # allowed_models = ["llama3:8b", "mistral:7b"]
 # default_model = "llama3:8b"
-# max_num_ctx = 32768
+# max_num_ctx = 32768                   # or set at setup: ./start-server.sh --max-num-ctx 65536
 # max_num_predict = 4096
 # keep_alive_min = "1m"
 # keep_alive_max = "30m"

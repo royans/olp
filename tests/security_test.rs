@@ -913,6 +913,7 @@ fn test_server_cli_overrides_and_scripting() {
         passkey_user: Some("scripted-passkey-user".to_string()),
         tls_verify: Some(true),
         auto_git_pull: Some(false),
+        max_num_ctx: Some(65536),
         ..Default::default()
     };
 
@@ -925,12 +926,14 @@ fn test_server_cli_overrides_and_scripting() {
     assert_eq!(cfg.server.passkey_user, "scripted-passkey-user");
     assert_eq!(cfg.server.tls_verify, Some(true));
     assert!(!cfg.maintenance.auto_git_pull);
+    assert_eq!(cfg.server.max_num_ctx, 65536);
 
     // Verify it saved to disk
     assert!(cfg_path.is_file());
     let loaded = olp::config::ServerConfig::load_from_path(&cfg_path).unwrap();
     assert_eq!(loaded.server.proxy_addr, "proxy.domain.com:4443");
     assert_eq!(loaded.server.remote_port, Some(10500));
+    assert_eq!(loaded.server.max_num_ctx, 65536);
 
     // Subsequent call with CLI override updates existing config
     let update_overrides = olp::config::ServerCliOverrides {
@@ -941,6 +944,27 @@ fn test_server_cli_overrides_and_scripting() {
         olp::config::ensure_server_initialized(&cfg_path, true, update_overrides).unwrap();
     assert_eq!(updated.server.remote_port, Some(10600));
     assert_eq!(updated.server.proxy_addr, "proxy.domain.com:4443");
+    // Unspecified max_num_ctx keeps the previously saved value
+    assert_eq!(updated.server.max_num_ctx, 65536);
+
+    // --max-num-ctx on an existing config updates it
+    let ctx_overrides = olp::config::ServerCliOverrides {
+        max_num_ctx: Some(8192),
+        ..Default::default()
+    };
+    let updated = olp::config::ensure_server_initialized(&cfg_path, true, ctx_overrides).unwrap();
+    assert_eq!(updated.server.max_num_ctx, 8192);
+    let loaded = olp::config::ServerConfig::load_from_path(&cfg_path).unwrap();
+    assert_eq!(loaded.server.max_num_ctx, 8192);
+
+    // Zero is rejected and the saved config is left untouched
+    let zero_overrides = olp::config::ServerCliOverrides {
+        max_num_ctx: Some(0),
+        ..Default::default()
+    };
+    assert!(olp::config::ensure_server_initialized(&cfg_path, true, zero_overrides).is_err());
+    let loaded = olp::config::ServerConfig::load_from_path(&cfg_path).unwrap();
+    assert_eq!(loaded.server.max_num_ctx, 8192);
 }
 
 // ============================================================================

@@ -754,6 +754,14 @@ pub fn generate_random_passkey() -> String {
 }
 
 /// Enforces a minimum length of 12 characters for user-supplied keys.
+/// `max_num_ctx` must be a positive token count.
+pub fn validate_max_num_ctx(n: usize) -> Result<()> {
+    if n == 0 {
+        return Err(anyhow!("max_num_ctx must be greater than 0"));
+    }
+    Ok(())
+}
+
 pub fn validate_passkey_length(passkey: &str, field_name: &str) -> Result<()> {
     if !passkey.is_empty() && passkey.len() < 12 {
         return Err(anyhow!(
@@ -849,6 +857,7 @@ pub struct ServerCliOverrides {
     pub insecure_skip_tls_verify: bool,
     pub auto_git_pull: Option<bool>,
     pub read_only: Option<bool>,
+    pub max_num_ctx: Option<usize>,
 }
 
 /// Ensures `~/.olp/proxy.toml` and `~/.olp/config/` exist.
@@ -1146,6 +1155,11 @@ pub fn ensure_server_initialized(
             cfg.server.read_only = Some(val);
             modified = true;
         }
+        if let Some(val) = overrides.max_num_ctx {
+            validate_max_num_ctx(val)?;
+            cfg.server.max_num_ctx = val;
+            modified = true;
+        }
         if overrides.insecure_skip_tls_verify {
             cfg.server.tls_verify = Some(false);
             modified = true;
@@ -1164,6 +1178,9 @@ pub fn ensure_server_initialized(
     let mut cfg = ServerConfig::default_config();
     if let Some(ref p) = overrides.passkey_user {
         validate_passkey_length(p, "passkey_user")?;
+    }
+    if let Some(n) = overrides.max_num_ctx {
+        validate_max_num_ctx(n)?;
     }
     cfg.server.olp_server_id = overrides
         .olp_server_id
@@ -1258,6 +1275,9 @@ pub fn ensure_server_initialized(
     }
     if let Some(val) = overrides.read_only {
         cfg.server.read_only = Some(val);
+    }
+    if let Some(val) = overrides.max_num_ctx {
+        cfg.server.max_num_ctx = val;
     }
     if overrides.insecure_skip_tls_verify {
         cfg.server.tls_verify = Some(false);
