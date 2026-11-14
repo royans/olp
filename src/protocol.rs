@@ -131,6 +131,7 @@ impl ServerAuthRegister {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_all(
         olp_api_key: &str,
         olp_server_id: &str,

@@ -514,7 +514,7 @@ async fn forward_to_local_ollama(
                     .map(|n| n as usize)
             });
             match requested_ctx {
-                Some(n) if n >= 512 && n <= 1_048_576 => {
+                Some(n) if (512..=1_048_576).contains(&n) => {
                     let mut cfg_guard = config_lock.write().await;
                     cfg_guard.server.max_num_ctx = n;
                     let cfg_path = match std::env::var("OLP_CONFIG") {
