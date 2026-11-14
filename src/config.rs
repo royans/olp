@@ -161,6 +161,8 @@ pub struct UserServerConfig {
     pub created_at: Option<String>,
     #[serde(default)]
     pub read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_ctx: Option<usize>,
     #[serde(default)]
     pub keys: HashMap<String, ScopedKeyConfig>,
 }
@@ -176,6 +178,7 @@ impl Default for UserServerConfig {
             allowed_server_cidrs: default_allowed_cidrs(),
             created_at: None,
             read_only: None,
+            max_num_ctx: None,
             keys: HashMap::new(),
         }
     }
@@ -1354,6 +1357,7 @@ mod tests {
                 allowed_server_cidrs: vec!["0.0.0.0/0".to_string()],
                 created_at: Some("2026-11-06T12:00:00Z".to_string()),
                 read_only: Some(true),
+                max_num_ctx: Some(16384),
                 keys: HashMap::new(),
             },
         );

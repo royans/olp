@@ -203,7 +203,7 @@ pub async fn run_single_tunnel_session(
             },
         );
     }
-    let register = ServerAuthRegister::with_keys(
+    let register = ServerAuthRegister::with_all(
         &config.server.olp_api_key,
         &config.server.olp_server_id,
         config.server.remote_port,
@@ -211,6 +211,7 @@ pub async fn run_single_tunnel_session(
         &challenge.proxy_nonce,
         config.server.read_only,
         reg_keys,
+        Some(config.server.max_num_ctx),
     );
 
     tokio::time::timeout(
@@ -264,7 +265,7 @@ pub async fn run_single_tunnel_session(
     let hb_timeout = Duration::from_secs(config.reconnect.heartbeat_timeout_sec.max(1));
     let ollama_addr = config.server.ollama_addr.clone();
     let model_tracker = Arc::new(ActiveModelTracker::new(ollama_addr.clone()));
-    let cfg_arc = Arc::new(config.clone());
+    let cfg_arc = Arc::new(tokio::sync::RwLock::new(config.clone()));
 
     let mut ticker = tokio::time::interval(hb_interval);
     ticker.tick().await;
@@ -445,13 +446,13 @@ async fn query_ollama_json(ollama_addr: &str, path: &str) -> Result<serde_json::
 
 async fn serve_proxied_ollama_stream(
     yamux_stream: CompatYamuxStream,
-    config: Arc<ServerConfig>,
+    config: Arc<tokio::sync::RwLock<ServerConfig>>,
     model_tracker: Arc<ActiveModelTracker>,
 ) {
     let service = service_fn(move |req: Request<Incoming>| {
         let cfg = config.clone();
         let tracker = model_tracker.clone();
-        async move { forward_to_local_ollama(req, &cfg, &tracker).await }
+        async move { forward_to_local_ollama(req, cfg, tracker).await }
     });
 
     let _ = server_http1::Builder::new()
@@ -463,8 +464,8 @@ async fn serve_proxied_ollama_stream(
 
 async fn forward_to_local_ollama(
     req: Request<Incoming>,
-    config: &ServerConfig,
-    model_tracker: &ActiveModelTracker,
+    config_lock: Arc<tokio::sync::RwLock<ServerConfig>>,
+    model_tracker: Arc<ActiveModelTracker>,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
     if req.method() == Method::CONNECT {
         let mut resp = Response::new(full_body(r#"{"error":"CONNECT method is forbidden"}"#));
@@ -480,6 +481,93 @@ async fn forward_to_local_ollama(
         .to_string();
 
     let clean_path = path_and_query.split('?').next().unwrap_or(&path_and_query);
+
+    // Intercept internal olp context management endpoints (/api/olp/context or /api/olp/ctx)
+    if clean_path == "/api/olp/context" || clean_path == "/api/olp/ctx" {
+        if req.method() == Method::GET || req.method() == Method::HEAD {
+            let cfg_guard = config_lock.read().await;
+            let body = serde_json::json!({
+                "status": "ok",
+                "server_id": cfg_guard.server.olp_server_id,
+                "num_ctx": cfg_guard.server.max_num_ctx,
+                "max_num_ctx": cfg_guard.server.max_num_ctx,
+                "read_only": cfg_guard.server.read_only.unwrap_or(false),
+                "source": "olp-server"
+            });
+            let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("application/json"),
+            );
+            return Ok(resp);
+        } else if req.method() == Method::POST || req.method() == Method::PUT {
+            let body_bytes = match req.into_body().collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(e) => return Err(e),
+            };
+            let parse_res: Result<serde_json::Value, _> = serde_json::from_slice(&body_bytes);
+            let requested_ctx = parse_res.ok().and_then(|v| {
+                v.get("num_ctx")
+                    .or_else(|| v.get("max_num_ctx"))
+                    .and_then(|c| c.as_u64())
+                    .map(|n| n as usize)
+            });
+            match requested_ctx {
+                Some(n) if n >= 512 && n <= 1_048_576 => {
+                    let mut cfg_guard = config_lock.write().await;
+                    cfg_guard.server.max_num_ctx = n;
+                    let cfg_path = match std::env::var("OLP_CONFIG") {
+                        Ok(p) => std::path::PathBuf::from(p),
+                        Err(_) => match crate::config::olp_home_dir() {
+                            Ok(h) => h.join("server.toml"),
+                            Err(_) => std::path::PathBuf::from("server.toml"),
+                        },
+                    };
+                    let persisted = cfg_guard.save_to_path(&cfg_path).is_ok();
+                    info!(
+                        "[CONTEXT] Updated olp-server context window to {} tokens (persisted: {})",
+                        n, persisted
+                    );
+                    let body = serde_json::json!({
+                        "success": true,
+                        "server_id": cfg_guard.server.olp_server_id,
+                        "num_ctx": n,
+                        "max_num_ctx": n,
+                        "server_updated": true,
+                        "persisted": persisted,
+                        "message": format!("Context window updated to {} tokens on olp-server", n)
+                    });
+                    let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
+                    *resp.status_mut() = StatusCode::OK;
+                    resp.headers_mut().insert(
+                        hyper::header::CONTENT_TYPE,
+                        hyper::header::HeaderValue::from_static("application/json"),
+                    );
+                    return Ok(resp);
+                }
+                _ => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "error": "Invalid context window size: must be a positive integer between 512 and 1048576 tokens"
+                    });
+                    let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
+                    *resp.status_mut() = StatusCode::BAD_REQUEST;
+                    resp.headers_mut().insert(
+                        hyper::header::CONTENT_TYPE,
+                        hyper::header::HeaderValue::from_static("application/json"),
+                    );
+                    return Ok(resp);
+                }
+            }
+        }
+    }
+
+    let config_snapshot = {
+        let guard = config_lock.read().await;
+        guard.clone()
+    };
+    let config = &config_snapshot;
 
     // Stricter-wins determination of inference scope:
     // 1. If server config specifies read_only = true, authoritative defense-in-depth enforces inference scope.

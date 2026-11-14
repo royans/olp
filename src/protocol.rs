@@ -56,6 +56,8 @@ pub struct ServerAuthRegister {
     pub policy_override: Option<bool>,
     #[serde(default)]
     pub keys: std::collections::HashMap<String, ScopedKeyRegistration>,
+    #[serde(default)]
+    pub max_num_ctx: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +105,7 @@ impl ServerAuthRegister {
             auth_token,
             policy_override,
             keys: std::collections::HashMap::new(),
+            max_num_ctx: None,
         }
     }
 
@@ -124,6 +127,30 @@ impl ServerAuthRegister {
             auth_token,
             policy_override,
             keys,
+            max_num_ctx: None,
+        }
+    }
+
+    pub fn with_all(
+        olp_api_key: &str,
+        olp_server_id: &str,
+        recommended_port: Option<u16>,
+        passkey_user: &str,
+        proxy_nonce: &[u8; 32],
+        policy_override: Option<bool>,
+        keys: std::collections::HashMap<String, ScopedKeyRegistration>,
+        max_num_ctx: Option<usize>,
+    ) -> Self {
+        let auth_token = compute_server_auth_token(proxy_nonce, olp_server_id, olp_api_key);
+        Self {
+            olp_api_key: olp_api_key.to_string(),
+            olp_server_id: olp_server_id.to_string(),
+            recommended_port,
+            passkey_user: passkey_user.to_string(),
+            auth_token,
+            policy_override,
+            keys,
+            max_num_ctx,
         }
     }
 }
@@ -148,7 +175,8 @@ pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
     match (method, normalized_path) {
         (
             &hyper::Method::GET | &hyper::Method::HEAD,
-            "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps" | "/v1/models",
+            "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps" | "/v1/models"
+            | "/api/olp/context" | "/api/olp/ctx",
         ) => false,
         (&hyper::Method::GET | &hyper::Method::HEAD, p) if p.starts_with("/v1/models/") => false,
         (
@@ -160,8 +188,11 @@ pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
             | "/api/show"
             | "/v1/chat/completions"
             | "/v1/completions"
-            | "/v1/embeddings",
+            | "/v1/embeddings"
+            | "/api/olp/context"
+            | "/api/olp/ctx",
         ) => false,
+        (&hyper::Method::PUT, "/api/olp/context" | "/api/olp/ctx") => false,
         // All mutating operations (e.g. POST /api/pull, DELETE /api/delete, POST /api/push,
         // POST /api/create, POST /api/copy, /api/blobs/*, etc.) or unknown verbs are sensitive.
         _ => true,

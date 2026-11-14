@@ -1693,6 +1693,7 @@ async fn test_dynamic_policy_reload_on_disk_update() {
         created_at: None,
         keys: Default::default(),
         read_only: Some(false),
+        max_num_ctx: None,
     };
     profile
         .servers

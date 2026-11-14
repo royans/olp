@@ -272,6 +272,43 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
     assert_eq!(status_after_reconnect, StatusCode::OK);
     assert!(body_after.contains("llama3:latest"));
 
+    // 6b. Test /api/olp/context GET and POST
+    let (ctx_status, _, ctx_body) = send_http_request(
+        public_addr,
+        Method::GET,
+        "/api/olp/context",
+        Some(&bearer),
+        b"",
+    )
+    .await;
+    assert_eq!(ctx_status, StatusCode::OK);
+    assert!(ctx_body.contains("32768"));
+
+    let (post_ctx_status, _, post_ctx_body) = send_http_request(
+        public_addr,
+        Method::POST,
+        "/api/olp/context",
+        Some(&bearer),
+        br#"{"num_ctx":16384}"#,
+    )
+    .await;
+    assert_eq!(post_ctx_status, StatusCode::OK);
+    assert!(post_ctx_body.contains("\"success\":true"));
+    assert!(post_ctx_body.contains("\"server_updated\":true"));
+    assert!(post_ctx_body.contains("\"proxy_updated\":true"));
+    assert!(post_ctx_body.contains("\"num_ctx\":16384"));
+
+    let (ctx_status2, _, ctx_body2) = send_http_request(
+        public_addr,
+        Method::GET,
+        "/api/olp/context",
+        Some(&bearer),
+        b"",
+    )
+    .await;
+    assert_eq!(ctx_status2, StatusCode::OK);
+    assert!(ctx_body2.contains("16384"));
+
     // 7. Test CONNECT method SSRF rejection (405 Method Not Allowed)
     let (connect_status, _, _) = send_http_request(
         public_addr,

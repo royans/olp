@@ -152,6 +152,7 @@ pub struct PortWorker {
     pub assigned_api_key: RwLock<Option<String>>,
     pub server_policy_override: RwLock<Option<bool>>,
     pub read_only: AtomicBool,
+    pub max_num_ctx: std::sync::atomic::AtomicUsize,
     pub concurrency_semaphore: Arc<tokio::sync::Semaphore>,
     pub request_rate_limiter: Arc<crate::keys::RequestRateLimiter>,
     pub resolved_keys: RwLock<Vec<crate::config::ResolvedKey>>,
@@ -716,6 +717,7 @@ impl ProxyState {
                     .and_then(|s| s.created_at.clone())
                     .or_else(|| Some(format_apache_timestamp(std::time::SystemTime::now()))),
                 read_only: existing.as_ref().and_then(|s| s.read_only),
+                max_num_ctx: existing.as_ref().and_then(|s| s.max_num_ctx),
                 keys: keys_map,
             },
         );
@@ -1072,7 +1074,7 @@ async fn handle_incoming_tunnel(
 
     // Step 7: Enforce per-server CIDR ACL
     let profile = state.load_user_profile(&register.olp_api_key)?;
-    let server_cfg = profile
+    let mut server_cfg = profile
         .servers
         .get(&register.olp_server_id)
         .cloned()
@@ -1124,6 +1126,25 @@ async fn handle_incoming_tunnel(
         *worker.assigned_server_id.write().unwrap() = Some(register.olp_server_id.clone());
         *worker.assigned_api_key.write().unwrap() = Some(register.olp_api_key.clone());
         *worker.server_policy_override.write().unwrap() = register.policy_override;
+        if let Some(ctx) = register.max_num_ctx {
+            worker.max_num_ctx.store(ctx, Ordering::Relaxed);
+        } else if let Some(ctx) = server_cfg.max_num_ctx {
+            worker.max_num_ctx.store(ctx, Ordering::Relaxed);
+        }
+    }
+
+    if let Some(ctx) = register.max_num_ctx {
+        if server_cfg.max_num_ctx != Some(ctx) {
+            server_cfg.max_num_ctx = Some(ctx);
+            let mut p = profile.clone();
+            p.servers
+                .insert(register.olp_server_id.clone(), server_cfg.clone());
+            let _ = state.save_user_profile(&p);
+            info!(
+                "[CONTEXT] Synchronized server '{}' context window setting to {} tokens from olp-server",
+                register.olp_server_id, ctx
+            );
+        }
     }
 
     // Step 8b: Policy enforcement and conflict checking
@@ -1307,6 +1328,7 @@ fn get_or_create_port_worker(state: &Arc<ProxyState>, port: u16) -> Result<Arc<P
         assigned_api_key: RwLock::new(None),
         server_policy_override: RwLock::new(None),
         read_only: AtomicBool::new(state.config.security.read_only),
+        max_num_ctx: std::sync::atomic::AtomicUsize::new(32768),
         concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(max_active)),
         request_rate_limiter: Arc::new(crate::keys::RequestRateLimiter::new(
             state.config.security.max_requests_per_min,
@@ -1801,11 +1823,17 @@ async fn handle_public_http_request(
         guard.clone()
     };
 
+    let clean_path = uri.split('?').next().unwrap_or(&uri);
+    let is_context_endpoint = clean_path == "/api/olp/context" || clean_path == "/api/olp/ctx";
+
     let mux = match mux {
         Some(m) if !m.is_closed() => m,
         _ => {
-            let err_json =
-                r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#;
+            let err_json = if is_context_endpoint {
+                r#"{"error":"olp-server is currently offline. Context window can only be queried or modified when the server is connected."}"#
+            } else {
+                r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#
+            };
             log_event(
                 StatusCode::SERVICE_UNAVAILABLE,
                 err_json.len(),
@@ -1901,6 +1929,63 @@ async fn handle_public_http_request(
                 .entry(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .or_insert_with(|| hyper::header::HeaderValue::from_static("*"));
             let status = u_parts.status;
+
+            if is_context_endpoint && status == StatusCode::OK {
+                let collected_bytes = match u_body.collect().await {
+                    Ok(c) => c.to_bytes(),
+                    Err(_) => Bytes::new(),
+                };
+                let mut final_json: serde_json::Value = serde_json::from_slice(&collected_bytes)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+
+                if let Some(n) = final_json
+                    .get("num_ctx")
+                    .or_else(|| final_json.get("max_num_ctx"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
+                    worker.max_num_ctx.store(n, Ordering::Relaxed);
+                    let ids = {
+                        let s_id = worker.assigned_server_id.read().unwrap().clone();
+                        let a_key = worker.assigned_api_key.read().unwrap().clone();
+                        match (s_id, a_key) {
+                            (Some(s), Some(k)) => Some((s, k)),
+                            _ => None,
+                        }
+                    };
+                    if let Some((s_id, a_key)) = ids {
+                        if let Ok(mut profile) = state.load_user_profile(&a_key) {
+                            if let Some(srv) = profile.servers.get_mut(&s_id) {
+                                srv.max_num_ctx = Some(n);
+                                let _ = state.save_user_profile(&profile);
+                                info!(
+                                    "[CONTEXT] olp-proxy synchronized max_num_ctx = {} for server '{}'",
+                                    n, s_id
+                                );
+                            }
+                        }
+                    }
+                    if let Some(obj) = final_json.as_object_mut() {
+                        obj.insert("proxy_updated".to_string(), serde_json::json!(true));
+                        obj.insert("confirmed".to_string(), serde_json::json!(true));
+                    }
+                }
+                let resp_bytes =
+                    serde_json::to_vec(&final_json).unwrap_or_else(|_| collected_bytes.to_vec());
+                let resp_len = resp_bytes.len();
+                let _hold_permit = permit;
+                log_event(status, resp_len, req_size, &model, &active_key_label);
+                u_parts.headers.insert(
+                    hyper::header::CONTENT_TYPE,
+                    hyper::header::HeaderValue::from_static("application/json"),
+                );
+                u_parts.headers.insert(
+                    hyper::header::CONTENT_LENGTH,
+                    hyper::header::HeaderValue::from(resp_len),
+                );
+                return Ok(Response::from_parts(u_parts, full_body(resp_bytes)));
+            }
+
             let boxed_upstream = u_body.map_err(|e| e).boxed();
             let model_for_log = model.clone();
             let key_for_log = active_key_label.clone();
