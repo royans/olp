@@ -163,6 +163,14 @@ pub struct UserServerConfig {
     pub read_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_num_ctx: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_build_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_build_timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_git_hash: Option<String>,
     #[serde(default)]
     pub keys: HashMap<String, ScopedKeyConfig>,
 }
@@ -179,6 +187,10 @@ impl Default for UserServerConfig {
             created_at: None,
             read_only: None,
             max_num_ctx: None,
+            server_version: None,
+            server_build_date: None,
+            server_build_timestamp: None,
+            server_git_hash: None,
             keys: HashMap::new(),
         }
     }
@@ -1358,6 +1370,10 @@ mod tests {
                 created_at: Some("2026-11-06T12:00:00Z".to_string()),
                 read_only: Some(true),
                 max_num_ctx: Some(16384),
+                server_version: Some("0.1.0".to_string()),
+                server_build_date: Some("2026-11-14".to_string()),
+                server_build_timestamp: Some(1794633870),
+                server_git_hash: Some("4f1d8fd".to_string()),
                 keys: HashMap::new(),
             },
         );

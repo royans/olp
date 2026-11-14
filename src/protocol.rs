@@ -44,6 +44,14 @@ impl Default for ProxyHelloChallenge {
     }
 }
 
+pub const OLP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const OLP_BUILD_DATE: &str = env!("OLP_BUILD_DATE");
+pub const OLP_GIT_HASH: &str = env!("OLP_GIT_HASH");
+
+pub fn olp_build_timestamp() -> u64 {
+    env!("OLP_BUILD_TIMESTAMP").parse::<u64>().unwrap_or(0)
+}
+
 /// Step 2 of Handshake: Sent from `olp-server` to `olp-proxy` to register a tunnel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerAuthRegister {
@@ -58,6 +66,14 @@ pub struct ServerAuthRegister {
     pub keys: std::collections::HashMap<String, ScopedKeyRegistration>,
     #[serde(default)]
     pub max_num_ctx: Option<usize>,
+    #[serde(default)]
+    pub server_version: Option<String>,
+    #[serde(default)]
+    pub server_build_date: Option<String>,
+    #[serde(default)]
+    pub server_build_timestamp: Option<u64>,
+    #[serde(default)]
+    pub server_git_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +122,10 @@ impl ServerAuthRegister {
             policy_override,
             keys: std::collections::HashMap::new(),
             max_num_ctx: None,
+            server_version: None,
+            server_build_date: None,
+            server_build_timestamp: None,
+            server_git_hash: None,
         }
     }
 
@@ -128,6 +148,10 @@ impl ServerAuthRegister {
             policy_override,
             keys,
             max_num_ctx: None,
+            server_version: None,
+            server_build_date: None,
+            server_build_timestamp: None,
+            server_git_hash: None,
         }
     }
 
@@ -152,6 +176,10 @@ impl ServerAuthRegister {
             policy_override,
             keys,
             max_num_ctx,
+            server_version: Some(OLP_VERSION.to_string()),
+            server_build_date: Some(OLP_BUILD_DATE.to_string()),
+            server_build_timestamp: Some(olp_build_timestamp()),
+            server_git_hash: Some(OLP_GIT_HASH.to_string()),
         }
     }
 }

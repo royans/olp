@@ -718,6 +718,10 @@ impl ProxyState {
                     .or_else(|| Some(format_apache_timestamp(std::time::SystemTime::now()))),
                 read_only: existing.as_ref().and_then(|s| s.read_only),
                 max_num_ctx: existing.as_ref().and_then(|s| s.max_num_ctx),
+                server_version: existing.as_ref().and_then(|s| s.server_version.clone()),
+                server_build_date: existing.as_ref().and_then(|s| s.server_build_date.clone()),
+                server_build_timestamp: existing.as_ref().and_then(|s| s.server_build_timestamp),
+                server_git_hash: existing.as_ref().and_then(|s| s.server_git_hash.clone()),
                 keys: keys_map,
             },
         );
@@ -794,6 +798,19 @@ pub async fn start_proxy_server(
     let allowed_port_range = config.parse_allowed_port_range()?;
     let public_tls_acceptor = build_public_tls_acceptor(&config)?;
     let config_dir = olp_config_dir()?;
+
+    if let Some(olp_home) = config_dir.parent() {
+        let info_path = olp_home.join("proxy_info.json");
+        let info_json = serde_json::json!({
+            "version": crate::protocol::OLP_VERSION,
+            "build_date": crate::protocol::OLP_BUILD_DATE,
+            "build_timestamp": crate::protocol::olp_build_timestamp(),
+            "git_hash": crate::protocol::OLP_GIT_HASH,
+        });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&info_json) {
+            let _ = std::fs::write(&info_path, bytes);
+        }
+    }
 
     let server_ip_filter = Arc::new(
         IpFilter::new(&config.security.allowed_server_cidrs)
@@ -1133,18 +1150,33 @@ async fn handle_incoming_tunnel(
         }
     }
 
+    let mut profile_dirty = false;
     if let Some(ctx) = register.max_num_ctx {
         if server_cfg.max_num_ctx != Some(ctx) {
             server_cfg.max_num_ctx = Some(ctx);
-            let mut p = profile.clone();
-            p.servers
-                .insert(register.olp_server_id.clone(), server_cfg.clone());
-            let _ = state.save_user_profile(&p);
+            profile_dirty = true;
             info!(
                 "[CONTEXT] Synchronized server '{}' context window setting to {} tokens from olp-server",
                 register.olp_server_id, ctx
             );
         }
+    }
+    if server_cfg.server_version != register.server_version
+        || server_cfg.server_build_date != register.server_build_date
+        || server_cfg.server_build_timestamp != register.server_build_timestamp
+        || server_cfg.server_git_hash != register.server_git_hash
+    {
+        server_cfg.server_version = register.server_version.clone();
+        server_cfg.server_build_date = register.server_build_date.clone();
+        server_cfg.server_build_timestamp = register.server_build_timestamp;
+        server_cfg.server_git_hash = register.server_git_hash.clone();
+        profile_dirty = true;
+    }
+    if profile_dirty {
+        let mut p = profile.clone();
+        p.servers
+            .insert(register.olp_server_id.clone(), server_cfg.clone());
+        let _ = state.save_user_profile(&p);
     }
 
     // Step 8b: Policy enforcement and conflict checking
