@@ -371,7 +371,11 @@ pub fn sanitize_for_log(s: &str, max_len: usize) -> String {
 pub fn extract_model(body_bytes: &[u8], uri: &hyper::Uri) -> String {
     if !body_bytes.is_empty() {
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-            if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
+            if let Some(m) = val
+                .get("model")
+                .or_else(|| val.get("name"))
+                .and_then(|v| v.as_str())
+            {
                 if !m.is_empty() {
                     return m.to_string();
                 }
@@ -1499,6 +1503,13 @@ async fn handle_public_http_request(
         let method = method.clone();
         let uri = uri.clone();
         let version = version.clone();
+        let log_port = worker.port;
+        let log_server_id = worker
+            .assigned_server_id
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
         move |status: StatusCode,
               resp_bytes: usize,
               req_size: usize,
@@ -1506,7 +1517,7 @@ async fn handle_public_http_request(
               key_label: &str| {
             let duration_ms = start_time.elapsed().as_millis();
             let line = format!(
-                r#"{ip} - {auth_scheme} [{timestamp}] "{method} {uri} {version}" {status} {resp_bytes} {duration_ms}ms key="{key_label}" model="{model}" req_bytes={req_bytes}"#,
+                r#"{ip} - {auth_scheme} [{timestamp}] "{method} {uri} {version}" {status} {resp_bytes} {duration_ms}ms key="{key_label}" model="{model}" req_bytes={req_bytes} server="{server_id}" port={port}"#,
                 ip = client_ip,
                 auth_scheme = auth_scheme,
                 timestamp = timestamp_str,
@@ -1519,6 +1530,8 @@ async fn handle_public_http_request(
                 key_label = key_label,
                 model = model,
                 req_bytes = req_size,
+                server_id = log_server_id,
+                port = log_port,
             );
             access_logger.log(line);
         }
