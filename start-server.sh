@@ -35,7 +35,7 @@ for arg in "$@"; do
         --daemon|-d)
             DAEMON_MODE=1
             ;;
-        restart|ensure)
+        restart|ensure|update)
             ;;
         --non-interactive)
             NON_INTERACTIVE=1
@@ -548,7 +548,6 @@ elif [ "$ACTION" = "update" ]; then
         echo "[olp-server] Restarting running process (PID: $pid) with updated binary..."
         stop_process
         DAEMON_MODE=1
-        CLEAN_ARGS+=("--daemon")
     else
         echo "[olp-server] Update complete."
         exit 0
@@ -565,7 +564,7 @@ case "${1:-}" in
             echo "[olp-server] Existing process detected (PID: $pid). Terminating previous instance for clean restart..."
             stop_process
         fi
-        if [ "${1:-}" = "restart" ]; then
+        if [ "${1:-}" = "restart" ] || [ "${1:-}" = "update" ]; then
             shift || true
         fi
         ;;
