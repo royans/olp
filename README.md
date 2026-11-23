@@ -1,6 +1,6 @@
 # Ollama Proxy (`olp-proxy` & `olp-server`)
 
-[![Tests](https://img.shields.io/badge/tests-60%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-63%20passing-brightgreen.svg)]()
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
 [![Memory Footprint](https://img.shields.io/badge/memory-%3C5MB%20RAM-success.svg)]()
@@ -71,7 +71,8 @@ On first run, `olp-proxy` auto-generates your initial user API key and profile:
 ```
 
 > **Lifecycle & Cron Commands**:
-> - `./start-proxy.sh restart` — Gracefully restarts and pulls latest updates from git.
+> - `./start-proxy.sh update` — Pulls latest git commits, rebuilds release binary, and restarts the daemon.
+> - `./start-proxy.sh restart` — Gracefully restarts the running proxy.
 > - `./start-proxy.sh install-cron` — Installs automated 24h git auto-update + 15-min watchdog into crontab.
 > - `./start-proxy.sh uninstall-cron` — Removes managed cronjobs from crontab.
 > - `./start-proxy.sh stop` — Stops the proxy cleanly (`SIGTERM`).
@@ -109,7 +110,8 @@ TLS 1.3 tunnel established! Exposing local Ollama (127.0.0.1:11434) on remote po
 ```
 
 > **Lifecycle & Cron Commands**:
-> - `./start-server.sh restart` — Gracefully restarts and pulls latest updates from git.
+> - `./start-server.sh update` — Pulls latest git commits, rebuilds release binary, and restarts the daemon.
+> - `./start-server.sh restart` — Gracefully restarts the running server.
 > - `./start-server.sh install-cron` — Installs automated 24h git auto-update + 15-min watchdog into crontab.
 > - `./start-server.sh uninstall-cron` — Removes managed cronjobs from crontab.
 > - `./start-server.sh stop` — Stops the server cleanly (`SIGTERM`).
@@ -165,6 +167,15 @@ Brand new instances can be completely scripted via CLI without interactive promp
   - Independent Yamux substreams and ephemeral local TCP connections per request guarantee zero session bleed or data mixing between concurrent users.
   - Prompts pass through the gateway encrypted in transit and are never logged or stored on disk; for zero trust, you can run your own self-hosted `olp-proxy`.
   - Compatible with Ollama's isolated parallel slots (`OLLAMA_NUM_PARALLEL`).
+- **Hardware Telemetry & Dual GPU Support (NVIDIA & AMD)**:
+  - Real-time hardware telemetry for both **NVIDIA** (`nvidia-smi`) and **AMD** GPUs (automatic dual-strategy via `rocm-smi` and direct Linux kernel sysfs `/sys/class/drm/card*/device/` discovery without requiring ROCm tools).
+  - Reports GPU utilization, VRAM usage/totals, temperature, and power consumption.
+  - Reports host CPU load, CPU temperature, host RAM usage, uptime, and active user sessions.
+  - Reports actively loaded models in VRAM via Ollama's `/api/ps`.
+- **Remote On-Demand Maintenance & Restarts**:
+  - Securely trigger remote code updates (`git pull` + `cargo build --release` + daemon restart) or immediate process restarts via `/api/olp/maintenance` or the web dashboard.
+- **Strict Traffic Isolation for LLM Inference**:
+  - Internal telemetry queries (`/api/olp/*`) are bypassed by the access logger and excluded from inference request counters, ensuring stats reflect genuine LLM queries hitting the GPU.
 - **Built-in CORS & Webview Compatibility**: Full CORS preflight (`OPTIONS`) handling without authentication, enabling seamless integration with VS Code extensions (Cline, Roo Code) and browser web interfaces (Open WebUI).
 - **Flexible Client Authentication**: Supports Bearer tokens, HTTP Basic Auth, and custom `x-api-key` / `ollama-api-key` headers.
 - **Constant-Time Verification**: Plaintext passkeys are never verified with naive string equality; verification uses constant-time comparisons (`subtle::ConstantTimeEq`) and salted BLAKE3 hashing.
@@ -376,6 +387,70 @@ export OLLAMA_HOST="https://user:<passkey_user>@proxy.example.com:10000"
 ollama list
 ollama run default
 ```
+
+---
+
+## Host & GPU Telemetry and Remote Maintenance
+
+Each `olp-server` exposes internal management endpoints directly through its reverse tunnel port, secured by the server's passkey (`Authorization: Bearer <passkey_user>`):
+
+### 1. Live Telemetry (`GET /api/olp/metrics`)
+Returns real-time host, CPU, RAM, and GPU telemetry:
+```bash
+curl -H "Authorization: Bearer <passkey_user>" https://proxy.example.com:10000/api/olp/metrics
+```
+Example JSON response:
+```json
+{
+  "uptime_sec": 86400,
+  "load_avg": [0.42, 0.35, 0.28],
+  "cpu_temp_c": 54.2,
+  "cpu_util_pct": 12.5,
+  "host_ram_used_bytes": 17179869184,
+  "host_ram_total_bytes": 68719476736,
+  "logged_in_sessions": 2,
+  "active_requests": 1,
+  "total_requests": 258,
+  "gpus": [
+    {
+      "index": 0,
+      "vendor": "amd",
+      "model": "AMD Radeon RX 7900 XTX",
+      "temperature_c": 58.0,
+      "utilization_pct": 34.0,
+      "vram_used_bytes": 18253611008,
+      "vram_total_bytes": 25752961024,
+      "power_watts": 185.0
+    }
+  ],
+  "active_models": [
+    {
+      "name": "qwen2.5-coder:32b",
+      "size_vram_bytes": 19420000000,
+      "expires_at": "2026-11-23T05:30:00Z"
+    }
+  ]
+}
+```
+
+*Note: AMD GPU discovery works out of the box on Linux by reading sysfs entries under `/sys/class/drm/card*/device/` (PCI vendor `0x1002`), so no `rocm-smi` binary installation is required.*
+
+### 2. Remote Server Update & Restart (`POST /api/olp/maintenance`)
+Trigger an on-demand update or process restart remotely:
+```bash
+# Pull latest git commits, rebuild release binary, and restart daemon in background:
+curl -X POST https://proxy.example.com:10000/api/olp/maintenance \
+  -H "Authorization: Bearer <passkey_user>" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "update"}'
+
+# Or immediately restart the running process:
+curl -X POST https://proxy.example.com:10000/api/olp/maintenance \
+  -H "Authorization: Bearer <passkey_user>" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "restart"}'
+```
+The server detaches a background runner (`nohup ./start-server.sh update`) and returns HTTP 200 before restarting, ensuring tunnel state is cleanly resumed without manual terminal access.
 
 ---
 
