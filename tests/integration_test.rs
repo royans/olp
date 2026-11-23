@@ -205,6 +205,7 @@ async fn test_end_to_end_tunnel_auth_streaming_and_hotswap() {
             heartbeat_timeout_sec: 2,
         },
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -367,6 +368,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -391,6 +393,7 @@ async fn test_passkey_proxy_rejection_and_cidr_filtering() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (server_shutdown_tx, mut server_shutdown_rx) = watch::channel(false);
@@ -540,6 +543,7 @@ async fn test_model_auto_mapping_and_cors() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
@@ -678,6 +682,7 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (tx1, rx1) = watch::channel(false);
@@ -703,6 +708,7 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (tx2, rx2) = watch::channel(false);
@@ -728,6 +734,7 @@ async fn test_multi_user_and_multi_server_isolation_and_dynamic_ports() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (tx3, rx3) = watch::channel(false);

@@ -171,6 +171,10 @@ pub struct UserServerConfig {
     pub server_build_timestamp: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_git_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_git_pull: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_enabled: Option<bool>,
     #[serde(default)]
     pub keys: HashMap<String, ScopedKeyConfig>,
 }
@@ -191,6 +195,8 @@ impl Default for UserServerConfig {
             server_build_date: None,
             server_build_timestamp: None,
             server_git_hash: None,
+            auto_git_pull: None,
+            metrics_enabled: None,
             keys: HashMap::new(),
         }
     }
@@ -465,6 +471,20 @@ pub struct ServerConfig {
     pub reconnect: ReconnectSection,
     #[serde(default = "default_maintenance_for_existing_deployments")]
     pub maintenance: MaintenanceSection,
+    #[serde(default)]
+    pub metrics: MetricsSection,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self::default_config()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MetricsSection {
+    #[serde(default, deserialize_with = "deserialize_flexible_bool")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -635,6 +655,7 @@ impl ServerConfig {
             },
             reconnect: ReconnectSection::default(),
             maintenance: MaintenanceSection::default(),
+            metrics: MetricsSection::default(),
         }
     }
 
@@ -873,6 +894,7 @@ pub struct ServerCliOverrides {
     pub auto_git_pull: Option<bool>,
     pub read_only: Option<bool>,
     pub max_num_ctx: Option<usize>,
+    pub metrics_enabled: Option<bool>,
 }
 
 /// Ensures `~/.olp/proxy.toml` and `~/.olp/config/` exist.
@@ -1175,6 +1197,10 @@ pub fn ensure_server_initialized(
             cfg.server.max_num_ctx = val;
             modified = true;
         }
+        if let Some(val) = overrides.metrics_enabled {
+            cfg.metrics.enabled = val;
+            modified = true;
+        }
         if overrides.insecure_skip_tls_verify {
             cfg.server.tls_verify = Some(false);
             modified = true;
@@ -1270,6 +1296,9 @@ pub fn ensure_server_initialized(
         }
     }
 
+    if let Some(val) = overrides.metrics_enabled {
+        cfg.metrics.enabled = val;
+    }
     if let Some(val) = overrides.proxy_addr {
         cfg.server.proxy_addr = val;
     }
@@ -1374,6 +1403,8 @@ mod tests {
                 server_build_date: Some("2026-11-14".to_string()),
                 server_build_timestamp: Some(1794633870),
                 server_git_hash: Some("4f1d8fd".to_string()),
+                auto_git_pull: Some(false),
+                metrics_enabled: Some(true),
                 keys: HashMap::new(),
             },
         );

@@ -330,6 +330,7 @@ async fn test_read_only_mode_and_scoped_keys_full_compatibility() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -703,6 +704,7 @@ async fn test_scoped_keys_manage_allows_mutations_when_proxy_allows() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -824,6 +826,7 @@ async fn test_client_compat_simulated_flows() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);

@@ -74,6 +74,10 @@ pub struct ServerAuthRegister {
     pub server_build_timestamp: Option<u64>,
     #[serde(default)]
     pub server_git_hash: Option<String>,
+    #[serde(default)]
+    pub auto_git_pull: Option<bool>,
+    #[serde(default)]
+    pub metrics_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +130,8 @@ impl ServerAuthRegister {
             server_build_date: None,
             server_build_timestamp: None,
             server_git_hash: None,
+            auto_git_pull: None,
+            metrics_enabled: None,
         }
     }
 
@@ -152,6 +158,8 @@ impl ServerAuthRegister {
             server_build_date: None,
             server_build_timestamp: None,
             server_git_hash: None,
+            auto_git_pull: None,
+            metrics_enabled: None,
         }
     }
 
@@ -165,6 +173,33 @@ impl ServerAuthRegister {
         policy_override: Option<bool>,
         keys: std::collections::HashMap<String, ScopedKeyRegistration>,
         max_num_ctx: Option<usize>,
+    ) -> Self {
+        Self::with_full_details(
+            olp_api_key,
+            olp_server_id,
+            recommended_port,
+            passkey_user,
+            proxy_nonce,
+            policy_override,
+            keys,
+            max_num_ctx,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_full_details(
+        olp_api_key: &str,
+        olp_server_id: &str,
+        recommended_port: Option<u16>,
+        passkey_user: &str,
+        proxy_nonce: &[u8; 32],
+        policy_override: Option<bool>,
+        keys: std::collections::HashMap<String, ScopedKeyRegistration>,
+        max_num_ctx: Option<usize>,
+        auto_git_pull: Option<bool>,
+        metrics_enabled: Option<bool>,
     ) -> Self {
         let auth_token = compute_server_auth_token(proxy_nonce, olp_server_id, olp_api_key);
         Self {
@@ -180,6 +215,8 @@ impl ServerAuthRegister {
             server_build_date: Some(OLP_BUILD_DATE.to_string()),
             server_build_timestamp: Some(olp_build_timestamp()),
             server_git_hash: Some(OLP_GIT_HASH.to_string()),
+            auto_git_pull,
+            metrics_enabled,
         }
     }
 }
@@ -204,8 +241,16 @@ pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
     match (method, normalized_path) {
         (
             &hyper::Method::GET | &hyper::Method::HEAD,
-            "/" | "/api" | "/api/version" | "/api/tags" | "/api/ps" | "/v1/models"
-            | "/api/olp/context" | "/api/olp/ctx",
+            "/"
+            | "/api"
+            | "/api/version"
+            | "/api/tags"
+            | "/api/ps"
+            | "/v1/models"
+            | "/api/olp/context"
+            | "/api/olp/ctx"
+            | "/api/olp/metrics"
+            | "/api/olp/maintenance",
         ) => false,
         (&hyper::Method::GET | &hyper::Method::HEAD, p) if p.starts_with("/v1/models/") => false,
         (
@@ -219,9 +264,14 @@ pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
             | "/v1/completions"
             | "/v1/embeddings"
             | "/api/olp/context"
-            | "/api/olp/ctx",
+            | "/api/olp/ctx"
+            | "/api/olp/metrics"
+            | "/api/olp/maintenance",
         ) => false,
-        (&hyper::Method::PUT, "/api/olp/context" | "/api/olp/ctx") => false,
+        (
+            &hyper::Method::PUT,
+            "/api/olp/context" | "/api/olp/ctx" | "/api/olp/metrics" | "/api/olp/maintenance",
+        ) => false,
         // All mutating operations (e.g. POST /api/pull, DELETE /api/delete, POST /api/push,
         // POST /api/create, POST /api/copy, /api/blobs/*, etc.) or unknown verbs are sensitive.
         _ => true,

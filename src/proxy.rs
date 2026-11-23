@@ -726,6 +726,8 @@ impl ProxyState {
                 server_build_date: existing.as_ref().and_then(|s| s.server_build_date.clone()),
                 server_build_timestamp: existing.as_ref().and_then(|s| s.server_build_timestamp),
                 server_git_hash: existing.as_ref().and_then(|s| s.server_git_hash.clone()),
+                auto_git_pull: existing.as_ref().and_then(|s| s.auto_git_pull),
+                metrics_enabled: existing.as_ref().and_then(|s| s.metrics_enabled),
                 keys: keys_map,
             },
         );
@@ -1169,11 +1171,15 @@ async fn handle_incoming_tunnel(
         || server_cfg.server_build_date != register.server_build_date
         || server_cfg.server_build_timestamp != register.server_build_timestamp
         || server_cfg.server_git_hash != register.server_git_hash
+        || server_cfg.auto_git_pull != register.auto_git_pull
+        || server_cfg.metrics_enabled != register.metrics_enabled
     {
         server_cfg.server_version = register.server_version.clone();
         server_cfg.server_build_date = register.server_build_date.clone();
         server_cfg.server_build_timestamp = register.server_build_timestamp;
         server_cfg.server_git_hash = register.server_git_hash.clone();
+        server_cfg.auto_git_pull = register.auto_git_pull;
+        server_cfg.metrics_enabled = register.metrics_enabled;
         profile_dirty = true;
     }
     if profile_dirty {
@@ -1870,12 +1876,13 @@ async fn handle_public_http_request(
 
     let clean_path = uri.split('?').next().unwrap_or(&uri);
     let is_context_endpoint = clean_path == "/api/olp/context" || clean_path == "/api/olp/ctx";
+    let is_internal_olp_endpoint = clean_path.starts_with("/api/olp/");
 
     let mux = match mux {
         Some(m) if !m.is_closed() => m,
         _ => {
-            let err_json = if is_context_endpoint {
-                r#"{"error":"olp-server is currently offline. Context window can only be queried or modified when the server is connected."}"#
+            let err_json = if is_internal_olp_endpoint {
+                r#"{"error":"olp-server is currently offline. Management and telemetry endpoints can only be queried or modified when the server is connected."}"#
             } else {
                 r#"{"error":"olp-server tunnel currently offline. Waiting for reconnection..."}"#
             };

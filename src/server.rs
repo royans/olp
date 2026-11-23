@@ -203,7 +203,7 @@ pub async fn run_single_tunnel_session(
             },
         );
     }
-    let register = ServerAuthRegister::with_all(
+    let register = ServerAuthRegister::with_full_details(
         &config.server.olp_api_key,
         &config.server.olp_server_id,
         config.server.remote_port,
@@ -212,6 +212,8 @@ pub async fn run_single_tunnel_session(
         config.server.read_only,
         reg_keys,
         Some(config.server.max_num_ctx),
+        Some(config.maintenance.auto_git_pull),
+        Some(config.metrics.enabled),
     );
 
     tokio::time::timeout(
@@ -265,6 +267,10 @@ pub async fn run_single_tunnel_session(
     let hb_timeout = Duration::from_secs(config.reconnect.heartbeat_timeout_sec.max(1));
     let ollama_addr = config.server.ollama_addr.clone();
     let model_tracker = Arc::new(ActiveModelTracker::new(ollama_addr.clone()));
+    let metrics_collector = Arc::new(crate::metrics::MetricsCollector::new(
+        config.server.olp_server_id.clone(),
+        ollama_addr.clone(),
+    ));
     let cfg_arc = Arc::new(tokio::sync::RwLock::new(config.clone()));
 
     let mut ticker = tokio::time::interval(hb_interval);
@@ -283,8 +289,9 @@ pub async fn run_single_tunnel_session(
                     Some(yamux_stream) => {
                         let cfg = cfg_arc.clone();
                         let tracker = model_tracker.clone();
+                        let collector = metrics_collector.clone();
                         tokio::spawn(async move {
-                            serve_proxied_ollama_stream(yamux_stream, cfg, tracker).await;
+                            serve_proxied_ollama_stream(yamux_stream, cfg, tracker, collector).await;
                         });
                     }
                     None => {
@@ -405,7 +412,7 @@ impl ActiveModelTracker {
     }
 }
 
-async fn query_ollama_json(ollama_addr: &str, path: &str) -> Result<serde_json::Value> {
+pub async fn query_ollama_json(ollama_addr: &str, path: &str) -> Result<serde_json::Value> {
     let connect_res =
         tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(ollama_addr))
             .await
@@ -448,11 +455,13 @@ async fn serve_proxied_ollama_stream(
     yamux_stream: CompatYamuxStream,
     config: Arc<tokio::sync::RwLock<ServerConfig>>,
     model_tracker: Arc<ActiveModelTracker>,
+    metrics_collector: Arc<crate::metrics::MetricsCollector>,
 ) {
     let service = service_fn(move |req: Request<Incoming>| {
         let cfg = config.clone();
         let tracker = model_tracker.clone();
-        async move { forward_to_local_ollama(req, cfg, tracker).await }
+        let collector = metrics_collector.clone();
+        async move { forward_to_local_ollama(req, cfg, tracker, collector).await }
     });
 
     let _ = server_http1::Builder::new()
@@ -462,11 +471,40 @@ async fn serve_proxied_ollama_stream(
         .await;
 }
 
+/// Checks whether an olp-server cronjob is installed in the user's crontab.
+fn check_cron_installed_on_host() -> bool {
+    if let Ok(output) = std::process::Command::new("crontab").arg("-l").output() {
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout);
+            return s.contains("start-server.sh") || s.contains("olp-server");
+        }
+    }
+    false
+}
+
+struct RequestCounterGuard;
+
+impl RequestCounterGuard {
+    fn new() -> Self {
+        crate::metrics::ACTIVE_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::metrics::TOTAL_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for RequestCounterGuard {
+    fn drop(&mut self) {
+        crate::metrics::ACTIVE_REQUESTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 async fn forward_to_local_ollama(
     req: Request<Incoming>,
     config_lock: Arc<tokio::sync::RwLock<ServerConfig>>,
     model_tracker: Arc<ActiveModelTracker>,
+    metrics_collector: Arc<crate::metrics::MetricsCollector>,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
+    let _counter = RequestCounterGuard::new();
     if req.method() == Method::CONNECT {
         let mut resp = Response::new(full_body(r#"{"error":"CONNECT method is forbidden"}"#));
         *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
@@ -481,6 +519,169 @@ async fn forward_to_local_ollama(
         .to_string();
 
     let clean_path = path_and_query.split('?').next().unwrap_or(&path_and_query);
+
+    // Intercept internal olp metrics endpoint (/api/olp/metrics)
+    if clean_path == "/api/olp/metrics" {
+        if req.method() == Method::GET || req.method() == Method::HEAD {
+            let enabled = {
+                let cfg_guard = config_lock.read().await;
+                cfg_guard.metrics.enabled
+            };
+            let telemetry = metrics_collector.collect(enabled).await;
+            let mut resp = Response::new(full_body(serde_json::to_string(&telemetry).unwrap()));
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("application/json"),
+            );
+            return Ok(resp);
+        } else if req.method() == Method::POST || req.method() == Method::PUT {
+            let body_bytes = match req.into_body().collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(e) => return Err(e),
+            };
+            let parse_res: Result<serde_json::Value, _> = serde_json::from_slice(&body_bytes);
+            let requested_enabled = parse_res
+                .ok()
+                .and_then(|v| v.get("enabled").and_then(|b| b.as_bool()));
+            match requested_enabled {
+                Some(enabled) => {
+                    let mut cfg_guard = config_lock.write().await;
+                    cfg_guard.metrics.enabled = enabled;
+                    let cfg_path = match std::env::var("OLP_CONFIG") {
+                        Ok(p) => std::path::PathBuf::from(p),
+                        Err(_) => match crate::config::olp_home_dir() {
+                            Ok(h) => h.join("server.toml"),
+                            Err(_) => std::path::PathBuf::from("server.toml"),
+                        },
+                    };
+                    let persisted = cfg_guard.save_to_path(&cfg_path).is_ok();
+                    info!(
+                        "[METRICS] Updated olp-server telemetry enabled to {} (persisted: {})",
+                        enabled, persisted
+                    );
+                    let body = serde_json::json!({
+                        "success": true,
+                        "server_id": cfg_guard.server.olp_server_id,
+                        "enabled": enabled,
+                        "server_updated": true,
+                        "persisted": persisted,
+                        "message": format!("Server telemetry reporting is now {}", if enabled { "enabled" } else { "disabled" })
+                    });
+                    let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
+                    *resp.status_mut() = StatusCode::OK;
+                    resp.headers_mut().insert(
+                        hyper::header::CONTENT_TYPE,
+                        hyper::header::HeaderValue::from_static("application/json"),
+                    );
+                    return Ok(resp);
+                }
+                None => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "error": "Invalid request: missing boolean field 'enabled'"
+                    });
+                    let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
+                    *resp.status_mut() = StatusCode::BAD_REQUEST;
+                    resp.headers_mut().insert(
+                        hyper::header::CONTENT_TYPE,
+                        hyper::header::HeaderValue::from_static("application/json"),
+                    );
+                    return Ok(resp);
+                }
+            }
+        }
+    }
+
+    // Intercept internal olp maintenance / auto-update endpoint (/api/olp/maintenance)
+    if clean_path == "/api/olp/maintenance" {
+        if req.method() == Method::GET || req.method() == Method::HEAD {
+            let cfg_guard = config_lock.read().await;
+            let cron_installed = check_cron_installed_on_host();
+            let body = serde_json::json!({
+                "status": "ok",
+                "server_id": cfg_guard.server.olp_server_id,
+                "auto_git_pull": cfg_guard.maintenance.auto_git_pull,
+                "cron_installed": cron_installed,
+                "autoupdate_schedule": "every 15 minutes (watchdog)",
+                "source": "olp-server"
+            });
+            let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("application/json"),
+            );
+            return Ok(resp);
+        } else if req.method() == Method::POST || req.method() == Method::PUT {
+            let body_bytes = match req.into_body().collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(e) => return Err(e),
+            };
+            let parse_res: Result<serde_json::Value, _> = serde_json::from_slice(&body_bytes);
+            let requested_pull = parse_res.ok().and_then(|v| {
+                v.get("auto_git_pull")
+                    .or_else(|| v.get("autoupdate"))
+                    .and_then(|b| b.as_bool())
+            });
+            match requested_pull {
+                Some(pull_enabled) => {
+                    let mut cfg_guard = config_lock.write().await;
+                    cfg_guard.maintenance.auto_git_pull = pull_enabled;
+                    let cfg_path = match std::env::var("OLP_CONFIG") {
+                        Ok(p) => std::path::PathBuf::from(p),
+                        Err(_) => match crate::config::olp_home_dir() {
+                            Ok(h) => h.join("server.toml"),
+                            Err(_) => std::path::PathBuf::from("server.toml"),
+                        },
+                    };
+                    let persisted = cfg_guard.save_to_path(&cfg_path).is_ok();
+                    let cron_installed = check_cron_installed_on_host();
+                    info!(
+                        "[MAINTENANCE] Updated olp-server auto_git_pull to {} (persisted: {})",
+                        pull_enabled, persisted
+                    );
+                    let body = serde_json::json!({
+                        "success": true,
+                        "server_id": cfg_guard.server.olp_server_id,
+                        "auto_git_pull": pull_enabled,
+                        "cron_installed": cron_installed,
+                        "server_updated": true,
+                        "persisted": persisted,
+                        "message": format!(
+                            "Auto-update is now {}. {}",
+                            if pull_enabled { "enabled" } else { "disabled" },
+                            if pull_enabled && !cron_installed {
+                                "Note: Cronjob was not detected on host. Run './start-server.sh cron' to activate automated 15-min watchdog."
+                            } else {
+                                ""
+                            }
+                        )
+                    });
+                    let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
+                    *resp.status_mut() = StatusCode::OK;
+                    resp.headers_mut().insert(
+                        hyper::header::CONTENT_TYPE,
+                        hyper::header::HeaderValue::from_static("application/json"),
+                    );
+                    return Ok(resp);
+                }
+                None => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "error": "Invalid request: missing boolean field 'auto_git_pull'"
+                    });
+                    let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
+                    *resp.status_mut() = StatusCode::BAD_REQUEST;
+                    resp.headers_mut().insert(
+                        hyper::header::CONTENT_TYPE,
+                        hyper::header::HeaderValue::from_static("application/json"),
+                    );
+                    return Ok(resp);
+                }
+            }
+        }
+    }
 
     // Intercept internal olp context management endpoints (/api/olp/context or /api/olp/ctx)
     if clean_path == "/api/olp/context" || clean_path == "/api/olp/ctx" {

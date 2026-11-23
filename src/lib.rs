@@ -2,6 +2,7 @@ pub mod backoff;
 pub mod cidr;
 pub mod config;
 pub mod keys;
+pub mod metrics;
 pub mod mux;
 pub mod protocol;
 pub mod proxy;

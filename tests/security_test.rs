@@ -351,6 +351,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (tx1, mut rx1) = watch::channel(false);
@@ -384,6 +385,7 @@ async fn test_port_range_and_forbidden_port_rejection() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (tx2, mut rx2) = watch::channel(false);
@@ -435,6 +437,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let mut server_cfg2 = ServerConfig {
@@ -451,6 +454,7 @@ async fn test_multiple_simultaneous_olp_servers_on_different_ports() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx1, mut rx1) = watch::channel(false);
@@ -677,6 +681,7 @@ async fn test_apache_access_log_file_logging() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -802,6 +807,7 @@ async fn test_plain_http_to_https_port_returns_helpful_bad_request() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -1007,6 +1013,7 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx1, mut rx1) = watch::channel(false);
@@ -1034,6 +1041,7 @@ async fn test_handshake_rejects_path_traversal_identifiers() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx2, mut rx2) = watch::channel(false);
@@ -1090,6 +1098,7 @@ async fn test_user_disabled_account_rejection() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -1149,6 +1158,7 @@ async fn test_user_max_servers_limit_enforcement() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (tx1, mut rx1) = watch::channel(false);
@@ -1174,6 +1184,7 @@ async fn test_user_max_servers_limit_enforcement() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx2, mut rx2) = watch::channel(false);
@@ -1250,6 +1261,7 @@ async fn test_cross_user_port_stealing_prevention() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (tx_bob, mut rx_bob) = watch::channel(false);
@@ -1312,6 +1324,7 @@ async fn test_port_exhaustion_returns_clean_error() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
     let (tx1, mut rx1) = watch::channel(false);
     let conn1 = connector.clone();
@@ -1335,6 +1348,7 @@ async fn test_port_exhaustion_returns_clean_error() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
     let (tx2, mut rx2) = watch::channel(false);
     let conn2 = connector.clone();
@@ -1358,6 +1372,7 @@ async fn test_port_exhaustion_returns_clean_error() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
     let (_tx3, mut rx3) = watch::channel(false);
     let res3 = run_single_tunnel_session(&mut srv3, &connector, &mut rx3).await;
@@ -1435,6 +1450,7 @@ async fn test_server_specific_cidr_restrictions() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -1512,6 +1528,7 @@ async fn test_sensitive_operations_blocked_by_default_on_proxy() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -1715,6 +1732,7 @@ async fn test_dynamic_policy_reload_on_disk_update() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -1854,6 +1872,7 @@ async fn test_policy_coexistence_conflict_fails_tunnel() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -1913,6 +1932,7 @@ async fn test_policy_aligned_both_sides_succeeds() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (tx, mut rx) = watch::channel(false);
@@ -1989,6 +2009,7 @@ async fn test_policy_server_restricts_itself_stricter_wins() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -2139,6 +2160,7 @@ async fn test_unauthenticated_request_rejects_without_buffering_large_body() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -2226,6 +2248,7 @@ async fn test_max_request_body_size_rejection() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -2324,6 +2347,7 @@ async fn test_backend_concurrency_throttling_returns_429() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -2440,6 +2464,7 @@ async fn test_authenticated_request_rate_limiting() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -2564,6 +2589,7 @@ async fn test_user_profile_salted_hash_passkey_verification() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -2670,6 +2696,7 @@ async fn test_user_profile_default_plaintext_passkey_manual_editing() {
         },
         reconnect: ReconnectSection::default(),
         maintenance: Default::default(),
+        metrics: Default::default(),
     };
 
     let (_tx, mut rx) = watch::channel(false);
@@ -2759,4 +2786,27 @@ async fn test_user_profile_default_plaintext_passkey_manual_editing() {
     );
 
     let _ = std::fs::remove_file(&profile_path);
+}
+
+#[tokio::test]
+async fn test_telemetry_and_maintenance_endpoints() {
+    let collector =
+        olp::metrics::MetricsCollector::new("srv_test".to_string(), "127.0.0.1:11434".to_string());
+
+    // 1. By default, telemetry collect(false) returns disabled status without exposing metrics
+    let res_disabled = collector.collect(false).await;
+    assert_eq!(res_disabled.status, "disabled");
+    assert!(!res_disabled.enabled);
+    assert!(res_disabled.cpu.is_none());
+    assert!(res_disabled.uptime.is_none());
+    assert!(res_disabled.load_average.is_none());
+
+    // 2. When enabled, collect(true) gathers host metrics safely
+    let res_enabled = collector.collect(true).await;
+    assert_eq!(res_enabled.status, "ok");
+    assert!(res_enabled.enabled);
+    assert!(res_enabled.uptime.is_some());
+    assert!(res_enabled.cpu.is_some());
+    assert!(res_enabled.users.is_some());
+    assert!(res_enabled.busyness.is_some());
 }

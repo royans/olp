@@ -49,6 +49,10 @@ struct Args {
     #[arg(long)]
     auto_git_pull: Option<bool>,
 
+    /// Enable or disable host telemetry and metrics reporting (true/false)
+    #[arg(long)]
+    metrics: Option<bool>,
+
     /// Maximum context window (tokens) allowed per request; caps options.num_ctx and the
     /// context length reported by /api/show (default: 32768). Saved to server.toml.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
@@ -114,6 +118,7 @@ async fn main() -> Result<()> {
         tls_verify: args.tls_verify,
         insecure_skip_tls_verify: args.insecure_skip_tls_verify,
         auto_git_pull: args.auto_git_pull,
+        metrics_enabled: args.metrics,
         max_num_ctx: args.max_num_ctx.map(|n| n as usize),
         read_only: if args.read_only {
             Some(true)
