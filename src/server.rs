@@ -482,6 +482,51 @@ fn check_cron_installed_on_host() -> bool {
     false
 }
 
+/// Attempts to locate `start-server.sh` script on the host system.
+fn find_start_server_script() -> Option<std::path::PathBuf> {
+    // 1. Current working directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let script = cwd.join("start-server.sh");
+        if script.is_file() {
+            return Some(script);
+        }
+    }
+
+    // 2. Ancestor directories of the running binary (e.g. repo_root/target/release/olp-server)
+    if let Ok(exe) = std::env::current_exe() {
+        let mut curr = exe.parent();
+        for _ in 0..4 {
+            if let Some(dir) = curr {
+                let script = dir.join("start-server.sh");
+                if script.is_file() {
+                    return Some(script);
+                }
+                curr = dir.parent();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 3. Inspect crontab for managed marker comment: # olp-server-managed:<path>
+    if let Ok(output) = std::process::Command::new("crontab").arg("-l").output() {
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout);
+            for line in s.lines() {
+                if let Some(idx) = line.find("# olp-server-managed:") {
+                    let dir_str = line[idx + "# olp-server-managed:".len()..].trim();
+                    let path = std::path::PathBuf::from(dir_str).join("start-server.sh");
+                    if path.is_file() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 struct RequestCounterGuard;
 
 impl RequestCounterGuard {
@@ -594,7 +639,11 @@ async fn forward_to_local_ollama(
     }
 
     // Intercept internal olp maintenance / auto-update endpoint (/api/olp/maintenance)
-    if clean_path == "/api/olp/maintenance" {
+    if clean_path == "/api/olp/maintenance"
+        || clean_path == "/api/olp/maintenance/update"
+        || clean_path == "/api/olp/update"
+        || clean_path == "/api/olp/restart"
+    {
         if req.method() == Method::GET || req.method() == Method::HEAD {
             let cfg_guard = config_lock.read().await;
             let cron_installed = check_cron_installed_on_host();
@@ -619,6 +668,102 @@ async fn forward_to_local_ollama(
                 Err(e) => return Err(e),
             };
             let parse_res: Result<serde_json::Value, _> = serde_json::from_slice(&body_bytes);
+
+            let requested_action = parse_res
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("action").and_then(|a| a.as_str()))
+                .unwrap_or("");
+
+            let is_update_action = clean_path.ends_with("/update")
+                || requested_action == "update"
+                || parse_res
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v.get("update").and_then(|b| b.as_bool()))
+                    .unwrap_or(false);
+
+            let is_restart_action = clean_path.ends_with("/restart")
+                || requested_action == "restart"
+                || parse_res
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v.get("restart").and_then(|b| b.as_bool()))
+                    .unwrap_or(false);
+
+            if is_update_action || is_restart_action {
+                let action_verb = if is_update_action {
+                    "update"
+                } else {
+                    "restart"
+                };
+                let script_path = find_start_server_script();
+                match script_path {
+                    Some(script) => {
+                        let script_dir = script.parent().unwrap().to_path_buf();
+                        let cfg_guard = config_lock.read().await;
+                        let server_id = cfg_guard.server.olp_server_id.clone();
+                        drop(cfg_guard);
+
+                        info!(
+                            "[MAINTENANCE] On-demand {} triggered for server '{}'. Spawning detached background updater...",
+                            action_verb, server_id
+                        );
+
+                        // Spawn detached updater process with a slight delay so HTTP response is cleanly sent
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+                            let cmd_str = format!(
+                                "cd \"{}\" && nohup ./start-server.sh {} >> ~/.olp/server.log 2>&1 &",
+                                script_dir.display(),
+                                action_verb
+                            );
+                            let _ = std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(&cmd_str)
+                                .spawn();
+                        });
+
+                        let body = serde_json::json!({
+                            "success": true,
+                            "server_id": server_id,
+                            "action": action_verb,
+                            "status": "executing",
+                            "message": format!(
+                                "On-demand {} initiated. olp-server is {} in the background and will reconnect in a few moments.",
+                                action_verb,
+                                if is_update_action { "pulling latest code from git, recompiling release binary, and restarting" } else { "restarting" }
+                            )
+                        });
+                        let mut resp =
+                            Response::new(full_body(serde_json::to_string(&body).unwrap()));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            hyper::header::CONTENT_TYPE,
+                            hyper::header::HeaderValue::from_static("application/json"),
+                        );
+                        return Ok(resp);
+                    }
+                    None => {
+                        let cfg_guard = config_lock.read().await;
+                        let server_id = cfg_guard.server.olp_server_id.clone();
+                        let body = serde_json::json!({
+                            "success": false,
+                            "server_id": server_id,
+                            "error": "Cannot trigger remote update: 'start-server.sh' was not found on host. Ensure olp-server is running from git repository."
+                        });
+                        let mut resp =
+                            Response::new(full_body(serde_json::to_string(&body).unwrap()));
+                        *resp.status_mut() = StatusCode::BAD_REQUEST;
+                        resp.headers_mut().insert(
+                            hyper::header::CONTENT_TYPE,
+                            hyper::header::HeaderValue::from_static("application/json"),
+                        );
+                        return Ok(resp);
+                    }
+                }
+            }
+
             let requested_pull = parse_res.ok().and_then(|v| {
                 v.get("auto_git_pull")
                     .or_else(|| v.get("autoupdate"))
@@ -669,7 +814,7 @@ async fn forward_to_local_ollama(
                 None => {
                     let body = serde_json::json!({
                         "success": false,
-                        "error": "Invalid request: missing boolean field 'auto_git_pull'"
+                        "error": "Invalid request: missing boolean field 'auto_git_pull' or action 'update'"
                     });
                     let mut resp = Response::new(full_body(serde_json::to_string(&body).unwrap()));
                     *resp.status_mut() = StatusCode::BAD_REQUEST;

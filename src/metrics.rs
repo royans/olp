@@ -183,7 +183,7 @@ impl MetricsCollector {
         let users = count_logged_in_users();
         let (cpu_temp, cpu_util, cpu_cores) = self.gather_cpu_info().await;
         let memory = read_memory_info();
-        let gpus = tokio::task::spawn_blocking(gather_nvidia_gpus)
+        let gpus = tokio::task::spawn_blocking(gather_all_gpus)
             .await
             .unwrap_or_default();
         let ollama = self.gather_ollama_stats().await;
@@ -516,6 +516,303 @@ fn gather_nvidia_gpus() -> Vec<GpuStats> {
             });
         }
     }
+    gpus
+}
+
+/// Gathers both NVIDIA and AMD GPUs, unifying telemetry across vendors.
+fn gather_all_gpus() -> Vec<GpuStats> {
+    let mut gpus = gather_nvidia_gpus();
+    let amd_gpus = gather_amd_gpus();
+    for mut amd in amd_gpus {
+        amd.index = gpus.len();
+        gpus.push(amd);
+    }
+    gpus
+}
+
+/// Queries AMD GPUs via `rocm-smi` CLI or directly through Linux kernel `amdgpu` sysfs.
+fn gather_amd_gpus() -> Vec<GpuStats> {
+    // 1. Try rocm-smi if installed
+    if let Some(gpus) = gather_amd_gpus_rocm_smi() {
+        if !gpus.is_empty() {
+            return gpus;
+        }
+    }
+    // 2. Direct Linux sysfs driver inspection (/sys/class/drm/card*/device)
+    gather_amd_gpus_sysfs()
+}
+
+fn gather_amd_gpus_rocm_smi() -> Option<Vec<GpuStats>> {
+    let output = std::process::Command::new("rocm-smi")
+        .arg("--json")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let val: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let obj = val.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+
+    let mut gpus = Vec::new();
+    for (k, v) in obj {
+        if !v.is_object() {
+            continue;
+        }
+        let index = k
+            .trim_start_matches("card")
+            .parse::<usize>()
+            .unwrap_or_else(|_| gpus.len());
+
+        let name = v
+            .get("Card model")
+            .or_else(|| v.get("card_model"))
+            .or_else(|| v.get("Card series"))
+            .or_else(|| v.get("card_series"))
+            .or_else(|| v.get("product_name"))
+            .and_then(|val| val.as_str())
+            .unwrap_or("AMD Radeon GPU")
+            .to_string();
+
+        let temp_c = v
+            .get("Temperature (Sensor edge) (C)")
+            .or_else(|| v.get("temperature.edge.value"))
+            .or_else(|| v.get("temperature"))
+            .and_then(|val| {
+                if let Some(n) = val.as_f64() {
+                    Some(n as f32)
+                } else if let Some(s) = val.as_str() {
+                    s.parse::<f32>().ok()
+                } else if let Some(sub) = val.get("edge").and_then(|e| e.get("value")) {
+                    sub.as_f64().map(|n| n as f32)
+                } else {
+                    None
+                }
+            });
+
+        let util_pct = v
+            .get("GPU use (%)")
+            .or_else(|| v.get("utilization.gpu_use.value"))
+            .and_then(|val| {
+                if let Some(n) = val.as_f64() {
+                    Some(n as f32)
+                } else if let Some(s) = val.as_str() {
+                    s.parse::<f32>().ok()
+                } else if let Some(sub) = val.get("gpu_use").and_then(|e| e.get("value")) {
+                    sub.as_f64().map(|n| n as f32)
+                } else {
+                    None
+                }
+            });
+
+        let mem_util_pct = v
+            .get("GPU Memory use (%)")
+            .or_else(|| v.get("utilization.memory_use.value"))
+            .and_then(|val| {
+                if let Some(n) = val.as_f64() {
+                    Some(n as f32)
+                } else if let Some(s) = val.as_str() {
+                    s.parse::<f32>().ok()
+                } else {
+                    None
+                }
+            });
+
+        let vram_total_mb = v
+            .get("VRAM Total Memory (B)")
+            .and_then(|val| {
+                val.as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| val.as_u64())
+            })
+            .map(|b| b / (1024 * 1024))
+            .unwrap_or(0);
+
+        let vram_used_mb = v
+            .get("VRAM Total Used Memory (B)")
+            .and_then(|val| {
+                val.as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| val.as_u64())
+            })
+            .map(|b| b / (1024 * 1024))
+            .unwrap_or(0);
+
+        let vram_free_mb = vram_total_mb.saturating_sub(vram_used_mb);
+
+        let power_w = v.get("Average Graphics Package Power (W)").and_then(|val| {
+            if let Some(n) = val.as_f64() {
+                Some(n as f32)
+            } else if let Some(s) = val.as_str() {
+                s.parse::<f32>().ok()
+            } else {
+                None
+            }
+        });
+
+        gpus.push(GpuStats {
+            index,
+            name,
+            temperature_c: temp_c,
+            utilization_percent: util_pct,
+            memory_utilization_percent: mem_util_pct,
+            vram_total_mb,
+            vram_used_mb,
+            vram_free_mb,
+            power_watts: power_w,
+        });
+    }
+
+    if gpus.is_empty() {
+        None
+    } else {
+        Some(gpus)
+    }
+}
+
+/// Reads AMD GPU metrics from Linux kernel `amdgpu` sysfs paths.
+/// Supports VRAM usage, GPU/mem load, hwmon temperatures, and power metrics.
+fn gather_amd_gpus_sysfs() -> Vec<GpuStats> {
+    let mut gpus = Vec::new();
+    let drm_path = std::path::Path::new("/sys/class/drm");
+    let Ok(entries) = std::fs::read_dir(drm_path) else {
+        return gpus;
+    };
+
+    let mut card_dirs: Vec<(usize, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("card") && !name_str.contains('-') {
+            if let Ok(num) = name_str["card".len()..].parse::<usize>() {
+                card_dirs.push((num, entry.path()));
+            }
+        }
+    }
+    card_dirs.sort_by_key(|(num, _)| *num);
+
+    for (card_idx, card_path) in card_dirs {
+        let device_path = card_path.join("device");
+        if !device_path.is_dir() {
+            continue;
+        }
+
+        // Check vendor is 0x1002 (AMD PCI vendor ID)
+        let vendor = std::fs::read_to_string(device_path.join("vendor"))
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        if vendor != "0x1002" {
+            continue;
+        }
+
+        // Read VRAM total and used in bytes
+        let vram_total_bytes = std::fs::read_to_string(device_path.join("mem_info_vram_total"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let vram_used_bytes = std::fs::read_to_string(device_path.join("mem_info_vram_used"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let vram_total_mb = vram_total_bytes / (1024 * 1024);
+        let vram_used_mb = vram_used_bytes / (1024 * 1024);
+        let vram_free_mb = vram_total_mb.saturating_sub(vram_used_mb);
+
+        // Utilization %
+        let util_pct = std::fs::read_to_string(device_path.join("gpu_busy_percent"))
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok());
+
+        // Memory utilization %
+        let mem_util_pct = std::fs::read_to_string(device_path.join("mem_busy_percent"))
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .or_else(|| {
+                if vram_total_mb > 0 {
+                    Some(((vram_used_mb as f64 / vram_total_mb as f64) * 100.0) as f32)
+                } else {
+                    None
+                }
+            });
+
+        // Temperature & Power from hwmon
+        let mut temp_c: Option<f32> = None;
+        let mut power_w: Option<f32> = None;
+
+        let hwmon_dir = device_path.join("hwmon");
+        if let Ok(hw_entries) = std::fs::read_dir(hwmon_dir) {
+            for hw_entry in hw_entries.flatten() {
+                let hw_path = hw_entry.path();
+                if hw_path.is_dir() {
+                    // Try temp1_input, temp2_input, temp3_input
+                    if temp_c.is_none() {
+                        for t in 1..=4 {
+                            if let Ok(s) =
+                                std::fs::read_to_string(hw_path.join(format!("temp{}_input", t)))
+                            {
+                                if let Ok(milli) = s.trim().parse::<f32>() {
+                                    if milli > 0.0 {
+                                        temp_c = Some(milli / 1000.0);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Try power1_average, power1_input
+                    if power_w.is_none() {
+                        for p in &["power1_average", "power1_input"] {
+                            if let Ok(s) = std::fs::read_to_string(hw_path.join(p)) {
+                                if let Ok(micro) = s.trim().parse::<f32>() {
+                                    if micro > 0.0 {
+                                        power_w = Some(micro / 1_000_000.0);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Product Name
+        let mut name = std::fs::read_to_string(device_path.join("product_name"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        if name.is_empty() {
+            let dev_id = std::fs::read_to_string(device_path.join("device"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !dev_id.is_empty() {
+                name = format!("AMD Radeon GPU [{}] (card{})", dev_id, card_idx);
+            } else {
+                name = format!("AMD Radeon GPU (card{})", card_idx);
+            }
+        }
+
+        gpus.push(GpuStats {
+            index: gpus.len(),
+            name,
+            temperature_c: temp_c,
+            utilization_percent: util_pct,
+            memory_utilization_percent: mem_util_pct,
+            vram_total_mb,
+            vram_used_mb,
+            vram_free_mb,
+            power_watts: power_w,
+        });
+    }
+
     gpus
 }
 

@@ -250,7 +250,9 @@ pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
             | "/api/olp/context"
             | "/api/olp/ctx"
             | "/api/olp/metrics"
-            | "/api/olp/maintenance",
+            | "/api/olp/maintenance"
+            | "/api/olp/maintenance/update"
+            | "/api/olp/update",
         ) => false,
         (&hyper::Method::GET | &hyper::Method::HEAD, p) if p.starts_with("/v1/models/") => false,
         (
@@ -266,11 +268,18 @@ pub fn is_sensitive_ollama_op(method: &hyper::Method, path: &str) -> bool {
             | "/api/olp/context"
             | "/api/olp/ctx"
             | "/api/olp/metrics"
-            | "/api/olp/maintenance",
+            | "/api/olp/maintenance"
+            | "/api/olp/maintenance/update"
+            | "/api/olp/update",
         ) => false,
         (
             &hyper::Method::PUT,
-            "/api/olp/context" | "/api/olp/ctx" | "/api/olp/metrics" | "/api/olp/maintenance",
+            "/api/olp/context"
+            | "/api/olp/ctx"
+            | "/api/olp/metrics"
+            | "/api/olp/maintenance"
+            | "/api/olp/maintenance/update"
+            | "/api/olp/update",
         ) => false,
         // All mutating operations (e.g. POST /api/pull, DELETE /api/delete, POST /api/push,
         // POST /api/create, POST /api/copy, /api/blobs/*, etc.) or unknown verbs are sensitive.
