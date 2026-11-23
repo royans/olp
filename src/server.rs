@@ -527,6 +527,20 @@ fn find_start_server_script() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Checks whether an HTTP request path triggers LLM inference compute on the GPU.
+pub fn is_llm_inference_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/generate"
+            | "/api/chat"
+            | "/api/embed"
+            | "/api/embeddings"
+            | "/v1/chat/completions"
+            | "/v1/completions"
+            | "/v1/embeddings"
+    )
+}
+
 struct RequestCounterGuard;
 
 impl RequestCounterGuard {
@@ -549,7 +563,6 @@ async fn forward_to_local_ollama(
     model_tracker: Arc<ActiveModelTracker>,
     metrics_collector: Arc<crate::metrics::MetricsCollector>,
 ) -> std::result::Result<Response<BoxHttpBody>, hyper::Error> {
-    let _counter = RequestCounterGuard::new();
     if req.method() == Method::CONNECT {
         let mut resp = Response::new(full_body(r#"{"error":"CONNECT method is forbidden"}"#));
         *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
@@ -564,6 +577,15 @@ async fn forward_to_local_ollama(
         .to_string();
 
     let clean_path = path_and_query.split('?').next().unwrap_or(&path_and_query);
+
+    // Only count active/total requests for operations that execute LLM compute on the GPU.
+    // Internal olp telemetry, health checks, and metadata endpoints (e.g. /api/tags, /api/version)
+    // are ignored so reported traffic counters strictly reflect queries hitting the GPU.
+    let _llm_guard = if is_llm_inference_path(clean_path) {
+        Some(RequestCounterGuard::new())
+    } else {
+        None
+    };
 
     // Intercept internal olp metrics endpoint (/api/olp/metrics)
     if clean_path == "/api/olp/metrics" {

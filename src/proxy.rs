@@ -1521,6 +1521,13 @@ async fn handle_public_http_request(
               req_size: usize,
               model: &str,
               key_label: &str| {
+            // Ignore internal telemetry and maintenance operations (/api/olp/*)
+            // from the traffic access log so logs focus on client requests and GPU queries.
+            let clean_uri = uri.split('?').next().unwrap_or(&uri);
+            if clean_uri.starts_with("/api/olp/") {
+                return;
+            }
+
             let duration_ms = start_time.elapsed().as_millis();
             let line = format!(
                 r#"{ip} - {auth_scheme} [{timestamp}] "{method} {uri} {version}" {status} {resp_bytes} {duration_ms}ms key="{key_label}" model="{model}" req_bytes={req_bytes} server="{server_id}" port={port}"#,
